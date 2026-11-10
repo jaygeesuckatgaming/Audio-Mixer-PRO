@@ -2829,6 +2829,13 @@ impl MixerApp {
     fn save_settings(&mut self) {
         let text = self.scene_document();
         let path = settings_file();
+        // First run on a clean machine: the folder does not exist yet, and a
+        // failed write here would mean the scene is never persisted at all.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
         match std::fs::write(&path, text) {
             Ok(_) => {
                 for slot in 0..self.vsts.len() {
@@ -8980,6 +8987,9 @@ fn diag_path(name: &str) -> PathBuf {
 fn diag_log(message: impl AsRef<str>) {
     use std::io::Write;
     let path = diag_path("startup.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     if let Ok(meta) = std::fs::metadata(&path) {
         if meta.len() > 512 * 1024 {
             let _ = std::fs::remove_file(&path);
@@ -9002,6 +9012,9 @@ fn install_panic_log() {
     std::panic::set_hook(Box::new(|info| {
         use std::io::Write;
         let path = diag_path("panic.log");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
