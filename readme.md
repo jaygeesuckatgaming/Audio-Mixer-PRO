@@ -42,6 +42,10 @@ On the first run UAC will pop up... Just continue and the app starts(Dont worry 
 
 ![Ducking](https://i.ibb.co/Y4xVVDRB/Ducking.png)
 
+**VBAN With auto detect Incoming streams**
+
+![vban](https://i.ibb.co/hJ6ftWDF/vban.png)
+
 
 
 
