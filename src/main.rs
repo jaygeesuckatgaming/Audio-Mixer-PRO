@@ -9,6 +9,7 @@
 // by measured audio (microphone capture, tape material and the A1 output peak).
 
 mod audio;
+mod vban;
 mod vc;
 mod vst;
 
@@ -17,6 +18,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Id, Pos2, Rect, Response, Sense, Stroke, Vec2,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -548,6 +550,99 @@ impl Strip {
     }
 }
 
+/// A VBAN receive binding feeding one strip. The hub owns the socket and
+/// writes decoded frames into `shared`; the strip pipeline is identical to a
+/// Windows capture.
+struct VbanInput {
+    shared: Arc<audio::InputShared>,
+    device: String,
+    status: String,
+}
+
+impl VbanInput {
+    fn new(shared: Arc<audio::InputShared>, device: String) -> Self {
+        Self {
+            shared,
+            device,
+            status: "VBAN listening".to_string(),
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.shared.rate_value().max(8_000)
+    }
+}
+
+enum StripInput {
+    Cpal(InputCapture),
+    Vban(VbanInput),
+}
+
+impl StripInput {
+    fn device(&self) -> &str {
+        match self {
+            Self::Cpal(capture) => &capture.device,
+            Self::Vban(input) => &input.device,
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Cpal(capture) => capture.sample_rate,
+            Self::Vban(input) => input.sample_rate(),
+        }
+    }
+
+    fn channels(&self) -> u16 {
+        match self {
+            Self::Cpal(capture) => capture.channels,
+            Self::Vban(_) => 2,
+        }
+    }
+
+    fn available(&self) -> bool {
+        match self {
+            Self::Cpal(capture) => capture.available,
+            Self::Vban(input) => !input.status.is_empty(),
+        }
+    }
+
+    fn status(&self) -> &str {
+        match self {
+            Self::Cpal(capture) => &capture.status,
+            Self::Vban(input) => &input.status,
+        }
+    }
+
+    fn peak(&self) -> f32 {
+        match self {
+            Self::Cpal(capture) => capture.peak(),
+            Self::Vban(input) => input.shared.peak_value(),
+        }
+    }
+
+    fn ring_fill_ms(&self) -> f32 {
+        match self {
+            Self::Cpal(capture) => capture.ring_fill_ms(),
+            Self::Vban(input) => input.shared.fill_ms(input.sample_rate()),
+        }
+    }
+
+    fn last_frames(&self) -> usize {
+        match self {
+            Self::Cpal(capture) => capture.last_frames(),
+            Self::Vban(input) => input.shared.frames_last(),
+        }
+    }
+
+    fn shared(&self) -> Arc<audio::InputShared> {
+        match self {
+            Self::Cpal(capture) => capture.shared(),
+            Self::Vban(input) => input.shared.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct StripClip {
     gain_db: f32,
@@ -781,7 +876,7 @@ struct MixerApp {
     pending_auto_assign: Vec<usize>,
     buses: Vec<Bus>,
     /// One real capture stream per hardware strip (None until a device opens).
-    captures: Vec<Option<InputCapture>>,
+    captures: Vec<Option<StripInput>>,
     tape: Tape,
     audio: AudioEngine,
     sample_rate: u32,
@@ -807,12 +902,22 @@ struct MixerApp {
     lock_gui: bool,
     help_caption: bool,
     menu_open: bool,
+    /// Ignore the outside-click test on the frame that opened the menu; the
+    /// MENU button click is outside the popup and would close it immediately.
+    menu_ignore_click: bool,
     show_system: bool,
     show_vc: bool,
     vc: crate::vc::VirtualCables,
     vc_cfg: virtual_cables::Config,
     show_about: bool,
     show_audio_stats: bool,
+    show_vban: bool,
+    vban: vban::VbanHub,
+    vban_enabled: bool,
+    vban_port: u16,
+    vban_quality: u8,
+    vban_target_strip: usize,
+    vban_out: Vec<vban::VbanOutConfig>,
     show_tape_opts: bool,
     /// FUN_0052d990 / FUN_0052de50 preset scene browser: a saved scene with
     /// PresetName / PresetComment / PresetTimeStamp around the parameter block.
@@ -1240,12 +1345,12 @@ impl MixerApp {
         // its meter shows the real signal without any setup. The other two
         // hardware strips open a device when the person picks one.
         let mut strips: Vec<Strip> = (0..MAX_STRIPS).map(Strip::new).collect();
-        let mut captures: Vec<Option<InputCapture>> =
+        let mut captures: Vec<Option<StripInput>> =
             (0..MAX_STRIPS).map(|_| None).collect();
         let first_input = InputCapture::open(None);
         if first_input.available {
             strips[0].device = first_input.device.clone();
-            captures[0] = Some(first_input);
+            captures[0] = Some(StripInput::Cpal(first_input));
         }
 
         let mut app = MixerApp {
@@ -1276,12 +1381,20 @@ impl MixerApp {
             lock_gui: false,
             help_caption: true,
             menu_open: false,
+            menu_ignore_click: false,
             show_system: false,
             show_vc: false,
             vc: crate::vc::VirtualCables::new(),
             vc_cfg: virtual_cables::Config::import_legacy().unwrap_or_default(),
             show_about: false,
             show_audio_stats: false,
+            show_vban: false,
+            vban: vban::VbanHub::new(),
+            vban_enabled: false,
+            vban_port: vban::DEFAULT_PORT,
+            vban_quality: 1,
+            vban_target_strip: 3,
+            vban_out: Vec::new(),
             show_tape_opts: false,
             show_presets: false,
             preset_name: String::new(),
@@ -1446,6 +1559,12 @@ impl MixerApp {
         }
         if std::env::args().any(|a| a == "--audio-stats") {
             app.show_audio_stats = true;
+        }
+        if std::env::args().any(|a| a == "--menu") {
+            app.menu_open = true;
+        }
+        if std::env::args().any(|a| a == "--vban") {
+            app.show_vban = true;
         }
         // Headless check of the scene writer/reader used by the build.
         if std::env::args().any(|a| a == "--load-settings") {
@@ -1864,11 +1983,22 @@ impl MixerApp {
         // so a CABLES restart swaps in the new USB devices.
         self.audio
             .set_virtual_outputs(self.vc.device(1), self.vc.device(2));
+        self.audio.set_vban_tx(self.vban.tx_targets());
     }
 
     /// Re-open A1 with the values in System Settings. FUN_00527ad0 only takes
     /// the seven standard rates and a main buffer of at most 2048 samples; the
     /// exact A1 error text is returned when the device refuses the format.
+    fn apply_vban_config(&mut self) {
+        self.vban.configure(self.vban_enabled, self.vban_port);
+        let configs = if self.vban_enabled {
+            self.vban_out.clone()
+        } else {
+            Vec::new()
+        };
+        let _ = self.vban.set_senders(configs, self.audio.sample_rate);
+    }
+
     fn apply_audio_format(&mut self) -> Result<(), String> {
         let preferred = self.buses[0].device.clone();
         let preferred = if AudioEngine::output_devices()
@@ -1885,6 +2015,8 @@ impl MixerApp {
         self.sample_rate = self.audio.sample_rate.max(8_000);
         if result.is_ok() {
             self.reload_tape_audio();
+            // Sender pacing/resampling follows the A1 rate.
+            self.apply_vban_config();
         }
         result
     }
@@ -1965,16 +2097,19 @@ impl MixerApp {
                 let Some(cap) = self.captures[i].as_ref() else {
                     continue;
                 };
-                let gone = !inputs.iter().any(|d| d == &cap.device);
+                if matches!(cap, StripInput::Vban(_)) {
+                    continue;
+                }
+                let gone = !inputs.iter().any(|d| d == cap.device());
                 if !gone {
                     continue;
                 }
-                let name = cap.device.clone();
+                let name = cap.device().to_string();
                 let reopened = InputCapture::open(Some(&name));
                 if reopened.available {
                     self.audio.attach_input(i, reopened.shared());
                     self.strips[i].device = reopened.device.clone();
-                    self.captures[i] = Some(reopened);
+                    self.captures[i] = Some(StripInput::Cpal(reopened));
                     self.toast(format!("Input re-opened: {name}"));
                 }
             }
@@ -1987,6 +2122,9 @@ impl MixerApp {
         let vc_attached = self.vc.status().attached;
         if vc_attached && !self.vc_was_attached {
             for i in 3..self.active_strips {
+                if matches!(self.captures[i], Some(StripInput::Vban(_))) {
+                    continue;
+                }
                 let name = &self.strips[i].device;
                 if !name.trim().is_empty()
                     && name != "Virtual 1 (VAIO)"
@@ -2154,9 +2292,8 @@ impl MixerApp {
                 // includes every routed strip, the A1 fader, mute, mono, EQ and
                 // soft limiter.
                 output
-            } else if bi >= 3 {
-                // B1/B2 are real outputs now; show the level actually written
-                // into their virtual cable.
+            } else if bi >= 1 {
+                // A2/A3 and B1/B2 are real bus stems now (VBAN/cable outputs).
                 bus_peaks[bi]
             } else {
                 bus_source[bi] * db_to_lin(b.gain_db)
@@ -2535,6 +2672,43 @@ impl MixerApp {
             vc.max_rate,
             vc.uac_mode.as_str()
         ));
+        text.push_str(&format!(
+            "\t<VBAN enabled='{}' localPort='{}' quality='{}' />\n",
+            self.vban_enabled as u8, self.vban_port, self.vban_quality
+        ));
+        for i in 0..self.active_strips {
+            if let Some(StripInput::Vban(input)) = self.captures[i].as_ref() {
+                if let Some((name, ip, port)) = Self::parse_vban_device(&input.device) {
+                    text.push_str(&format!(
+                        "\t<VBANStreamIn index='{}' in='{}' name=\"{}\" ip='{}' port='{}' NQ='{}' />\n",
+                        i + 1,
+                        i + 1,
+                        xml_escape(&name),
+                        xml_escape(&ip),
+                        port,
+                        self.vban_quality
+                    ));
+                }
+            }
+        }
+        for (index, out) in self.vban_out.iter().enumerate() {
+            let (ip, port) = out
+                .target
+                .rsplit_once(':')
+                .unwrap_or((out.target.as_str(), "6980"));
+            text.push_str(&format!(
+                "\t<VBANStreamOut index='{}' bus='{}' name=\"{}\" ip='{}' port='{}' SR='{}' ch='{}' NQ='{}' format='{}' />\n",
+                index + 1,
+                out.bus,
+                xml_escape(&out.name),
+                xml_escape(ip),
+                port,
+                out.sample_rate,
+                out.channels,
+                out.quality,
+                out.format.code()
+            ));
+        }
         let route: String = self
             .tape
             .route
@@ -2658,6 +2832,8 @@ impl MixerApp {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 self.load_settings_xml(&text);
+                self.apply_saved_inputs();
+                self.apply_vban_config();
                 self.restore_vst(false);
                 self.preset_active = xml_elements(&text, "PresetName")
                     .first()
@@ -2710,6 +2886,7 @@ impl MixerApp {
                 // <InputDev> only stores a name; open the stream again so the
                 // restored HW INPUT 1-3 really work after a restart.
                 self.apply_saved_inputs();
+                self.apply_vban_config();
                 if announce {
                     self.toast("Settings loaded");
                 }
@@ -2718,6 +2895,7 @@ impl MixerApp {
                 // Settings written by the earlier build still load.
                 self.load_settings_legacy();
                 self.apply_saved_inputs();
+                self.apply_vban_config();
             }
         }
     }
@@ -2739,6 +2917,14 @@ impl MixerApp {
                 {
                     highest = highest.max(idx.min(MAX_STRIPS));
                 }
+            }
+        }
+        for (attrs, _) in xml_elements(text, "VBANStreamIn") {
+            if let Some(idx) = xml_attr(attrs, "in")
+                .or_else(|| xml_attr(attrs, "index"))
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                highest = highest.max(idx.min(MAX_STRIPS));
             }
         }
         for (attrs, _) in xml_elements(text, "VstPlugin") {
@@ -2793,6 +2979,50 @@ impl MixerApp {
                     self.vc_cfg.uac_mode = mode;
                 }
             }
+        }
+
+        if let Some((attrs, _)) = xml_elements(text, "VBAN").first() {
+            if let Some(value) = xml_attr(attrs, "enabled") {
+                self.vban_enabled = value == "1" || value.eq_ignore_ascii_case("true");
+            }
+            if let Some(value) = xml_attr(attrs, "localPort").and_then(|v| v.parse::<u16>().ok()) {
+                self.vban_port = value;
+            }
+            if let Some(value) = xml_attr(attrs, "quality").and_then(|v| v.parse::<u8>().ok()) {
+                self.vban_quality = value.min(4);
+            }
+        }
+        self.vban_out.clear();
+        for (attrs, _) in xml_elements(text, "VBANStreamOut") {
+            let mut out = vban::VbanOutConfig::default();
+            if let Some(value) = xml_attr(attrs, "bus").and_then(|v| v.parse::<usize>().ok()) {
+                out.bus = value.min(4);
+            }
+            if let Some(value) = xml_attr(attrs, "name") {
+                out.name = xml_unescape(&value);
+            }
+            let ip = xml_attr(attrs, "ip").map(|v| xml_unescape(&v)).unwrap_or_default();
+            let port = xml_attr(attrs, "port").unwrap_or_else(|| "6980".to_string());
+            out.target = if ip.is_empty() {
+                format!("127.0.0.1:{port}")
+            } else if ip.contains(':') && !ip.starts_with('[') {
+                format!("[{ip}]:{port}")
+            } else {
+                format!("{ip}:{port}")
+            };
+            if let Some(value) = xml_attr(attrs, "SR").and_then(|v| v.parse::<u32>().ok()) {
+                out.sample_rate = value;
+            }
+            if let Some(value) = xml_attr(attrs, "ch").and_then(|v| v.parse::<usize>().ok()) {
+                out.channels = value.clamp(1, 2);
+            }
+            if let Some(value) = xml_attr(attrs, "NQ").and_then(|v| v.parse::<u8>().ok()) {
+                out.quality = value.min(4);
+            }
+            if let Some(value) = xml_attr(attrs, "format").and_then(|v| v.parse::<u8>().ok()) {
+                out.format = vban::VbanFormat::from_code(value).unwrap_or(vban::VbanFormat::Float32);
+            }
+            self.vban_out.push(out);
         }
 
         for (i, s) in self
@@ -3163,6 +3393,31 @@ impl MixerApp {
             }
             let _ = body;
         }
+        // Incoming VBAN bindings are primarily restored from InputDev; this
+        // fallback keeps a scene that only carries the original-style stream
+        // entries working too.
+        for (attrs, _) in xml_elements(text, "VBANStreamIn") {
+            let raw = xml_attr(attrs, "in")
+                .or_else(|| xml_attr(attrs, "index"))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let strip = raw.saturating_sub(1).min(MAX_STRIPS - 1);
+            if strip >= self.active_strips || self.strips[strip].device.starts_with("VBAN: ") {
+                continue;
+            }
+            let Some(name) = xml_attr(attrs, "name") else {
+                continue;
+            };
+            let name = xml_unescape(&name);
+            if name.trim().is_empty() {
+                continue;
+            }
+            let ip = xml_attr(attrs, "ip")
+                .map(|v| xml_unescape(&v))
+                .unwrap_or_default();
+            let port = xml_attr(attrs, "port").unwrap_or_else(|| "6980".to_string());
+            self.strips[strip].device = format!("VBAN: {name} @ {ip}:{port}");
+        }
         for (attrs, _body) in xml_elements(text, "OutputDev") {
             if let Some(idx) = xml_attr(attrs, "index").and_then(|v| v.parse::<usize>().ok()) {
                 if (1..=3).contains(&idx) {
@@ -3313,7 +3568,7 @@ impl MixerApp {
             if capture.available {
                 self.strips[idx].device = capture.device.clone();
                 self.audio.attach_input(idx, capture.shared());
-                self.captures[idx] = Some(capture);
+                self.captures[idx] = Some(StripInput::Cpal(capture));
                 self.toast(format!(
                     "Virtual {} added - listening to {cable}",
                     idx - 2
@@ -3340,7 +3595,7 @@ impl MixerApp {
                 if capture.available {
                     self.strips[idx].device = capture.device.clone();
                     self.audio.attach_input(idx, capture.shared());
-                    self.captures[idx] = Some(capture);
+                    self.captures[idx] = Some(StripInput::Cpal(capture));
                     self.toast(format!(
                         "Virtual {} listening to {cable}",
                         idx - 2
@@ -3359,6 +3614,7 @@ impl MixerApp {
             return;
         }
         let idx = self.active_strips - 1;
+        self.vban.unbind(idx);
         self.captures[idx] = None;
         self.audio.detach_input(idx);
         let chain = self.audio.vst(idx);
@@ -3380,22 +3636,69 @@ impl MixerApp {
         self.toast(format!("Virtual {} removed", idx - 2));
     }
 
+    fn parse_vban_device(device: &str) -> Option<(String, String, u16)> {
+        let rest = device.strip_prefix("VBAN: ")?;
+        let (name, address) = rest.rsplit_once(" @ ")?;
+        let (ip, port) = address.rsplit_once(':')?;
+        Some((name.to_string(), ip.to_string(), port.parse().ok()?))
+    }
+
+    fn set_vban_input(&mut self, i: usize, name: &str, ip: &str, port: u16, quality: u8) {
+        self.vban.unbind(i);
+        let sink = self.vban.new_sink();
+        self.vban.bind(i, name, ip, quality, sink.clone());
+        let device = format!("VBAN: {name} @ {ip}:{port}");
+        self.strips[i].device = device.clone();
+        self.strips[i].tape_feed = false;
+        self.audio.attach_input(i, sink.clone());
+        self.captures[i] = Some(StripInput::Vban(VbanInput::new(sink, device)));
+    }
+
     /// Re-open the inputs named in a restored scene. Only names that exist on
     /// this machine are opened; a placeholder or an unplugged device stays
     /// visible in the strip header so the person can reconnect it. Virtual
     /// strips list Windows capture endpoints, so a saved USB interface or
-    /// virtual cable reopens too.
+    /// virtual cable reopens too. `VBAN:` devices are bindings rather than
+    /// Windows endpoints and wait for their stream.
     fn apply_saved_inputs(&mut self) {
         let available = InputCapture::devices();
         for i in 0..self.active_strips {
             let name = self.strips[i].device.clone();
             self.strips[i].tape_feed = i == 3 && name == "Virtual 1 (VAIO)";
+            let is_vban = name.starts_with("VBAN: ");
+            if matches!(self.captures[i], Some(StripInput::Vban(_))) {
+                let matches = self
+                    .captures[i]
+                    .as_ref()
+                    .map(|c| c.device().eq_ignore_ascii_case(&name))
+                    .unwrap_or(false);
+                if !is_vban || !matches {
+                    self.vban.unbind(i);
+                    self.captures[i] = None;
+                    self.audio.detach_input(i);
+                }
+            }
+            if is_vban {
+                if self
+                    .captures[i]
+                    .as_ref()
+                    .map(|c| c.device().eq_ignore_ascii_case(&name))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if let Some((stream, ip, port)) = Self::parse_vban_device(&name) {
+                    self.set_vban_input(i, &stream, &ip, port, self.vban_quality);
+                }
+                continue;
+            }
             if name == "No input"
                 || name == "No input device found"
                 || name == "No device"
                 || name == "Virtual 1 (VAIO)"
                 || name == "Virtual 2 (AUX)"
             {
+                self.vban.unbind(i);
                 self.captures[i] = None;
                 self.audio.detach_input(i);
                 self.strips[i].meter = 0.0;
@@ -3405,7 +3708,7 @@ impl MixerApp {
             if self
                 .captures[i]
                 .as_ref()
-                .map(|c| c.device.eq_ignore_ascii_case(&name))
+                .map(|c| c.device().eq_ignore_ascii_case(&name))
                 .unwrap_or(false)
             {
                 continue;
@@ -3417,7 +3720,7 @@ impl MixerApp {
             if capture.available {
                 self.strips[i].device = capture.device.clone();
                 self.audio.attach_input(i, capture.shared());
-                self.captures[i] = Some(capture);
+                self.captures[i] = Some(StripInput::Cpal(capture));
             } else {
                 self.captures[i] = None;
                 self.audio.detach_input(i);
@@ -3632,6 +3935,7 @@ impl MixerApp {
         self.captures = (0..MAX_STRIPS).map(|_| None).collect();
         self.active_strips = BASE_STRIPS;
         self.strip_bank = 0;
+        self.vban.unbind_all();
         for i in 0..MAX_STRIPS {
             self.audio.detach_input(i);
         }
@@ -3738,11 +4042,14 @@ impl MixerApp {
         let menu_rect = Rect::from_min_size(Pos2::new(rect.left() + 166.0, rect.top() + 7.0), Vec2::new(64.0, 24.0));
         if top_button(ui, menu_rect, "MENU", self.menu_open, AMBER) {
             self.menu_open = !self.menu_open;
+            if self.menu_open {
+                self.menu_ignore_click = true;
+            }
         }
 
         let vban_rect = Rect::from_min_size(Pos2::new(rect.left() + 234.0, rect.top() + 7.0), Vec2::new(56.0, 24.0));
-        if top_button(ui, vban_rect, "VBAN", false, TEAL) {
-            self.toast("VBAN network options are not part of this control surface");
+        if top_button(ui, vban_rect, "VBAN", self.show_vban, TEAL) {
+            self.show_vban = true;
         }
 
         // preset / scene badge
@@ -5188,35 +5495,43 @@ impl MixerApp {
                     .rounding(4.0)
                     .inner_margin(egui::Margin::same(5.0))
                     .show(ui, |ui| {
-                        ui.set_width(292.0);
-                        if menu_item(ui, "Show Control Panel...", "", true) {
+                        ui.set_width(620.0);
+                        ui.columns(2, |cols| {
+                            let (left_slice, right_slice) = cols.split_at_mut(1);
+                            let left = &mut left_slice[0];
+                            let right = &mut right_slice[0];
+                        if menu_item(left, "Show Control Panel...", "", true) {
                             self.show_system = true;
                             close = true;
                         }
-                        if menu_item(ui, "Restart Audio Engine", "Ctrl+R", true) {
+                        if menu_item(left, "Audio Stats...", "", true) {
+                            self.show_audio_stats = true;
+                            close = true;
+                        }
+                        if menu_item(left, "Restart Audio Engine", "Ctrl+R", true) {
                             self.menu_command(CMD_RESTART_ENGINE);
                             close = true;
                         }
                         if check_item(
-                            ui,
+                            left,
                             "Auto Restart Audio Engine (A1 Device)",
                             self.auto_restart_a1,
                         ) {
                             self.menu_command(CMD_AUTO_RESTART_A1);
                         }
                         if check_item(
-                            ui,
+                            left,
                             "Auto Restart Audio Engine (All Device)",
                             self.auto_restart_all,
                         ) {
                             self.menu_command(CMD_AUTO_RESTART_ALL);
                         }
-                        ui.separator();
-                        if menu_item(ui, "Load Settings...", "", true) {
+                        left.separator();
+                        if menu_item(left, "Load Settings...", "", true) {
                             self.load_settings(true);
                             close = true;
                         }
-                        if check_item(ui, "Load Settings on Startup", self.load_on_startup) {
+                        if check_item(left, "Load Settings on Startup", self.load_on_startup) {
                             self.load_on_startup = !self.load_on_startup;
                             self.toast(if self.load_on_startup {
                                 "Settings will load when the console starts"
@@ -5224,11 +5539,11 @@ impl MixerApp {
                                 "The console will start with the default scene"
                             });
                         }
-                        if menu_item(ui, "Save Settings...", "", true) {
+                        if menu_item(left, "Save Settings...", "", true) {
                             self.save_settings();
                             close = true;
                         }
-                        if check_item(ui, "Save Settings on Exit", self.save_on_exit) {
+                        if check_item(left, "Save Settings on Exit", self.save_on_exit) {
                             self.save_on_exit = !self.save_on_exit;
                             self.toast(if self.save_on_exit {
                                 "Settings will be saved when the console closes"
@@ -5236,17 +5551,17 @@ impl MixerApp {
                                 "Settings are only saved with Save Settings"
                             });
                         }
-                        if menu_item(ui, "Reset Settings (Re-Initialization)", "", true) {
+                        if menu_item(left, "Reset Settings (Re-Initialization)", "", true) {
                             self.reset_all();
                             close = true;
                         }
-                        ui.separator();
-                        if menu_item(ui, "Preset Scene...", "Ctrl+4", true) {
+                        left.separator();
+                        if menu_item(left, "Preset Scene...", "Ctrl+4", true) {
                             self.open_presets();
                             close = true;
                         }
                         if check_item(
-                            ui,
+                            left,
                             "Show Preset Scene On Startup",
                             self.show_preset_on_startup,
                         ) {
@@ -5257,23 +5572,23 @@ impl MixerApp {
                                 "The console will start on the console view"
                             });
                         }
-                        if menu_item(ui, "System Settings...", "Ctrl+',''", true) {
+                        if menu_item(left, "System Settings...", "Ctrl+',''", true) {
                             self.show_system = true;
                             close = true;
                         }
-                        if menu_item(ui, "Virtual Cables...", "Ctrl+Shift+V", true) {
+                        if menu_item(left, "Virtual Cables...", "Ctrl+Shift+V", true) {
                             self.show_vc = true;
                             close = true;
                         }
-                        if menu_item(ui, "Tape Recorder Options...", "Ctrl+5", true) {
+                        if menu_item(left, "Tape Recorder Options...", "Ctrl+5", true) {
                             self.show_tape_opts = true;
                             close = true;
                         }
-                        if menu_item(ui, "Eject Cassette (release audio file)", "", true) {
+                        if menu_item(left, "Eject Cassette (release audio file)", "", true) {
                             self.eject_tape();
                             close = true;
                         }
-                        if menu_item(ui, "M.I.D.I. Mapping...", "Ctrl+3", true) {
+                        if menu_item(right, "M.I.D.I. Mapping...", "Ctrl+3", true) {
                             self.show_info = Some((
                                 "M.I.D.I. Mapping".to_string(),
                                 "This rebuild is a control surface and does not open MIDI ports."
@@ -5281,16 +5596,11 @@ impl MixerApp {
                             ));
                             close = true;
                         }
-                        if menu_item(ui, "VBAN Options...", "Ctrl+1", true) {
-                            self.show_info = Some((
-                                "VBAN Options".to_string(),
-                                "VBAN streams audio between machines over the local network. \
-                                 It is a separate network engine."
-                                    .to_string(),
-                            ));
+                        if menu_item(right, "VBAN Options...", "Ctrl+1", true) {
+                            self.show_vban = true;
                             close = true;
                         }
-                        if menu_item(ui, "VBAN Chat Room...", "Ctrl+2", true) {
+                        if menu_item(right, "VBAN Chat Room...", "Ctrl+2", true) {
                             self.show_info = Some((
                                 "VBAN Chat Room".to_string(),
                                 "VBAN networking is not part of this control-surface \
@@ -5299,7 +5609,7 @@ impl MixerApp {
                             ));
                             close = true;
                         }
-                        if menu_item(ui, "Check Driver Installation...", "", true) {
+                        if menu_item(right, "Check Driver Installation...", "", true) {
                             self.show_info = Some((
                                 "Check Driver Installation".to_string(),
                                 "The virtual audio inputs and outputs are Windows drivers installed \
@@ -5308,29 +5618,25 @@ impl MixerApp {
                             ));
                             close = true;
                         }
-                        ui.separator();
-                        if check_item(ui, "Lock Graphic User Interface", self.lock_gui) {
+                        right.separator();
+                        if check_item(right, "Lock Graphic User Interface", self.lock_gui) {
                             self.lock_gui = !self.lock_gui;
                         }
-                        if check_item(ui, "Limit Remote Gain to 0 dBfs", self.limit_remote) {
+                        if check_item(right, "Limit Remote Gain to 0 dBfs", self.limit_remote) {
                             self.limit_remote = !self.limit_remote;
                         }
-                        if check_item(ui, "Show Contextual Help In Caption", self.help_caption) {
+                        if check_item(right, "Show Contextual Help In Caption", self.help_caption) {
                             self.help_caption = !self.help_caption;
                         }
-                        if check_item(ui, "Monitor on BUS SEL", self.monitor_on_sel) {
+                        if check_item(right, "Monitor on BUS SEL", self.monitor_on_sel) {
                             self.monitor_on_sel = !self.monitor_on_sel;
                         }
-                        ui.separator();
-                        if menu_item(ui, "Audio Stats...", "", true) {
-                            self.show_audio_stats = true;
-                            close = true;
-                        }
-                        if menu_item(ui, "About Box / License...", "", true) {
+                        right.separator();
+                        if menu_item(right, "About Box / License...", "", true) {
                             self.show_about = true;
                             close = true;
                         }
-                        if menu_item(ui, "Online Help / Support...", "", true) {
+                        if menu_item(right, "Online Help / Support...", "", true) {
                             self.show_info = Some((
                                 "Online Help / Support".to_string(),
                                 "."
@@ -5338,13 +5644,14 @@ impl MixerApp {
                             ));
                             close = true;
                         }
-                        if menu_item(ui, "Exit Menu", "Esc", true) {
+                        if menu_item(right, "Exit Menu", "Esc", true) {
                             close = true;
                         }
-                        ui.separator();
-                        if menu_item(ui, "Shut Down Audio Mixer PRO", "", true) {
+                        right.separator();
+                        if menu_item(right, "Shut Down Audio Mixer PRO", "", true) {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
+                        }); // columns
                     });
             });
         let clicked_outside = ctx.input(|i| i.pointer.any_click())
@@ -5352,7 +5659,9 @@ impl MixerApp {
                 .response
                 .rect
                 .contains(ctx.input(|i| i.pointer.interact_pos()).unwrap_or(Pos2::ZERO));
-        if close || clicked_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if self.menu_ignore_click {
+            self.menu_ignore_click = false;
+        } else if close || clicked_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.menu_open = false;
         }
     }
@@ -5534,6 +5843,294 @@ impl MixerApp {
             }
         }
 
+        if self.show_vban {
+            let mut open = self.show_vban;
+            egui::Window::new("VBAN Network")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(720.0)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    let status = self.vban.status();
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.vban_enabled, "Enabled");
+                        ui.label("UDP port:");
+                        ui.add(egui::DragValue::new(&mut self.vban_port).range(1024..=65535));
+                        ui.label("Quality:");
+                        egui::ComboBox::from_id_source("vban_q")
+                            .selected_text(
+                                ["Fast", "Medium", "Safe", "Slow", "Very slow"]
+                                    [self.vban_quality.min(4) as usize],
+                            )
+                            .show_ui(ui, |ui| {
+                                for (i, label) in
+                                    ["Fast", "Medium", "Safe", "Slow", "Very slow"].iter().enumerate()
+                                {
+                                    ui.selectable_value(
+                                        &mut self.vban_quality,
+                                        i as u8,
+                                        *label,
+                                    );
+                                }
+                            });
+                        if ui.button("Apply").clicked() {
+                            self.apply_vban_config();
+                            self.toast("VBAN settings applied");
+                        }
+                    });
+                    let state = if status.running {
+                        format!(
+                            "Listening on UDP {} - {} stream(s), {} binding(s)",
+                            status.port, status.streams, status.bindings
+                        )
+                    } else {
+                        "VBAN receive is stopped".to_string()
+                    };
+                    ui.label(
+                        egui::RichText::new(state)
+                            .color(if status.running { GREEN } else { DIM }),
+                    );
+                    if let Some(err) = &status.error {
+                        ui.colored_label(RED, err);
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Allow UDP through Windows Firewall. A stream appears only while it \
+                             is sending to this machine's port.",
+                        )
+                        .size(9.0)
+                        .color(FAINT),
+                    );
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("DISCOVERED STREAMS").strong().color(AMBER),
+                    );
+                    let discovered = self.vban.discovered();
+                    if discovered.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Waiting for VBAN audio packets...")
+                                .size(10.0)
+                                .color(DIM),
+                        );
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Assign to:");
+                            let labels: Vec<String> = (0..self.active_strips)
+                                .map(|i| self.strip_label(i))
+                                .collect();
+                            let selected = self
+                                .vban_target_strip
+                                .min(self.active_strips.saturating_sub(1));
+                            egui::ComboBox::from_id_source("vban_target")
+                                .selected_text(
+                                    labels.get(selected).cloned().unwrap_or_default(),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, label) in labels.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut self.vban_target_strip,
+                                            i,
+                                            label,
+                                        );
+                                    }
+                                });
+                        });
+                        let mut assign = None;
+                        egui::ScrollArea::vertical()
+                            .max_height(120.0)
+                            .show(ui, |ui| {
+                                for stream in &discovered {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!(
+                                            "{}  {}:{}  {} Hz / {} ch / {}",
+                                            stream.name,
+                                            stream.ip,
+                                            stream.port,
+                                            stream.sample_rate,
+                                            stream.channels,
+                                            stream.format.label()
+                                        ));
+                                        if ui.small_button("Use").clicked() {
+                                            assign = Some(stream.clone());
+                                        }
+                                    });
+                                }
+                            });
+                        if let Some(stream) = assign {
+                            let target = self
+                                .vban_target_strip
+                                .min(self.active_strips.saturating_sub(1));
+                            self.captures[target] = None;
+                            self.audio.detach_input(target);
+                            self.set_vban_input(
+                                target,
+                                &stream.name,
+                                &stream.ip,
+                                stream.port,
+                                self.vban_quality,
+                            );
+                            self.toast(format!(
+                                "VBAN {} assigned to {}",
+                                stream.name,
+                                self.strip_label(target)
+                            ));
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("INCOMING BINDINGS").strong().color(AMBER),
+                    );
+                    let bindings = self.vban.bindings();
+                    if bindings.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No VBAN input bindings yet.")
+                                .size(10.0)
+                                .color(DIM),
+                        );
+                    }
+                    let mut unbind = None;
+                    for binding in &bindings {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{}  <-  {} @ {}{}  ({} pkts, {} lost, {} dup)",
+                                self.strip_label(binding.strip),
+                                binding.name,
+                                binding.ip,
+                                if binding.waiting { " (waiting)" } else { "" },
+                                binding.packets,
+                                binding.lost,
+                                binding.duplicates
+                            ));
+                            if ui.small_button("Remove").clicked() {
+                                unbind = Some(binding.strip);
+                            }
+                        });
+                    }
+                    if let Some(strip) = unbind {
+                        self.vban.unbind(strip);
+                        self.captures[strip] = None;
+                        self.audio.detach_input(strip);
+                        self.strips[strip].device = "No input".to_string();
+                        self.strips[strip].route = [false; 5];
+                    }
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("OUTGOING STREAMS").strong().color(AMBER),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Sends A1/A2/A3/B1/B2 to another machine. Allow UDP to the target port.",
+                        )
+                        .size(9.0)
+                        .color(FAINT),
+                    );
+                    let bus_labels = ["A1", "A2", "A3", "B1", "B2"];
+                    let mut remove = None;
+                    for (index, out) in self.vban_out.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_source(("vban_bus", index))
+                                .width(48.0)
+                                .selected_text(
+                                    bus_labels.get(out.bus).copied().unwrap_or("A1"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (i, label) in bus_labels.iter().enumerate() {
+                                        ui.selectable_value(&mut out.bus, i, *label);
+                                    }
+                                });
+                            ui.add(
+                                egui::TextEdit::singleline(&mut out.name)
+                                    .desired_width(150.0)
+                                    .hint_text("Stream name"),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut out.target)
+                                    .desired_width(180.0)
+                                    .hint_text("IP:port"),
+                            );
+                            if ui.small_button("x").clicked() {
+                                remove = Some(index);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_source(("vban_sr", index))
+                                .selected_text(format!("{} Hz", out.sample_rate))
+                                .show_ui(ui, |ui| {
+                                    for sr in [44_100u32, 48_000, 96_000] {
+                                        ui.selectable_value(
+                                            &mut out.sample_rate,
+                                            sr,
+                                            format!("{sr} Hz"),
+                                        );
+                                    }
+                                });
+                            egui::ComboBox::from_id_source(("vban_fmt", index))
+                                .selected_text(out.format.label())
+                                .show_ui(ui, |ui| {
+                                    for format in [
+                                        vban::VbanFormat::Pcm16,
+                                        vban::VbanFormat::Pcm24,
+                                        vban::VbanFormat::Float32,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut out.format,
+                                            format,
+                                            format.label(),
+                                        );
+                                    }
+                                });
+                            egui::ComboBox::from_id_source(("vban_oq", index))
+                                .selected_text(format!("Quality {}", out.quality))
+                                .show_ui(ui, |ui| {
+                                    for quality in 0..=4u8 {
+                                        ui.selectable_value(
+                                            &mut out.quality,
+                                            quality,
+                                            format!("Quality {quality}"),
+                                        );
+                                    }
+                                });
+                        });
+                    }
+                    if let Some(index) = remove {
+                        self.vban_out.remove(index);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("+ Add outgoing").clicked() {
+                            let mut out = vban::VbanOutConfig::default();
+                            out.sample_rate = self.audio.sample_rate.max(8_000);
+                            self.vban_out.push(out);
+                        }
+                        if ui.button("Apply outgoing").clicked() {
+                            self.apply_vban_config();
+                            self.toast("VBAN outgoing streams applied");
+                        }
+                    });
+                    for info in self.vban.sender_info() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} -> {} [{}] {} pkts, {} err{}",
+                                bus_labels.get(info.bus).copied().unwrap_or("?"),
+                                info.target,
+                                info.name,
+                                info.packets,
+                                info.errors,
+                                info.last_error
+                                    .map(|err| format!(": {err}"))
+                                    .unwrap_or_default()
+                            ))
+                            .size(9.0)
+                            .color(DIM),
+                        );
+                    }
+                });
+            self.show_vban = open;
+        }
+
         if self.show_audio_stats {
             let mut open = self.show_audio_stats;
             egui::Window::new("Audio Stats")
@@ -5576,8 +6173,8 @@ impl MixerApp {
                             ui.label(format!(
                                 "{}: {} | {} Hz | ring {:.1} ms | last {} frames{}",
                                 self.strips[i].name,
-                                cap.device,
-                                cap.sample_rate,
+                                cap.device(),
+                                cap.sample_rate(),
                                 cap.ring_fill_ms(),
                                 cap.last_frames(),
                                 if mixed { "" } else { " (not mixed to A1/B1/B2)" }
@@ -6347,6 +6944,16 @@ impl MixerApp {
                             list.push("\u{2014} Virtual audio inputs \u{2014}".to_string());
                             list.extend(virtual_tail.iter().map(|s| s.to_string()));
                         }
+                        let vban_streams = self.vban.discovered();
+                        if !vban_streams.is_empty() {
+                            list.push("\u{2014} VBAN network inputs \u{2014}".to_string());
+                            for stream in vban_streams {
+                                list.push(format!(
+                                    "VBAN: {} @ {}:{}",
+                                    stream.name, stream.ip, stream.port
+                                ));
+                            }
+                        }
                         list.push("No device".to_string());
                     } else {
                         list.push("No input".to_string());
@@ -6422,6 +7029,7 @@ impl MixerApp {
                                         || d == "No input device found"
                                         || d == "No device"
                                     {
+                                        self.vban.unbind(i);
                                         self.captures[i] = None;
                                         self.audio.detach_input(i);
                                         self.strips[i].device = "No input".to_string();
@@ -6434,6 +7042,7 @@ impl MixerApp {
                                         && self.strips[i].kind == StripKind::Virtual
                                         && (d == virtual_tail[0] || d == virtual_tail[1])
                                     {
+                                        self.vban.unbind(i);
                                         self.captures[i] = None;
                                         self.audio.detach_input(i);
                                         self.strips[i].device = d.clone();
@@ -6441,9 +7050,28 @@ impl MixerApp {
                                         self.strips[i].peak = 0.0;
                                         self.strips[i].tape_feed = i == 3 && d == virtual_tail[0];
                                         self.toast(format!("Virtual input set to {d}"));
+                                    } else if let Some((stream, ip, port)) =
+                                        Self::parse_vban_device(&d)
+                                    {
+                                        self.captures[i] = None;
+                                        self.audio.detach_input(i);
+                                        if i < 3
+                                            && !self.strips[i].route.iter().any(|r| *r)
+                                        {
+                                            self.strips[i].route[0] = true;
+                                        }
+                                        self.set_vban_input(
+                                            i,
+                                            &stream,
+                                            &ip,
+                                            port,
+                                            self.vban_quality,
+                                        );
+                                        self.toast(format!("VBAN input: {stream}"));
                                     } else {
                                         let capture = InputCapture::open(Some(&d));
                                         if capture.available {
+                                            self.vban.unbind(i);
                                             self.strips[i].device =
                                                 capture.device.clone();
                                             self.audio.attach_input(i, capture.shared());
@@ -6452,13 +7080,14 @@ impl MixerApp {
                                             {
                                                 self.strips[i].route[0] = true;
                                             }
-                                            self.captures[i] = Some(capture);
+                                            self.captures[i] = Some(StripInput::Cpal(capture));
                                             self.strips[i].tape_feed = false;
                                             self.toast(format!(
                                                 "Listening to {d} - its A1-A3/B1-B2 buttons now route it"
                                             ));
                                         } else {
                                             let reason = capture.status.clone();
+                                            self.vban.unbind(i);
                                             self.captures[i] = None;
                                             self.audio.detach_input(i);
                                             self.strips[i].device = d.clone();
@@ -7141,7 +7770,7 @@ fn chip(
 }
 
 fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> bool {
-    let h = 22.0;
+    let h = 24.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click());
     let hovered = resp.hovered() && enabled;
     if hovered {
@@ -7151,7 +7780,7 @@ fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> b
         rect.left_center() + Vec2::new(9.0, 0.0),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(11.0),
+        FontId::proportional(12.0),
         if enabled { TEXT } else { FAINT },
     );
     if !shortcut.is_empty() {
@@ -7159,7 +7788,7 @@ fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> b
             rect.right_center() - Vec2::new(9.0, 0.0),
             Align2::RIGHT_CENTER,
             shortcut,
-            FontId::proportional(9.0),
+            FontId::proportional(9.5),
             FAINT,
         );
     }
@@ -7167,7 +7796,7 @@ fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> b
 }
 
 fn check_item(ui: &mut egui::Ui, label: &str, checked: bool) -> bool {
-    let h = 22.0;
+    let h = 24.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click());
     let hovered = resp.hovered();
     if hovered {
@@ -7177,12 +7806,12 @@ fn check_item(ui: &mut egui::Ui, label: &str, checked: bool) -> bool {
         rect.left_center() + Vec2::new(9.0, 0.0),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(11.0),
+        FontId::proportional(12.0),
         TEXT,
     );
     let box_rect = Rect::from_center_size(
         Pos2::new(rect.right() - 16.0, rect.center().y),
-        Vec2::splat(11.0),
+        Vec2::splat(12.0),
     );
     ui.painter().rect_filled(box_rect, 2.0, Color32::from_rgb(22, 25, 31));
     ui.painter()
@@ -7866,6 +8495,9 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         } else if arg == "--virtual-bus-selftest" {
             audio::virtual_bus_selftest();
+            return Ok(());
+        } else if arg == "--vban-selftest" {
+            vban::vban_selftest();
             return Ok(());
         } else if arg == "--cable-peak" {
             let name = args.next();

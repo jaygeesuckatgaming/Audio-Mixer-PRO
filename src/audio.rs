@@ -10,6 +10,7 @@
 // sheet (MECHANICS.md); the demo material is generated here so the rebuild has
 // something audible without shipping copyrighted audio.
 
+use crate::vban::TxRing;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
 use std::f64::consts::TAU;
@@ -564,6 +565,9 @@ struct Shared {
     gain_db: AtomicU32,
     route: AtomicU32,
     position: AtomicU64,
+    /// Pending seek request applied by the next audio callback. A plain
+    /// `position` store can race with the callback's per-block write.
+    seek_request: AtomicU64,
     length: AtomicU64,
     stop_at_end: AtomicBool,
     loop_playback: AtomicBool,
@@ -577,6 +581,8 @@ struct Shared {
     /// B1 and B2 feed the capture endpoint of two USB cables. The console
     /// binds cables 1 and 2 when the virtual-cable server is running.
     virtual_outputs: Mutex<[Option<Arc<Device>>; 2]>,
+    /// Outgoing VBAN streams: (bus index, sender ring).
+    vban_tx: Mutex<Vec<(usize, Arc<TxRing>)>>,
     /// Live capture streams for all five input strips, in strip order. The
     /// original console feeds the two virtual strips from fixed virtual
     /// devices; this rebuild also lets them open any Windows capture endpoint,
@@ -617,6 +623,7 @@ impl Shared {
             gain_db: f32_atomic(0.0),
             route: AtomicU32::new(1),
             position: AtomicU64::new(0),
+            seek_request: AtomicU64::new(u64::MAX),
             length: AtomicU64::new(0),
             stop_at_end: AtomicBool::new(true),
             loop_playback: AtomicBool::new(false),
@@ -628,6 +635,7 @@ impl Shared {
             bus_eq_on: std::array::from_fn(|_| AtomicBool::new(false)),
             bus_eq_gain: std::array::from_fn(|_| std::array::from_fn(|_| f32_atomic(0.0))),
             virtual_outputs: Mutex::new([None, None]),
+            vban_tx: Mutex::new(Vec::new()),
             inputs: Mutex::new(std::array::from_fn(|_| None)),
             strips: std::array::from_fn(|_| StripMix::new()),
             active_strips: AtomicUsize::new(BASE_STRIPS),
@@ -723,10 +731,8 @@ struct Dsp {
     vst_ready: [bool; MAX_STRIPS],
     // B1/B2 are rendered alongside A1 and handed to their virtual cable's
     // capture endpoint as PCM, so other applications can record them.
-    out_b1_l: Vec<f32>,
-    out_b1_r: Vec<f32>,
-    out_b2_l: Vec<f32>,
-    out_b2_r: Vec<f32>,
+    out_bus_l: [Vec<f32>; 5],
+    out_bus_r: [Vec<f32>; 5],
     pcm: Vec<u8>,
 }
 
@@ -749,10 +755,8 @@ impl Dsp {
             vst_out_l: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             vst_out_r: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             vst_ready: [false; MAX_STRIPS],
-            out_b1_l: vec![0.0; crate::vst::VST_MAX_BLOCK],
-            out_b1_r: vec![0.0; crate::vst::VST_MAX_BLOCK],
-            out_b2_l: vec![0.0; crate::vst::VST_MAX_BLOCK],
-            out_b2_r: vec![0.0; crate::vst::VST_MAX_BLOCK],
+            out_bus_l: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
+            out_bus_r: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             pcm: Vec::with_capacity(crate::vst::VST_MAX_BLOCK * 2 * 4),
         }
     }
@@ -809,7 +813,12 @@ impl Dsp {
         let len = shared.length.load(Ordering::Relaxed);
         let stop_at_end = shared.stop_at_end.load(Ordering::Relaxed);
         let loop_playback = shared.loop_playback.load(Ordering::Relaxed);
-        let mut pos = shared.position.load(Ordering::Relaxed);
+        let seek = shared.seek_request.swap(u64::MAX, Ordering::Relaxed);
+        let mut pos = if seek == u64::MAX {
+            shared.position.load(Ordering::Relaxed)
+        } else {
+            seek
+        };
         let mut finished = false;
         let mut peak = 0.0f32;
         let mut source_peak = 0.0f32;
@@ -834,7 +843,13 @@ impl Dsp {
             // soloed, it is one of the soloed strips.
             let route = s.route.load(Ordering::Relaxed);
             strip_route[i] = route;
-            let routed = route & (STRIP_ROUTE_A1 | STRIP_ROUTE_B1 | STRIP_ROUTE_B2) != 0;
+            let routed = route
+                & (STRIP_ROUTE_A1
+                    | STRIP_ROUTE_A2
+                    | STRIP_ROUTE_A3
+                    | STRIP_ROUTE_B1
+                    | STRIP_ROUTE_B2)
+                != 0;
             let muted = (strip_flags[i] & 1) != 0;
             let solo = (strip_flags[i] & 2) != 0;
             strip_on[i] = routed && !muted && (!any_solo || solo);
@@ -863,6 +878,13 @@ impl Dsp {
         self.vst_ready = [false; MAX_STRIPS];
         for i in 0..strip_count {
             if !strip_on[i] {
+                // Keep an unrouted/muted input near live time. Without this a
+                // strip can accumulate seconds of backlog and be delayed as
+                // soon as its bus button is turned on.
+                if let Some(ring) = rings[i].as_mut() {
+                    let target = (sample_rate * INPUT_TARGET_MS / 1000.0) as usize;
+                    ring.trim_to(target);
+                }
                 continue;
             }
             let Some(ring) = rings[i].as_mut() else {
@@ -894,10 +916,10 @@ impl Dsp {
         {
             let source_guard = lock_source(&shared.source);
             let source = source_guard.as_ref();
-            self.out_b1_l.resize(frames, 0.0);
-            self.out_b1_r.resize(frames, 0.0);
-            self.out_b2_l.resize(frames, 0.0);
-            self.out_b2_r.resize(frames, 0.0);
+            for bus in 0..5 {
+                self.out_bus_l[bus].resize(frames, 0.0);
+                self.out_bus_r[bus].resize(frames, 0.0);
+            }
 
             for (frame_no, frame) in data.chunks_mut(channels.max(1)).enumerate() {
                 let mut bus_l = [0.0f32; 5];
@@ -915,6 +937,14 @@ impl Dsp {
                         if tape_route & 1 != 0 {
                             bus_l[0] += tl;
                             bus_r[0] += tr;
+                        }
+                        if tape_route & 2 != 0 {
+                            bus_l[1] += tl;
+                            bus_r[1] += tr;
+                        }
+                        if tape_route & 4 != 0 {
+                            bus_l[2] += tl;
+                            bus_r[2] += tr;
                         }
                         if tape_route & 8 != 0 {
                             bus_l[3] += tl;
@@ -956,6 +986,14 @@ impl Dsp {
                     if strip_route[i] & STRIP_ROUTE_A1 != 0 {
                         bus_l[0] += sl;
                         bus_r[0] += sr;
+                    }
+                    if strip_route[i] & STRIP_ROUTE_A2 != 0 {
+                        bus_l[1] += sl;
+                        bus_r[1] += sr;
+                    }
+                    if strip_route[i] & STRIP_ROUTE_A3 != 0 {
+                        bus_l[2] += sl;
+                        bus_r[2] += sr;
                     }
                     if strip_route[i] & STRIP_ROUTE_B1 != 0 {
                         bus_l[3] += sl;
@@ -1015,10 +1053,10 @@ impl Dsp {
                     *out = T::from_sample(v);
                 }
 
-                self.out_b1_l[frame_no] = bus_l[3];
-                self.out_b1_r[frame_no] = bus_r[3];
-                self.out_b2_l[frame_no] = bus_l[4];
-                self.out_b2_r[frame_no] = bus_r[4];
+                for bus in 0..5 {
+                    self.out_bus_l[bus][frame_no] = bus_l[bus];
+                    self.out_bus_r[bus][frame_no] = bus_r[bus];
+                }
 
                 if active && source.is_some() && len > 0 {
                     pos += 1;
@@ -1056,6 +1094,7 @@ impl Dsp {
             shared.bus_peak[b].store(bus_peak[b].to_bits(), Ordering::Relaxed);
         }
         self.write_virtual_outputs(shared, frames);
+        self.write_vban(shared, frames);
         shared.peak.store(peak.to_bits(), Ordering::Relaxed);
 
         let frames_now = frames.max(1);
@@ -1069,6 +1108,17 @@ impl Dsp {
         shared
             .callback_load
             .store(load.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Feed the VBAN sender rings from the post-bus stems. This is a ring
+    /// copy only; the actual UDP send happens on the sender threads.
+    fn write_vban(&self, shared: &Shared, frames: usize) {
+        let targets = lock_source(&shared.vban_tx);
+        for (bus, ring) in targets.iter() {
+            if *bus < 5 {
+                ring.push_block(&self.out_bus_l[*bus], &self.out_bus_r[*bus], frames);
+            }
+        }
     }
 
     /// Send B1/B2 to the capture side of their USB cables as PCM. Called at
@@ -1097,11 +1147,8 @@ impl Dsp {
                 continue;
             }
             let capture_rate = device.capture_rate().max(1);
-            let (left, right) = if slot == 0 {
-                (&self.out_b1_l, &self.out_b1_r)
-            } else {
-                (&self.out_b2_l, &self.out_b2_r)
-            };
+            let bus = if slot == 0 { 3 } else { 4 };
+            let (left, right) = (&self.out_bus_l[bus], &self.out_bus_r[bus]);
             let out_frames = if capture_rate == mixer_rate {
                 frames
             } else {
@@ -1343,6 +1390,7 @@ impl AudioEngine {
         let sr = self.sample_rate.max(1) as f32;
         let frame = ((seconds.max(0.0) * sr) as u64).min(len);
         self.shared.position.store(frame, Ordering::Relaxed);
+        self.shared.seek_request.store(frame, Ordering::Relaxed);
         self.shared.finished.store(false, Ordering::Relaxed);
     }
 
@@ -1418,6 +1466,20 @@ impl AudioEngine {
         if !same {
             guard[0] = b1;
             guard[1] = b2;
+        }
+    }
+
+    /// Replace the VBAN sender targets. The A1 callback copies the selected
+    /// post-bus stems into each ring; the sender threads do the UDP work.
+    pub fn set_vban_tx(&self, targets: Vec<(usize, Arc<TxRing>)>) {
+        let mut guard = lock_source(&self.shared.vban_tx);
+        let same = guard.len() == targets.len()
+            && guard
+                .iter()
+                .zip(targets.iter())
+                .all(|(a, b)| a.0 == b.0 && Arc::ptr_eq(&a.1, &b.1));
+        if !same {
+            *guard = targets;
         }
     }
 
@@ -1731,7 +1793,7 @@ pub(crate) struct InputShared {
 }
 
 impl InputShared {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             ring: Mutex::new(SampleRing::new()),
             rate: AtomicU32::new(48_000),
@@ -1739,6 +1801,43 @@ impl InputShared {
             frames: AtomicUsize::new(0),
             error: Mutex::new(None),
         }
+    }
+
+    /// VBAN receiver feed. The hub pushes decoded stereo frames here; the
+    /// output callback consumes them exactly like a CPAL capture.
+    pub(crate) fn push_block(&self, frames: &[[f32; 2]]) {
+        if frames.is_empty() {
+            return;
+        }
+        let mut peak = 0.0f32;
+        let mut ring = lock_source(&self.ring);
+        for frame in frames {
+            ring.push(*frame);
+            peak = peak.max(frame[0].abs()).max(frame[1].abs());
+        }
+        self.peak.store(peak.to_bits(), Ordering::Relaxed);
+        self.frames.store(frames.len(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_rate(&self, rate: u32) {
+        self.rate.store(rate.max(1), Ordering::Relaxed);
+    }
+
+    pub(crate) fn rate_value(&self) -> u32 {
+        self.rate.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn peak_value(&self) -> f32 {
+        load_f32(&self.peak)
+    }
+
+    pub(crate) fn fill_ms(&self, rate: u32) -> f32 {
+        let fill = lock_source(&self.ring).fill();
+        fill as f32 / rate.max(1) as f32 * 1000.0
+    }
+
+    pub(crate) fn frames_last(&self) -> usize {
+        self.frames.load(Ordering::Relaxed)
     }
 }
 
@@ -1751,6 +1850,7 @@ struct InputReader {
     phase: f32,
     ready: bool,
     drift_tick: u32,
+    starve: u32,
 }
 
 impl InputReader {
@@ -1761,6 +1861,7 @@ impl InputReader {
             phase: 0.0,
             ready: false,
             drift_tick: 0,
+            starve: 0,
         }
     }
 
@@ -1788,6 +1889,13 @@ impl InputReader {
             if let Some(frame) = ring.pop() {
                 self.prev = self.cur;
                 self.cur = frame;
+                self.starve = 0;
+            } else {
+                self.starve = self.starve.saturating_add(1);
+                if self.starve > output_rate / 10 {
+                    self.prev = [0.0, 0.0];
+                    self.cur = [0.0, 0.0];
+                }
             }
             self.phase -= 1.0;
         }
