@@ -812,6 +812,7 @@ struct MixerApp {
     vc: crate::vc::VirtualCables,
     vc_cfg: virtual_cables::Config,
     show_about: bool,
+    show_audio_stats: bool,
     show_tape_opts: bool,
     /// FUN_0052d990 / FUN_0052de50 preset scene browser: a saved scene with
     /// PresetName / PresetComment / PresetTimeStamp around the parameter block.
@@ -1259,7 +1260,7 @@ impl MixerApp {
             audio,
             sample_rate,
             buffer: VAIO_BUFFER_DEFAULT,
-            main_buffer: 1024,
+            main_buffer: 512,
             dev_mme: DEV_MME_DEFAULT,
             dev_wdm: DEV_WDM_DEFAULT,
             dev_ks: DEV_KS_DEFAULT,
@@ -1280,6 +1281,7 @@ impl MixerApp {
             vc: crate::vc::VirtualCables::new(),
             vc_cfg: virtual_cables::Config::import_legacy().unwrap_or_default(),
             show_about: false,
+            show_audio_stats: false,
             show_tape_opts: false,
             show_presets: false,
             preset_name: String::new(),
@@ -1359,6 +1361,12 @@ impl MixerApp {
         }
         app.audio.set_strip_count(app.active_strips);
         app.strip_bank = 0;
+        // Make the saved output period real before the first interaction.
+        // apply_audio_format falls back to the driver default if the requested
+        // buffer is refused, so this cannot leave the console silent.
+        if app.audio.available {
+            let _ = app.apply_audio_format();
+        }
         if app.show_preset_on_startup {
             app.open_presets();
         }
@@ -1435,6 +1443,9 @@ impl MixerApp {
         // Diagnostic for the virtual-cables window (`--cables`).
         if std::env::args().any(|a| a == "--cables") {
             app.show_vc = true;
+        }
+        if std::env::args().any(|a| a == "--audio-stats") {
+            app.show_audio_stats = true;
         }
         // Headless check of the scene writer/reader used by the build.
         if std::env::args().any(|a| a == "--load-settings") {
@@ -2493,11 +2504,18 @@ impl MixerApp {
         text.push_str("</AudioMixerProRecorder>\n");
         // Rebuild extension for state the original keeps in the registry
         // (audio format, menu switches) and for the tape file itself.
+        let latency_profile = match self.main_buffer {
+            256 => "low",
+            512 => "balanced",
+            1024 => "safe",
+            _ => "custom",
+        };
         text.push_str(&format!(
-            "<AppOptions sampleRate='{}' buffer='{}' mainBuffer='{}' engine='{}' limitRemote='{}' lock='{}' autoRestart='{}' autoRestartAll='{}' helpCaption='{}' loadOnStartup='{}' saveOnExit='{}' presetOnStartup='{}' />\n",
+            "<AppOptions sampleRate='{}' buffer='{}' mainBuffer='{}' latencyProfile='{}' engine='{}' limitRemote='{}' lock='{}' autoRestart='{}' autoRestartAll='{}' helpCaption='{}' loadOnStartup='{}' saveOnExit='{}' presetOnStartup='{}' />\n",
             self.sample_rate,
             self.buffer,
             self.main_buffer,
+            latency_profile,
             self.engine_mode,
             self.limit_remote as u8,
             self.lock_gui as u8,
@@ -2510,9 +2528,10 @@ impl MixerApp {
         ));
         let vc = self.vc.config();
         text.push_str(&format!(
-            "\t<VirtualCables enabled='{}' cables='{}' maxRate='{}' uacMode='{}' />\n",
+            "\t<VirtualCables enabled='{}' cables='{}' bufferMs='{}' maxRate='{}' uacMode='{}' />\n",
             vc.enabled as u8,
             vc.cables,
+            vc.buffer_ms,
             vc.max_rate,
             vc.uac_mode.as_str()
         ));
@@ -2748,6 +2767,14 @@ impl MixerApp {
         }
 
         if let Some((attrs, _)) = xml_elements(text, "VirtualCables").first() {
+            // Older scenes and CONFIG.ini had no bufferMs; use the balanced
+            // default instead of inheriting the old 250 ms ring.
+            self.vc_cfg.buffer_ms = 60;
+            if let Some(value) = xml_attr(attrs, "bufferMs") {
+                if let Ok(n) = value.parse::<u32>() {
+                    self.vc_cfg.buffer_ms = n.clamp(20, 5000);
+                }
+            }
             if let Some(value) = xml_attr(attrs, "enabled") {
                 self.vc_cfg.enabled = value == "1" || value.eq_ignore_ascii_case("true");
             }
@@ -3029,6 +3056,7 @@ impl MixerApp {
             self.tape.arm = arm;
         }
         if let Some((attrs, _)) = xml_elements(text, "AppOptions").first() {
+            let has_latency_profile = xml_attr(attrs, "latencyProfile").is_some();
             if let Some(v) = xml_attr(attrs, "sampleRate").and_then(|v| v.parse::<u32>().ok()) {
                 if SAMPLE_RATES.contains(&v) {
                     self.sample_rate = v;
@@ -3039,6 +3067,12 @@ impl MixerApp {
             }
             if let Some(v) = xml_attr(attrs, "mainBuffer").and_then(|v| v.parse::<u32>().ok()) {
                 self.main_buffer = v.min(MAIN_BUFFER_MAX);
+                // 1024 was the old default; moving it to the balanced 512 is
+                // a one-time latency improvement. A saved latencyProfile means
+                // the person chose the value deliberately.
+                if !has_latency_profile && self.main_buffer == 1024 {
+                    self.main_buffer = 512;
+                }
             }
             if let Some(v) = xml_attr(attrs, "engine").and_then(|v| v.parse::<usize>().ok()) {
                 self.engine_mode = v.min(1);
@@ -5288,6 +5322,10 @@ impl MixerApp {
                             self.monitor_on_sel = !self.monitor_on_sel;
                         }
                         ui.separator();
+                        if menu_item(ui, "Audio Stats...", "", true) {
+                            self.show_audio_stats = true;
+                            close = true;
+                        }
                         if menu_item(ui, "About Box / License...", "", true) {
                             self.show_about = true;
                             close = true;
@@ -5368,6 +5406,29 @@ impl MixerApp {
                                     );
                                 }
                             });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Latency profile:");
+                        for (label, samples) in
+                            [("Low", 256u32), ("Balanced", 512), ("Safe", 1024)]
+                        {
+                            if ui
+                                .selectable_label(self.main_buffer == samples, label)
+                                .clicked()
+                            {
+                                self.main_buffer = samples;
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "~{:.1} ms buffer (click Apply)",
+                                self.main_buffer as f32
+                                    / self.sample_rate.max(1) as f32
+                                    * 1000.0
+                            ))
+                            .size(9.0)
+                            .color(FAINT),
+                        );
                     });
                     ui.horizontal(|ui| {
                         ui.label("VAIO buffer:");
@@ -5471,6 +5532,80 @@ impl MixerApp {
             if !open {
                 self.show_system = false;
             }
+        }
+
+        if self.show_audio_stats {
+            let mut open = self.show_audio_stats;
+            egui::Window::new("Audio Stats")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(470.0)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "A1: {} | {} Hz | {} frames | {:.1} ms buffer | callback load {:.0}%",
+                        self.audio.device,
+                        self.audio.sample_rate,
+                        self.audio.callback_frames(),
+                        self.audio.output_latency_ms(),
+                        self.audio.callback_load() * 100.0
+                    ));
+                    ui.separator();
+                    ui.label(egui::RichText::new("VIRTUAL CABLES").strong().color(AMBER));
+                    for n in 1..=self.vc_cfg.cables {
+                        if let Some(device) = self.vc.device(n) {
+                            ui.label(format!(
+                                "Cable {:02}: buffer {} ms | inject {} ms (fill {:.1} ms) | capture {} Hz{}",
+                                n,
+                                device.buffer_ms(),
+                                device.inject_ms(),
+                                device.inject_fill_ms(),
+                                device.capture_rate(),
+                                if device.capture_active() { "" } else { " (idle)" }
+                            ));
+                        }
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("INPUTS").strong().color(AMBER));
+                    for i in 0..self.active_strips {
+                        if let Some(cap) = self.captures[i].as_ref() {
+                            let mixed = self.strips[i].route[0]
+                                || self.strips[i].route[3]
+                                || self.strips[i].route[4];
+                            ui.label(format!(
+                                "{}: {} | {} Hz | ring {:.1} ms | last {} frames{}",
+                                self.strips[i].name,
+                                cap.device,
+                                cap.sample_rate,
+                                cap.ring_fill_ms(),
+                                cap.last_frames(),
+                                if mixed { "" } else { " (not mixed to A1/B1/B2)" }
+                            ));
+                        }
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("VST LATENCY").strong().color(AMBER));
+                    for i in 0..self.active_strips {
+                        if self.vsts[i].loaded() {
+                            let (latency, tail) = self.vsts[i].chain.latency();
+                            let name = self.vsts[i]
+                                .info
+                                .as_ref()
+                                .map(|info| info.name.clone())
+                                .unwrap_or_else(|| "plug-in".to_string());
+                            ui.label(format!(
+                                "{} - {}: {} samples ({:.1} ms), tail {}",
+                                self.strips[i].name,
+                                name,
+                                latency,
+                                latency as f32 / self.sample_rate.max(1) as f32 * 1000.0,
+                                tail
+                            ));
+                        }
+                    }
+                });
+            self.show_audio_stats = open;
         }
 
         if self.show_about {

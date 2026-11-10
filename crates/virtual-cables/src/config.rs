@@ -16,7 +16,9 @@ impl Default for Config {
         Self {
             enabled: true,
             cables: 4,
-            buffer_ms: 250,
+            // Balanced default: enough slack for USB/IP, much lower than the
+            // old 250 ms default that dominated end-to-end latency.
+            buffer_ms: 60,
             max_rate: 48_000,
             uac_mode: Mode::Uac2,
         }
@@ -65,6 +67,11 @@ impl Config {
                 }
                 _ => {}
             }
+        }
+        // 250 ms was the standalone app's old default, not a deliberate choice;
+        // migrate it to the new balanced default.
+        if config.buffer_ms == 250 {
+            config.buffer_ms = 60;
         }
         Some(config)
     }

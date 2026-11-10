@@ -177,6 +177,21 @@ impl VirtualCables {
                     });
                     ui.end_row();
 
+                    ui.label(egui::RichText::new("Buffer").color(TEXT));
+                    egui::ComboBox::from_id_source("vc_buffer")
+                        .width(130.0)
+                        .selected_text(format!("{} ms", cfg.buffer_ms))
+                        .show_ui(ui, |ui| {
+                            for ms in [30u32, 40, 60, 100, 150, 250] {
+                                ui.selectable_value(
+                                    &mut cfg.buffer_ms,
+                                    ms,
+                                    format!("{ms} ms"),
+                                );
+                            }
+                        });
+                    ui.end_row();
+
                     ui.label(egui::RichText::new("Max rate").color(TEXT));
                     egui::ComboBox::from_id_source("vc_max_rate")
                         .width(130.0)
@@ -218,8 +233,9 @@ impl VirtualCables {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(
-                    "After changing Cables, Max rate or Class, click Apply / Restart \
-                     (and restart the audio app using the cable).",
+                    "After changing Cables, Buffer, Max rate or Class, click Apply / Restart \
+                     (and restart the audio app using the cable). Lower Buffer means less \
+                     delay; raise it if the audio drops out.",
                 )
                 .size(9.0)
                 .color(FAINT),

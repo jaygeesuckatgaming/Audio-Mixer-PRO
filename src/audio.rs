@@ -598,6 +598,9 @@ struct Shared {
     /// Post-fader peak of each bus, before the A1 device and after B1/B2 are
     /// injected into their cables.
     bus_peak: [AtomicU32; 5],
+    /// Last A1 callback size and fraction of its period spent in the callback.
+    callback_frames: AtomicUsize,
+    callback_load: AtomicU32,
     /// One VST3 insert per input strip (up to MAX_STRIPS independent slots).
     /// This is a rebuild extension (the original console has no VST loader);
     /// see vst.rs.
@@ -633,6 +636,8 @@ impl Shared {
             source_peak: f32_atomic(0.0),
             peak: f32_atomic(0.0),
             bus_peak: std::array::from_fn(|_| f32_atomic(0.0)),
+            callback_frames: AtomicUsize::new(0),
+            callback_load: f32_atomic(0.0),
             vsts: std::array::from_fn(|_| crate::vst::VstChain::new()),
             error: Mutex::new(None),
         }
@@ -776,6 +781,7 @@ impl Dsp {
     where
         T: cpal::SizedSample + cpal::FromSample<f32>,
     {
+        let started = std::time::Instant::now();
         let sample_rate = shared.sample_rate.load(Ordering::Relaxed) as f32;
         let strip_count = shared
             .active_strips
@@ -1051,6 +1057,18 @@ impl Dsp {
         }
         self.write_virtual_outputs(shared, frames);
         shared.peak.store(peak.to_bits(), Ordering::Relaxed);
+
+        let frames_now = frames.max(1);
+        let period = frames_now as f32 / sample_rate.max(1.0);
+        let load = if period > 0.0 {
+            started.elapsed().as_secs_f32() / period
+        } else {
+            0.0
+        };
+        shared.callback_frames.store(frames_now, Ordering::Relaxed);
+        shared
+            .callback_load
+            .store(load.to_bits(), Ordering::Relaxed);
     }
 
     /// Send B1/B2 to the capture side of their USB cables as PCM. Called at
@@ -1485,6 +1503,23 @@ impl AudioEngine {
         load_f32(&self.shared.peak)
     }
 
+    /// Frames in the last A1 callback, as reported by the device.
+    pub fn callback_frames(&self) -> usize {
+        self.shared.callback_frames.load(Ordering::Relaxed)
+    }
+
+    /// Fraction of the callback period spent processing (0.25 = 25%).
+    pub fn callback_load(&self) -> f32 {
+        load_f32(&self.shared.callback_load)
+    }
+
+    /// One output buffer at the current rate. Real device latency also
+    /// includes the driver/WASAPI engine period.
+    pub fn output_latency_ms(&self) -> f32 {
+        let rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1) as f32;
+        self.callback_frames() as f32 / rate * 1000.0
+    }
+
     /// Peak of the tape material before the A1 fader and EQ. This is the level
     /// a virtual input strip would receive from the deck.
     pub fn source_peak(&self) -> f32 {
@@ -1621,6 +1656,14 @@ impl AudioEngine {
 /// is half a second, enough to bridge the output callback and a slow device
 /// without dropping audio.
 const INPUT_RING_FRAMES: usize = 96_000;
+/// Balanced capture period. Drivers that refuse it fall back to their default.
+const INPUT_BUFFER_FRAMES: u32 = 512;
+/// Keep the live input near this much audio; a startup backlog is trimmed and
+/// slow clock drift is corrected toward it instead of growing toward the ring
+/// capacity.
+const INPUT_TARGET_MS: f32 = 25.0;
+/// Extra fill tolerated before the drift controller starts dropping frames.
+const INPUT_TARGET_HYSTERESIS_MS: f32 = 15.0;
 
 /// Interleaved stereo frames waiting to be mixed into the output. The capture
 /// callback appends, the output callback consumes. A short ring keeps the
@@ -1662,6 +1705,19 @@ impl SampleRing {
         self.count -= 1;
         Some(frame)
     }
+
+    fn fill(&self) -> usize {
+        self.count
+    }
+
+    /// Drop the oldest frames down to `target`, in one lock.
+    fn trim_to(&mut self, target: usize) {
+        let drop = self.count.saturating_sub(target);
+        if drop > 0 {
+            self.read = (self.read + drop) % INPUT_RING_FRAMES;
+            self.count -= drop;
+        }
+    }
 }
 
 pub(crate) struct InputShared {
@@ -1669,6 +1725,8 @@ pub(crate) struct InputShared {
     /// Rate the capture device delivers. The output stream resamples from it.
     rate: AtomicU32,
     peak: AtomicU32,
+    /// Frames in the last capture callback.
+    frames: AtomicUsize,
     error: Mutex<Option<String>>,
 }
 
@@ -1678,6 +1736,7 @@ impl InputShared {
             ring: Mutex::new(SampleRing::new()),
             rate: AtomicU32::new(48_000),
             peak: f32_atomic(0.0),
+            frames: AtomicUsize::new(0),
             error: Mutex::new(None),
         }
     }
@@ -1691,6 +1750,7 @@ struct InputReader {
     cur: [f32; 2],
     phase: f32,
     ready: bool,
+    drift_tick: u32,
 }
 
 impl InputReader {
@@ -1700,11 +1760,20 @@ impl InputReader {
             cur: [0.0, 0.0],
             phase: 0.0,
             ready: false,
+            drift_tick: 0,
         }
     }
 
     fn next(&mut self, ring: &mut SampleRing, input_rate: u32, output_rate: u32) -> [f32; 2] {
+        let output_rate = output_rate.max(1);
+        let target = (output_rate as f32 * INPUT_TARGET_MS / 1000.0) as usize;
+        let high = target + (output_rate as f32 * INPUT_TARGET_HYSTERESIS_MS / 1000.0) as usize;
+
         if !self.ready {
+            // A capture stream can start with a large backlog (a virtual cable
+            // with a big ring, or a device opened long before playback). Drop
+            // the oldest frames once, so live latency starts bounded.
+            ring.trim_to(target);
             if let Some(frame) = ring.pop() {
                 self.cur = frame;
                 self.prev = frame;
@@ -1712,7 +1781,8 @@ impl InputReader {
             }
             return self.cur;
         }
-        let ratio = (input_rate.max(1) as f32) / (output_rate.max(1) as f32);
+
+        let ratio = (input_rate.max(1) as f32) / (output_rate as f32);
         self.phase += ratio;
         while self.phase >= 1.0 {
             if let Some(frame) = ring.pop() {
@@ -1721,6 +1791,20 @@ impl InputReader {
             }
             self.phase -= 1.0;
         }
+
+        // Clock drift: drop one frame occasionally when the ring grows past
+        // the target window. The startup trim below handles big backlogs; this
+        // only keeps a slow drift from becoming permanent latency.
+        if ring.fill() > high {
+            self.drift_tick += 1;
+            if self.drift_tick >= 128 {
+                let _ = ring.pop();
+                self.drift_tick = 0;
+            }
+        } else {
+            self.drift_tick = 0;
+        }
+
         // Keep the last frame when the device falls behind; a brief hold is
         // inaudible and avoids clicks from a starved ring.
         let f = self.phase.clamp(0.0, 1.0);
@@ -1823,9 +1907,19 @@ impl InputCapture {
             .default_input_config()
             .map_err(|e| format!("Could not read the input format for {name}: {e}"))?;
         let sample_format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.config();
+        let mut config: cpal::StreamConfig = supported.config();
+        config.buffer_size = cpal::BufferSize::Fixed(INPUT_BUFFER_FRAMES);
         let shared = Arc::new(InputShared::new());
-        let stream = build_capture_for_format(sample_format, device, &config, shared.clone())?;
+        let stream = match build_capture_for_format(sample_format, device, &config, shared.clone())
+        {
+            Ok(stream) => stream,
+            Err(_) => {
+                // Some drivers refuse a fixed period; keep the device's own
+                // default rather than failing the whole input.
+                config.buffer_size = cpal::BufferSize::Default;
+                build_capture_for_format(sample_format, device, &config, shared.clone())?
+            }
+        };
         stream
             .play()
             .map_err(|e| format!("Could not start {name}: {e}"))?;
@@ -1842,6 +1936,18 @@ impl InputCapture {
 
     pub fn peak(&self) -> f32 {
         load_f32(&self.shared.peak)
+    }
+
+    /// Frames in the last capture callback.
+    pub fn last_frames(&self) -> usize {
+        self.shared.frames.load(Ordering::Relaxed)
+    }
+
+    /// Frames currently waiting in the capture ring, expressed in milliseconds
+    /// at the device rate.
+    pub fn ring_fill_ms(&self) -> f32 {
+        let fill = lock_source(&self.shared.ring).fill();
+        fill as f32 / self.sample_rate.max(1) as f32 * 1000.0
     }
 
     /// The live buffer shared with the output stream, so a strip whose A1
@@ -1925,6 +2031,9 @@ where
                     ring.push([l, r]);
                 }
                 shared.peak.store(peak.to_bits(), Ordering::Relaxed);
+                shared
+                    .frames
+                    .store(data.len() / channels.max(1), Ordering::Relaxed);
             },
             move |err| {
                 *lock_source(&error_shared.error) = Some(format!("Audio input error: {err}"));
@@ -2741,6 +2850,44 @@ pub fn wav_selftest() {
 }
 
 #[cfg(test)]
+mod latency_tests {
+    use super::*;
+
+    #[test]
+    fn reader_trims_startup_backlog() {
+        let mut ring = SampleRing::new();
+        for _ in 0..48_000 {
+            ring.push([0.25, 0.25]);
+        }
+        let mut reader = InputReader::new();
+        let _ = reader.next(&mut ring, 48_000, 48_000);
+        assert!(
+            ring.fill() <= 1_201,
+            "ring fill was {} frames after the startup trim",
+            ring.fill()
+        );
+    }
+
+    #[test]
+    fn reader_drops_slow_clock_drift() {
+        let mut ring = SampleRing::new();
+        for _ in 0..2_000 {
+            ring.push([0.1, 0.1]);
+        }
+        let mut reader = InputReader::new();
+        let _ = reader.next(&mut ring, 48_000, 48_000);
+        for _ in 0..1_000 {
+            ring.push([0.1, 0.1]);
+        }
+        let before = ring.fill();
+        for _ in 0..1_000 {
+            let _ = reader.next(&mut ring, 48_000, 48_000);
+        }
+        assert!(ring.fill() < before, "drift controller did not catch up");
+    }
+}
+
+#[cfg(test)]
 mod probe_tests {
     use super::*;
 
@@ -2873,6 +3020,13 @@ pub fn routing_selftest() {
 /// through a strip routed to each virtual bus, renders one block, then reads
 /// the PCM the cable would hand to a recording application.
 pub fn virtual_bus_selftest() {
+    let b1 = run_virtual_bus(STRIP_ROUTE_B1, 0, 1);
+    let b2 = run_virtual_bus(STRIP_ROUTE_B2, 1, 2);
+    let pass = b1 > 0.1 && b2 > 0.1;
+    println!("virtual buses: b1_peak={b1:.4} b2_peak={b2:.4} pass={pass}");
+}
+
+fn run_virtual_bus(route: u32, slot: usize, number: u8) -> f32 {
     let shared = Shared::new();
     shared.sample_rate.store(48_000, Ordering::Relaxed);
     let input = Arc::new(InputShared::new());
@@ -2891,37 +3045,24 @@ pub fn virtual_bus_selftest() {
     shared.strips[0]
         .gain_db
         .store(0.0f32.to_bits(), Ordering::Relaxed);
-    shared.strips[0]
-        .route
-        .store(STRIP_ROUTE_B1, Ordering::Relaxed);
+    shared.strips[0].route.store(route, Ordering::Relaxed);
     for i in 1..5 {
         shared.strips[i].route.store(0, Ordering::Relaxed);
     }
 
-    let b1 = make_capture_device(1);
-    let b2 = make_capture_device(2);
+    let device = make_capture_device(number);
     {
         let mut outputs = lock_source(&shared.virtual_outputs);
-        outputs[0] = Some(b1.clone());
-        outputs[1] = Some(b2.clone());
+        outputs[slot] = Some(device.clone());
     }
 
-    let frames = 4096usize;
+    // Keep the block below the input reader's 25 ms target so the test does
+    // not mistake the intentional startup trim for lost audio.
+    let frames = 512usize;
     let mut dsp = Dsp::new();
     let mut out = vec![0.0f32; frames * 2];
     dsp.render(&mut out, 2, &shared);
-    let peak1 = read_pcm_peak(&b1, frames);
-
-    shared.strips[0]
-        .route
-        .store(STRIP_ROUTE_B2, Ordering::Relaxed);
-    let mut out2 = vec![0.0f32; frames * 2];
-    dsp.render(&mut out2, 2, &shared);
-    // The first render already pushed one (silent) B2 block, so read both.
-    let peak2 = read_pcm_peak(&b2, frames * 2);
-
-    let pass = peak1 > 0.1 && peak2 > 0.1;
-    println!("virtual buses: b1_peak={peak1:.4} b2_peak={peak2:.4} pass={pass}");
+    read_pcm_peak(&device, frames)
 }
 
 fn make_capture_device(number: u8) -> Arc<Device> {

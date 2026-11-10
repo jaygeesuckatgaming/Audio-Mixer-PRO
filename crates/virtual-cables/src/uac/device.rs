@@ -84,6 +84,8 @@ pub struct Device {
     inject_active: AtomicBool,
     inject_format: AtomicUsize,
     max_rate: u32,
+    buffer_ms: u32,
+    inject_ms: u32,
     state: Mutex<State>,
 }
 
@@ -98,6 +100,11 @@ impl Device {
             48_000 * 2 * 2
         };
         let ring_capacity = (bytes_per_second * latency_ms / 1000) as usize;
+        // B1/B2 are written into their own ring. Keep that feed short so a
+        // continuously running mixer cannot fill a 250 ms queue before the
+        // streaming app starts reading it.
+        let inject_ms = latency_ms.clamp(20, 40);
+        let inject_capacity = (bytes_per_second * inject_ms / 1000).max(1) as usize;
         let resampler_frames = (MAX_SAMPLE_RATE * latency_ms / 1000).max(256) as usize;
         Ok(Self {
             number,
@@ -106,10 +113,12 @@ impl Device {
             descriptors,
             buffer: Ring::new(ring_capacity),
             resampler: Resampler::new(resampler_frames, AUDIO_CHANNELS),
-            inject: Ring::new(ring_capacity),
+            inject: Ring::new(inject_capacity),
             inject_active: AtomicBool::new(false),
             inject_format: AtomicUsize::new(0),
             max_rate,
+            buffer_ms: latency_ms,
+            inject_ms,
             state: Mutex::new(State {
                 configuration: 0,
                 alt_setting: [0; 3],
@@ -527,6 +536,26 @@ impl Device {
     /// Rate Windows selected for the capture endpoint.
     pub fn capture_rate(&self) -> u32 {
         self.state.lock().unwrap().capture_rate
+    }
+
+    pub fn buffer_ms(&self) -> u32 {
+        self.buffer_ms
+    }
+
+    pub fn inject_ms(&self) -> u32 {
+        self.inject_ms
+    }
+
+    pub fn buffer_fill_ms(&self) -> f32 {
+        let (fill, _, _) = self.buffer.stats();
+        let capacity = self.buffer.capacity().max(1);
+        fill as f32 / capacity as f32 * self.buffer_ms as f32
+    }
+
+    pub fn inject_fill_ms(&self) -> f32 {
+        let (fill, _, _) = self.inject.stats();
+        let capacity = self.inject.capacity().max(1);
+        fill as f32 / capacity as f32 * self.inject_ms as f32
     }
 
     pub fn audio_status(&self) -> String {

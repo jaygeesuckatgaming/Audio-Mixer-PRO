@@ -433,7 +433,9 @@ impl VstChain {
         if frames == 0 {
             return false;
         }
-        let Ok(mut inner) = self.inner.lock() else {
+        // Never block the real-time callback behind the editor or a plug-in
+        // load. A busy slot passes dry audio for this block.
+        let Ok(mut inner) = self.inner.try_lock() else {
             return false;
         };
         if inner.failed {
