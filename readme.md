@@ -30,7 +30,7 @@ On the first run UAC will pop up... Just continue and the app starts(Dont worry 
 
 
 # Project Showcase
-**VST**
+**VST 3**
 
 ![VST](https://i.ibb.co/8gmbtM7y/VST.png)
 
