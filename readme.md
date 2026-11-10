@@ -1,8 +1,10 @@
 <div align="center">
 Use at your own risc....
-
-Yes it looks like Voicemeter, because i love Voicemeter but thought it could be improved.
-AND it makes people that are used to Voicemeter to recognize most things....
+Up to 16 Hardware/Virtual Inputs.
+Up to 32 Virtual Cables.
+Separate VST 3´s for each channel.
+VBAN with Auto discover sources.
+All Input strips can act as a Hardware Input or a Virtual Input.
 
 Requires 
 usbip-win2
