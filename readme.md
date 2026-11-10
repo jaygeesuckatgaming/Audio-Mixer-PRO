@@ -13,7 +13,7 @@ Up to 32 Virtual Cables(1 and 2 reserved for B1 and B2).
 Separate VST 3´s for each channel.
 
 
-VBAN with Auto discover sources.
+VBAN with Auto discover streams.
 
 All Input strips can act as a Hardware Input or a Virtual Input.
 
