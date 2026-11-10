@@ -4,7 +4,7 @@
 
 ![channels4_profile_circle_1](https://i.ibb.co/vxP16dyN/Main-View.png)
 
-Use at your own risc....
+Use at your own risk....
 
 Up to 16 Hardware/Virtual Inputs.
 
