@@ -874,6 +874,33 @@ enum StartupStep {
     Done,
 }
 
+/// Ducking settings. One source strip keys the attenuation of any number of
+/// target strips; persisted in the scene as `<Ducking>`.
+#[derive(Clone)]
+struct Ducking {
+    enabled: bool,
+    source: Option<usize>,
+    targets: u32,
+    depth_db: f32,
+    threshold_db: f32,
+    attack_ms: f32,
+    release_ms: f32,
+}
+
+impl Default for Ducking {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: None,
+            targets: 0,
+            depth_db: -12.0,
+            threshold_db: -35.0,
+            attack_ms: 10.0,
+            release_ms: 300.0,
+        }
+    }
+}
+
 struct MixerApp {
     strips: Vec<Strip>,
     /// Visible strips (5..=MAX_STRIPS). Vectors stay MAX_STRIPS long so a
@@ -923,6 +950,8 @@ struct MixerApp {
     vc_cfg: virtual_cables::Config,
     show_about: bool,
     show_audio_stats: bool,
+    duck: Ducking,
+    show_ducking: bool,
     show_vban: bool,
     vban: vban::VbanHub,
     vban_enabled: bool,
@@ -1427,6 +1456,8 @@ impl MixerApp {
             vc_cfg: virtual_cables::Config::import_legacy().unwrap_or_default(),
             show_about: false,
             show_audio_stats: false,
+            duck: Ducking::default(),
+            show_ducking: false,
             show_vban: false,
             vban: vban::VbanHub::new(),
             vban_enabled: false,
@@ -1605,6 +1636,9 @@ impl MixerApp {
         }
         if std::env::args().any(|a| a == "--vban") {
             app.show_vban = true;
+        }
+        if std::env::args().any(|a| a == "--ducking") {
+            app.show_ducking = true;
         }
         // Headless check of the scene writer/reader used by the build.
         if std::env::args().any(|a| a == "--load-settings") {
@@ -2018,6 +2052,18 @@ impl MixerApp {
                 ],
             );
         }
+        // Ducking: one source keys attenuation of the selected target strips.
+        // Bits outside the visible strip range are ignored.
+        let targets = self.duck.targets & ((1u32 << self.active_strips.min(31)) - 1);
+        self.audio.set_ducking(
+            self.duck.enabled,
+            self.duck.source.filter(|src| *src < self.active_strips),
+            targets,
+            self.duck.depth_db,
+            self.duck.threshold_db,
+            self.duck.attack_ms,
+            self.duck.release_ms,
+        );
         // B1/B2 live on the capture side of cables 1 and 2. Rebind every sync
         // so a CABLES restart swaps in the new USB devices.
         self.audio
@@ -2757,6 +2803,16 @@ impl MixerApp {
             "\t<VBAN enabled='{}' localPort='{}' quality='{}' />\n",
             self.vban_enabled as u8, self.vban_port, self.vban_quality
         ));
+        text.push_str(&format!(
+            "\t<Ducking enabled='{}' source='{}' targets='{}' depthDb='{:.2}' thresholdDb='{:.2}' attackMs='{:.1}' releaseMs='{:.0}' />\n",
+            self.duck.enabled as u8,
+            self.duck.source.map(|s| s as i32).unwrap_or(-1),
+            self.duck.targets,
+            self.duck.depth_db,
+            self.duck.threshold_db,
+            self.duck.attack_ms,
+            self.duck.release_ms
+        ));
         for i in 0..self.active_strips {
             if let Some(StripInput::Vban(input)) = self.captures[i].as_ref() {
                 if let Some((name, ip, port)) = Self::parse_vban_device(&input.device) {
@@ -3262,6 +3318,38 @@ impl MixerApp {
                 if let Some(mode) = virtual_cables::Mode::parse(&value) {
                     self.vc_cfg.uac_mode = mode;
                 }
+            }
+        }
+
+        if let Some((attrs, _)) = xml_elements(text, "Ducking").first() {
+            if let Some(value) = bool_attr(attrs, "enabled") {
+                self.duck.enabled = value;
+            }
+            if let Some(value) = xml_attr(attrs, "source")
+                .and_then(|v| v.trim().parse::<i32>().ok())
+            {
+                self.duck.source = if value >= 0 {
+                    Some((value as usize).min(MAX_STRIPS - 1))
+                } else {
+                    None
+                };
+            }
+            if let Some(value) = xml_attr(attrs, "targets")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+            {
+                self.duck.targets = value;
+            }
+            if let Some(value) = f32_attr(attrs, "depthDb") {
+                self.duck.depth_db = value.clamp(-30.0, 0.0);
+            }
+            if let Some(value) = f32_attr(attrs, "thresholdDb") {
+                self.duck.threshold_db = value.clamp(-60.0, -6.0);
+            }
+            if let Some(value) = f32_attr(attrs, "attackMs") {
+                self.duck.attack_ms = value.clamp(1.0, 100.0);
+            }
+            if let Some(value) = f32_attr(attrs, "releaseMs") {
+                self.duck.release_ms = value.clamp(20.0, 1000.0);
             }
         }
 
@@ -4295,8 +4383,15 @@ impl MixerApp {
             Pos2::new(rect.left() + 420.0, rect.top() + 7.0),
             Vec2::new(70.0, 24.0),
         );
+        // Ducking sits next to CABLES: both are processing panels for the
+        // virtual devices rather than scene/window controls.
+        let ducking_hit = Rect::from_min_size(
+            Pos2::new(rect.left() + 494.0, rect.top() + 7.0),
+            Vec2::new(76.0, 24.0),
+        );
         let button_hits = [
-            menu_hit, vban_hit, cables_hit, close_hit, min_hit, help_hit, lock_hit, r_hit, a_hit,
+            menu_hit, vban_hit, cables_hit, ducking_hit, close_hit, min_hit, help_hit, lock_hit,
+            r_hit, a_hit,
         ];
         let drag_strip = Rect::from_min_max(
             rect.min,
@@ -4363,6 +4458,10 @@ impl MixerApp {
             self.show_vc = true;
         }
 
+        if top_button(ui, ducking_hit, "DUCKING", self.show_ducking, AMBER) {
+            self.show_ducking = true;
+        }
+
         // right-hand status boxes
         let mut x = rect.right() - 8.0;
         let close = Rect::from_min_size(Pos2::new(x - 24.0, rect.top() + 7.0), Vec2::new(24.0, 24.0));
@@ -4413,12 +4512,17 @@ impl MixerApp {
 
         // transient status message
         if self.time < self.status_until && !self.status.is_empty() {
-            let srect = Rect::from_min_size(Pos2::new(rect.left() + 430.0, rect.top() + 8.0), Vec2::new(330.0, 22.0));
+            // Keep clear of CABLES and DUCKING so a transient message never
+            // hides the panel buttons next to them.
+            let srect = Rect::from_min_size(
+                Pos2::new(rect.left() + 578.0, rect.top() + 8.0),
+                Vec2::new(258.0, 22.0),
+            );
             p.rect_filled(srect, 3.0, Color32::from_rgb(36, 44, 38));
             p.text(
                 srect.center(),
                 Align2::CENTER_CENTER,
-                &self.status,
+                fit_text(p, &self.status, 9.5, 250.0),
                 FontId::proportional(9.5),
                 Color32::from_rgb(190, 220, 180),
             );
@@ -5367,13 +5471,31 @@ impl MixerApp {
                 self.strips[idx].comp, self.strips[idx].gate, self.strips[idx].limit
             )
         };
+        let ducked = self.duck.enabled
+            && self.duck.source.is_some_and(|src| src < self.active_strips)
+            && (self.duck.targets & (1u32 << idx)) != 0
+            && self.audio.duck_gain_db() < -0.5;
+        let summary_w = if ducked { w - 26.0 } else { w };
         ui.painter().text(
-            Pos2::new(inner.center().x, y),
+            Pos2::new(inner.left() + summary_w * 0.5, y),
             Align2::CENTER_TOP,
             summary,
             FontId::proportional(6.2),
             FAINT,
         );
+        if ducked {
+            let chip_rect =
+                Rect::from_min_size(Pos2::new(inner.right() - 25.0, y), Vec2::new(25.0, 8.0));
+            ui.painter()
+                .rect_filled(chip_rect, 1.5, AMBER.gamma_multiply(0.85));
+            ui.painter().text(
+                chip_rect.center(),
+                Align2::CENTER_CENTER,
+                "DUCK",
+                FontId::proportional(5.6),
+                Color32::from_rgb(26, 20, 10),
+            );
+        }
         y += 12.0;
 
         // fader + meter
@@ -6068,6 +6190,10 @@ impl MixerApp {
                         }
                         if menu_item(left, "Audio Stats...", "", true) {
                             self.show_audio_stats = true;
+                            close = true;
+                        }
+                        if menu_item(left, "Ducking...", "", true) {
+                            self.show_ducking = true;
                             close = true;
                         }
                         if menu_item(left, "Restart Audio Engine", "Ctrl+R", true) {
@@ -7862,6 +7988,128 @@ impl MixerApp {
             }
             self.tape_picker = open && !close_now;
         }
+
+        if self.show_ducking {
+            let mut open = self.show_ducking;
+            egui::Window::new("Ducking")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(400.0)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.checkbox(&mut self.duck.enabled, "Enable ducking");
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Source:");
+                        let current = self
+                            .duck
+                            .source
+                            .filter(|src| *src < self.active_strips)
+                            .map(|src| self.strip_label(src))
+                            .unwrap_or_else(|| "None".to_string());
+                        egui::ComboBox::from_id_salt("duck_source")
+                            .selected_text(current)
+                            .width(190.0)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(self.duck.source.is_none(), "None")
+                                    .clicked()
+                                {
+                                    self.duck.source = None;
+                                }
+                                for i in 0..self.active_strips {
+                                    let label = self.strip_label(i);
+                                    if ui
+                                        .selectable_label(self.duck.source == Some(i), label)
+                                        .clicked()
+                                    {
+                                        self.duck.source = Some(i);
+                                        self.duck.targets &= !(1u32 << i);
+                                    }
+                                }
+                            });
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "The source input level keys the gain reduction (pre-fader), so its own fader does not change the sensitivity.",
+                        )
+                        .size(9.0)
+                        .color(DIM),
+                    );
+                    ui.separator();
+                    ui.label("Targets:");
+                    egui::Grid::new("duck_targets")
+                        .num_columns(3)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for i in 0..self.active_strips {
+                                let mut on = (self.duck.targets & (1u32 << i)) != 0;
+                                let is_source = self.duck.source == Some(i);
+                                ui.add_enabled_ui(!is_source, |ui| {
+                                    if ui.checkbox(&mut on, self.strip_label(i)).changed() {
+                                        if on {
+                                            self.duck.targets |= 1u32 << i;
+                                        } else {
+                                            self.duck.targets &= !(1u32 << i);
+                                        }
+                                    }
+                                });
+                                if (i + 1) % 3 == 0 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                    ui.separator();
+                    ui.add(
+                        egui::Slider::new(&mut self.duck.depth_db, -30.0..=0.0)
+                            .text("Depth (dB)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.duck.threshold_db, -60.0..=-6.0)
+                            .text("Threshold (dBFS)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.duck.attack_ms, 1.0..=100.0)
+                            .text("Attack (ms)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.duck.release_ms, 20.0..=1000.0)
+                            .text("Release (ms)"),
+                    );
+                    ui.separator();
+                    let reduction = self.audio.duck_gain_db();
+                    ui.label(format!("Gain reduction: {reduction:.1} dB"));
+                    let (rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width().min(320.0), 8.0),
+                        Sense::hover(),
+                    );
+                    ui.painter().rect_filled(rect, 2.0, TRACK);
+                    let fraction = (-reduction / 30.0).clamp(0.0, 1.0);
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(
+                            rect.left_top(),
+                            Vec2::new(rect.width() * fraction, rect.height()),
+                        ),
+                        2.0,
+                        AMBER,
+                    );
+                    if !self.duck.enabled {
+                        ui.label(
+                            egui::RichText::new("Ducking is off")
+                                .size(9.0)
+                                .color(DIM),
+                        );
+                    } else if self.duck.source.is_none() {
+                        ui.label(
+                            egui::RichText::new("Choose a source strip to key the ducking")
+                                .size(9.0)
+                                .color(DIM),
+                        );
+                    }
+                });
+            self.show_ducking = open;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -9061,6 +9309,13 @@ fn main() -> eframe::Result<()> {
             eprintln!("virtual cables attach broker failed: {err}");
             std::process::exit(1);
         }
+        return Ok(());
+    }
+    if raw_args.iter().any(|arg| arg == "--ducking-selftest") {
+        let path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("ducking_selftest.txt");
+        audio::ducking_selftest(&path);
         return Ok(());
     }
     if raw_args.iter().any(|arg| arg == "--apps-selftest") {

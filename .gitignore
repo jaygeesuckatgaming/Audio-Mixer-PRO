@@ -18,6 +18,7 @@
 *.log
 /vst_*.txt
 /apps_selftest.txt
+/ducking_selftest.txt
 
 # Documentation is kept locally, not in the source+exe repository
 /MECHANICS.md

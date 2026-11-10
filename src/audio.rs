@@ -111,6 +111,16 @@ fn db_to_lin(db: f32) -> f32 {
     10.0f32.powf(db / 20.0)
 }
 
+/// One-pole smoothing coefficient for a time constant in milliseconds.
+fn one_pole(ms: f32, sample_rate: f32) -> f32 {
+    let samples = (ms.max(0.1) * 0.001 * sample_rate).max(1.0);
+    1.0 - (-1.0 / samples).exp()
+}
+
+fn lin_to_db(v: f32) -> f32 {
+    20.0 * v.max(1e-6).log10()
+}
+
 fn f32_atomic(v: f32) -> AtomicU32 {
     AtomicU32::new(v.to_bits())
 }
@@ -597,6 +607,18 @@ struct Shared {
     /// This is a rebuild extension (the original console has no VST loader);
     /// see vst.rs.
     pub vsts: [Arc<crate::vst::VstChain>; MAX_STRIPS],
+    /// Ducking: when the source strip passes the threshold, the selected
+    /// target strips are attenuated by `duck_depth_db` before they are summed
+    /// into their buses. `duck_source` is `usize::MAX` when no source is set.
+    duck_enabled: AtomicBool,
+    duck_source: AtomicUsize,
+    duck_targets: AtomicU32,
+    duck_depth_db: AtomicU32,
+    duck_threshold_db: AtomicU32,
+    duck_attack_ms: AtomicU32,
+    duck_release_ms: AtomicU32,
+    /// Current gain reduction in dB (0.0 = not ducking), for the UI meter.
+    duck_gain_db: AtomicU32,
     error: Mutex<Option<String>>,
 }
 
@@ -633,6 +655,14 @@ impl Shared {
             callback_frames: AtomicUsize::new(0),
             callback_load: f32_atomic(0.0),
             vsts: std::array::from_fn(|_| crate::vst::VstChain::new()),
+            duck_enabled: AtomicBool::new(false),
+            duck_source: AtomicUsize::new(usize::MAX),
+            duck_targets: AtomicU32::new(0),
+            duck_depth_db: f32_atomic(-12.0),
+            duck_threshold_db: f32_atomic(-35.0),
+            duck_attack_ms: f32_atomic(10.0),
+            duck_release_ms: f32_atomic(300.0),
+            duck_gain_db: f32_atomic(0.0),
             error: Mutex::new(None),
         }
     }
@@ -720,6 +750,9 @@ struct Dsp {
     out_bus_l: [Vec<f32>; 5],
     out_bus_r: [Vec<f32>; 5],
     pcm: Vec<u8>,
+    /// Ducking detector envelope (linear, smoothed) and current gain (linear).
+    duck_env: f32,
+    duck_gain: f32,
 }
 
 impl Dsp {
@@ -744,6 +777,8 @@ impl Dsp {
             out_bus_l: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             out_bus_r: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             pcm: Vec::with_capacity(crate::vst::VST_MAX_BLOCK * 2 * 4),
+            duck_env: 0.0,
+            duck_gain: 1.0,
         }
     }
 
@@ -841,6 +876,25 @@ impl Dsp {
             strip_on[i] = routed && !muted && (!any_solo || solo);
         }
 
+        // Ducking configuration snapshot. The detector is the source strip's
+        // pre-fader input, so the fader position never changes sensitivity.
+        let duck_enabled = shared.duck_enabled.load(Ordering::Relaxed);
+        let duck_source = {
+            let index = shared.duck_source.load(Ordering::Relaxed);
+            if duck_enabled && index < strip_count {
+                Some(index)
+            } else {
+                None
+            }
+        };
+        let duck_targets = shared.duck_targets.load(Ordering::Relaxed);
+        let duck_depth = db_to_lin(load_f32(&shared.duck_depth_db));
+        let duck_threshold = db_to_lin(load_f32(&shared.duck_threshold_db));
+        let duck_attack = one_pole(load_f32(&shared.duck_attack_ms), sample_rate);
+        let duck_release = one_pole(load_f32(&shared.duck_release_ms), sample_rate);
+        let level_attack = one_pole(5.0, sample_rate);
+        let level_release = one_pole(80.0, sample_rate);
+
         // Take a private reference to each capture stream, then one lock per
         // stream for the whole callback. No lock is taken per frame.
         let input_arcs: [Option<Arc<InputShared>>; MAX_STRIPS] = {
@@ -863,7 +917,8 @@ impl Dsp {
         let frames = data.len() / channels.max(1);
         self.vst_ready = [false; MAX_STRIPS];
         for i in 0..strip_count {
-            if !strip_on[i] {
+            let duck_source_strip = duck_source == Some(i);
+            if !strip_on[i] && !duck_source_strip {
                 // Keep an unrouted/muted input near live time. Without this a
                 // strip can accumulate seconds of backlog and be delayed as
                 // soon as its bus button is turned on.
@@ -943,6 +998,45 @@ impl Dsp {
                     }
                 }
 
+                // Ducking gain for this frame. Detection is causal: the
+                // source sample of this frame updates the envelope before the
+                // targets are summed.
+                let duck_now = if let Some(src) = duck_source {
+                    let level = if self.vst_ready[src] {
+                        self.vst_out_l[src][frame_no]
+                            .abs()
+                            .max(self.vst_out_r[src][frame_no].abs())
+                    } else {
+                        0.0
+                    };
+                    let coeff = if level > self.duck_env {
+                        level_attack
+                    } else {
+                        level_release
+                    };
+                    self.duck_env += (level - self.duck_env) * coeff;
+                    let target = if self.duck_env > duck_threshold {
+                        duck_depth
+                    } else {
+                        1.0
+                    };
+                    let coeff = if target < self.duck_gain {
+                        duck_attack
+                    } else {
+                        duck_release
+                    };
+                    self.duck_gain += (target - self.duck_gain) * coeff;
+                    self.duck_gain
+                } else if duck_enabled {
+                    1.0
+                } else {
+                    if self.duck_gain < 1.0 {
+                        self.duck_gain += (1.0 - self.duck_gain) * duck_release;
+                    }
+                    self.duck_env *= 1.0 - level_release;
+                    1.0
+                };
+
                 // Hardware and virtual input strips -> every bus they are
                 // routed to. A virtual strip that has not opened a device
                 // simply has no ring here and stays silent.
@@ -967,6 +1061,10 @@ impl Dsp {
                         let m = (sl + sr) * 0.5;
                         sl = m;
                         sr = m;
+                    }
+                    if duck_source.is_some() && (duck_targets & (1u32 << i)) != 0 {
+                        sl *= duck_now;
+                        sr *= duck_now;
                     }
                     strip_peak[i] = strip_peak[i].max(sl.abs()).max(sr.abs());
                     if strip_route[i] & STRIP_ROUTE_A1 != 0 {
@@ -1070,6 +1168,15 @@ impl Dsp {
             shared.finished.store(true, Ordering::Relaxed);
         }
         shared.position.store(pos, Ordering::Relaxed);
+        shared.duck_gain_db.store(
+            if duck_source.is_some() && duck_enabled {
+                lin_to_db(self.duck_gain)
+            } else {
+                0.0
+            }
+            .to_bits(),
+            Ordering::Relaxed,
+        );
         shared
             .source_peak
             .store(source_peak.to_bits(), Ordering::Relaxed);
@@ -1592,6 +1699,44 @@ impl AudioEngine {
         if !same {
             *guard = targets;
         }
+    }
+
+    /// Configure ducking. `source` is `None` to disable, `targets` is a bitmask
+    /// over strip indices. Gains are applied inside the output callback.
+    pub fn set_ducking(
+        &self,
+        enabled: bool,
+        source: Option<usize>,
+        targets: u32,
+        depth_db: f32,
+        threshold_db: f32,
+        attack_ms: f32,
+        release_ms: f32,
+    ) {
+        let shared = &self.shared;
+        shared.duck_enabled.store(enabled, Ordering::Relaxed);
+        shared
+            .duck_source
+            .store(source.unwrap_or(usize::MAX), Ordering::Relaxed);
+        shared.duck_targets.store(targets, Ordering::Relaxed);
+        shared
+            .duck_depth_db
+            .store(depth_db.clamp(-60.0, 0.0).to_bits(), Ordering::Relaxed);
+        shared.duck_threshold_db.store(
+            threshold_db.clamp(-60.0, 0.0).to_bits(),
+            Ordering::Relaxed,
+        );
+        shared
+            .duck_attack_ms
+            .store(attack_ms.clamp(1.0, 200.0).to_bits(), Ordering::Relaxed);
+        shared
+            .duck_release_ms
+            .store(release_ms.clamp(10.0, 2000.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Current ducking gain reduction in dB (negative, 0.0 when idle).
+    pub fn duck_gain_db(&self) -> f32 {
+        load_f32(&self.shared.duck_gain_db)
     }
 
     pub fn bus_peak(&self, index: usize) -> f32 {
@@ -3374,6 +3519,128 @@ pub fn cable_peak(name: Option<&str>, seconds: f32) {
         peak = peak.max(capture.peak());
     }
     println!("cable peak: device={:?} peak={peak:.4}", capture.device);
+}
+
+/// End-to-end check of the ducking path. Strip 1 keys the attenuation of strip
+/// 2: while the key is above the threshold the target must drop by the
+/// configured depth and recover afterwards, and nothing may change when
+/// ducking is off or the key stays under the threshold.
+pub fn ducking_selftest(report_path: &Path) {
+    let shared = Arc::new(Shared::new());
+    shared.sample_rate.store(48_000, Ordering::Relaxed);
+    shared.active_strips.store(5, Ordering::Relaxed);
+    // Source strip 0 is a key only; target strip 1 is what reaches A1.
+    shared.strips[0].route.store(0, Ordering::Relaxed);
+    shared.strips[1].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
+
+    let key = Arc::new(InputShared::new());
+    let target = Arc::new(InputShared::new());
+    key.rate.store(48_000, Ordering::Relaxed);
+    target.rate.store(48_000, Ordering::Relaxed);
+    {
+        let mut inputs = lock_source(&shared.inputs);
+        inputs[0] = Some(key.clone());
+        inputs[1] = Some(target.clone());
+    }
+
+    let mut report = String::new();
+    let mut dsp = Dsp::new();
+
+    let mut phase = |key_level: f32, target_level: f32, frames: usize| -> f32 {
+        // Each phase starts from an unducked state and empty buffers, so no
+        // envelope or backlog from the previous phase leaks into this one.
+        dsp.duck_env = 0.0;
+        dsp.duck_gain = 1.0;
+        dsp.readers[0] = InputReader::new();
+        dsp.readers[1] = InputReader::new();
+        *lock_source(&key.ring) = SampleRing::new();
+        *lock_source(&target.ring) = SampleRing::new();
+        let block = 512usize;
+        let mut buffer = vec![0.0f32; block * 2];
+        let mut peak = 0.0f32;
+        let mut done = 0usize;
+        while done < frames {
+            {
+                let mut ring = lock_source(&key.ring);
+                for _ in 0..block {
+                    ring.push([key_level, key_level]);
+                }
+            }
+            {
+                let mut ring = lock_source(&target.ring);
+                for _ in 0..block {
+                    ring.push([target_level, target_level]);
+                }
+            }
+            dsp.render(&mut buffer, 2, &shared);
+            // Ignore the attack/settle part of the phase.
+            if done + block > frames / 2 {
+                for v in &buffer {
+                    peak = peak.max(v.abs());
+                }
+            }
+            done += block;
+        }
+        peak
+    };
+
+    let config = |enabled: bool, depth: f32, threshold: f32| {
+        shared.duck_enabled.store(enabled, Ordering::Relaxed);
+        shared.duck_source.store(0, Ordering::Relaxed);
+        shared.duck_targets.store(1 << 1, Ordering::Relaxed);
+        shared
+            .duck_depth_db
+            .store(depth.to_bits(), Ordering::Relaxed);
+        shared
+            .duck_threshold_db
+            .store(threshold.to_bits(), Ordering::Relaxed);
+        shared
+            .duck_attack_ms
+            .store(10.0f32.to_bits(), Ordering::Relaxed);
+        shared
+            .duck_release_ms
+            .store(300.0f32.to_bits(), Ordering::Relaxed);
+    };
+
+    let target_level = 0.2f32;
+    config(true, -12.0, -35.0);
+    let reference = phase(0.0, target_level, 24_000);
+    let ducked = phase(0.8, target_level, 24_000);
+    let recovered = phase(0.0, target_level, 48_000);
+    config(false, -12.0, -35.0);
+    let disabled = phase(0.8, target_level, 24_000);
+    config(true, -12.0, -6.0);
+    let under = phase(0.05, target_level, 24_000);
+
+    let ratio = |v: f32| if reference > 0.0 { v / reference } else { 0.0 };
+    let drop_db = 20.0 * ratio(ducked).max(1e-6).log10();
+    let pass_duck = (drop_db + 12.0).abs() < 2.0;
+    let pass_recover = (ratio(recovered) - 1.0).abs() < 0.1;
+    let pass_disabled = (ratio(disabled) - 1.0).abs() < 0.1;
+    let pass_under = (ratio(under) - 1.0).abs() < 0.1;
+
+    report.push_str(&format!("reference peak {reference:.4}
+"));
+    report.push_str(&format!(
+        "keyed peak {ducked:.4}  reduction {drop_db:.2} dB  pass {pass_duck}
+"
+    ));
+    report.push_str(&format!(
+        "recovered peak {recovered:.4}  pass {pass_recover}
+"
+    ));
+    report.push_str(&format!(
+        "disabled peak {disabled:.4}  pass {pass_disabled}
+"
+    ));
+    report.push_str(&format!("under-threshold peak {under:.4}  pass {pass_under}
+"));
+    report.push_str(&format!(
+        "PASS {}
+",
+        pass_duck && pass_recover && pass_disabled && pass_under
+    ));
+    let _ = std::fs::write(report_path, report);
 }
 
 /// Open the default Windows input and report what the capture callback sees.
