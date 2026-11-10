@@ -14,7 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
 use std::f64::consts::TAU;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use symphonia::core::audio::{SampleBuffer, Signal};
 use symphonia::core::codecs::DecoderOptions;
@@ -36,6 +36,11 @@ const MAX_WAV_SECONDS: f64 = MAX_TRACK_SECONDS;
 
 const EQ_FREQS: [f32; 6] = [50.0, 200.0, 800.0, 2000.0, 8000.0, 12000.0];
 const EQ_Q: f32 = 3.0;
+
+/// Hardware strips plus the two base virtual strips. Additional virtual inputs
+/// extend the console up to this many strips.
+pub const BASE_STRIPS: usize = 5;
+pub const MAX_STRIPS: usize = 16;
 
 // ---------------------------------------------------------------------------
 // A1 output format rules (FUN_00527ad0, StartAudioStream)
@@ -577,12 +582,14 @@ struct Shared {
     /// devices; this rebuild also lets them open any Windows capture endpoint,
     /// so a USB interface or a virtual cable installed on the machine appears
     /// there.
-    inputs: Mutex<[Option<Arc<InputShared>>; 5]>,
-    strips: [StripMix; 5],
+    inputs: Mutex<[Option<Arc<InputShared>>; MAX_STRIPS]>,
+    strips: [StripMix; MAX_STRIPS],
+    /// Number of visible/processed input strips (5..=MAX_STRIPS).
+    active_strips: AtomicUsize,
     any_solo: AtomicBool,
     /// Post-fader, post-pan peak of each strip before the bus fader. The bus
     /// meters that have no physical device use it to show what was routed.
-    strip_peak: [AtomicU32; 5],
+    strip_peak: [AtomicU32; MAX_STRIPS],
     /// Peak of the material leaving the tape deck, before the A1 fader/EQ.
     /// This is what the virtual input strip and the unopened buses meter.
     source_peak: AtomicU32,
@@ -591,9 +598,10 @@ struct Shared {
     /// Post-fader peak of each bus, before the A1 device and after B1/B2 are
     /// injected into their cables.
     bus_peak: [AtomicU32; 5],
-    /// One VST3 insert per input strip (five independent slots). This is a
-    /// rebuild extension (the original console has no VST loader); see vst.rs.
-    pub vsts: [Arc<crate::vst::VstChain>; 5],
+    /// One VST3 insert per input strip (up to MAX_STRIPS independent slots).
+    /// This is a rebuild extension (the original console has no VST loader);
+    /// see vst.rs.
+    pub vsts: [Arc<crate::vst::VstChain>; MAX_STRIPS],
     error: Mutex<Option<String>>,
 }
 
@@ -617,8 +625,9 @@ impl Shared {
             bus_eq_on: std::array::from_fn(|_| AtomicBool::new(false)),
             bus_eq_gain: std::array::from_fn(|_| std::array::from_fn(|_| f32_atomic(0.0))),
             virtual_outputs: Mutex::new([None, None]),
-            inputs: Mutex::new([None, None, None, None, None]),
+            inputs: Mutex::new(std::array::from_fn(|_| None)),
             strips: std::array::from_fn(|_| StripMix::new()),
+            active_strips: AtomicUsize::new(BASE_STRIPS),
             any_solo: AtomicBool::new(false),
             strip_peak: std::array::from_fn(|_| f32_atomic(0.0)),
             source_peak: f32_atomic(0.0),
@@ -698,15 +707,15 @@ struct Dsp {
     eq_gain: [[f32; 6]; 5],
     eq_ready: [bool; 5],
     gain: [f32; 5],
-    readers: [InputReader; 5],
+    readers: [InputReader; MAX_STRIPS],
     // Each input strip is read as a block so its own VST insert can process it
     // before the mix. The per-strip buffers keep their capacity across
     // callbacks, so the audio thread never allocates.
-    vst_in_l: [Vec<f32>; 5],
-    vst_in_r: [Vec<f32>; 5],
-    vst_out_l: [Vec<f32>; 5],
-    vst_out_r: [Vec<f32>; 5],
-    vst_ready: [bool; 5],
+    vst_in_l: [Vec<f32>; MAX_STRIPS],
+    vst_in_r: [Vec<f32>; MAX_STRIPS],
+    vst_out_l: [Vec<f32>; MAX_STRIPS],
+    vst_out_r: [Vec<f32>; MAX_STRIPS],
+    vst_ready: [bool; MAX_STRIPS],
     // B1/B2 are rendered alongside A1 and handed to their virtual cable's
     // capture endpoint as PCM, so other applications can record them.
     out_b1_l: Vec<f32>,
@@ -734,7 +743,7 @@ impl Dsp {
             vst_in_r: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             vst_out_l: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             vst_out_r: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
-            vst_ready: [false; 5],
+            vst_ready: [false; MAX_STRIPS],
             out_b1_l: vec![0.0; crate::vst::VST_MAX_BLOCK],
             out_b1_r: vec![0.0; crate::vst::VST_MAX_BLOCK],
             out_b2_l: vec![0.0; crate::vst::VST_MAX_BLOCK],
@@ -768,6 +777,10 @@ impl Dsp {
         T: cpal::SizedSample + cpal::FromSample<f32>,
     {
         let sample_rate = shared.sample_rate.load(Ordering::Relaxed) as f32;
+        let strip_count = shared
+            .active_strips
+            .load(Ordering::Relaxed)
+            .clamp(BASE_STRIPS, MAX_STRIPS);
         self.update_eq(shared, sample_rate);
 
         let mut active = shared.playing.load(Ordering::Relaxed);
@@ -794,18 +807,18 @@ impl Dsp {
         let mut finished = false;
         let mut peak = 0.0f32;
         let mut source_peak = 0.0f32;
-        let mut strip_peak = [0.0f32; 5];
+        let mut strip_peak = [0.0f32; MAX_STRIPS];
         let mut bus_peak = [0.0f32; 5];
 
         // Snapshot the routing/gain settings once per callback. The UI writes
         // them at frame rate; reading them here keeps the mix in step.
         let any_solo = shared.any_solo.load(Ordering::Relaxed);
-        let mut strip_on = [false; 5];
-        let mut strip_gain = [0.0f32; 5];
-        let mut strip_pan = [0.0f32; 5];
-        let mut strip_flags = [0u32; 5];
-        let mut strip_route = [0u32; 5];
-        for i in 0..5 {
+        let mut strip_on = [false; MAX_STRIPS];
+        let mut strip_gain = [0.0f32; MAX_STRIPS];
+        let mut strip_pan = [0.0f32; MAX_STRIPS];
+        let mut strip_flags = [0u32; MAX_STRIPS];
+        let mut strip_route = [0u32; MAX_STRIPS];
+        for i in 0..strip_count {
             let s = &shared.strips[i];
             strip_flags[i] = s.flags.load(Ordering::Relaxed);
             strip_gain[i] = db_to_lin(load_f32(&s.gain_db));
@@ -823,53 +836,26 @@ impl Dsp {
 
         // Take a private reference to each capture stream, then one lock per
         // stream for the whole callback. No lock is taken per frame.
-        let input_arcs: [Option<Arc<InputShared>>; 5] = {
+        let input_arcs: [Option<Arc<InputShared>>; MAX_STRIPS] = {
             let guard = lock_source(&shared.inputs);
-            [
-                guard[0].clone(),
-                guard[1].clone(),
-                guard[2].clone(),
-                guard[3].clone(),
-                guard[4].clone(),
-            ]
+            std::array::from_fn(|i| guard[i].clone())
         };
-        let mut rings: [Option<std::sync::MutexGuard<'_, SampleRing>>; 5] = [
-            input_arcs[0].as_ref().map(|s| lock_source(&s.ring)),
-            input_arcs[1].as_ref().map(|s| lock_source(&s.ring)),
-            input_arcs[2].as_ref().map(|s| lock_source(&s.ring)),
-            input_arcs[3].as_ref().map(|s| lock_source(&s.ring)),
-            input_arcs[4].as_ref().map(|s| lock_source(&s.ring)),
-        ];
-        let input_rates: [u32; 5] = [
-            input_arcs[0]
+        let mut rings: [Option<std::sync::MutexGuard<'_, SampleRing>>; MAX_STRIPS] =
+            std::array::from_fn(|i| input_arcs[i].as_ref().map(|s| lock_source(&s.ring)));
+        let input_rates: [u32; MAX_STRIPS] = std::array::from_fn(|i| {
+            input_arcs[i]
                 .as_ref()
                 .map(|s| s.rate.load(Ordering::Relaxed))
-                .unwrap_or(48_000),
-            input_arcs[1]
-                .as_ref()
-                .map(|s| s.rate.load(Ordering::Relaxed))
-                .unwrap_or(48_000),
-            input_arcs[2]
-                .as_ref()
-                .map(|s| s.rate.load(Ordering::Relaxed))
-                .unwrap_or(48_000),
-            input_arcs[3]
-                .as_ref()
-                .map(|s| s.rate.load(Ordering::Relaxed))
-                .unwrap_or(48_000),
-            input_arcs[4]
-                .as_ref()
-                .map(|s| s.rate.load(Ordering::Relaxed))
-                .unwrap_or(48_000),
-        ];
+                .unwrap_or(48_000)
+        });
 
         // Every input strip has its own VST3 insert. Read each routed strip
         // as one block so its plug-in gets whole buffers, process it, then mix
         // the returned samples below exactly where the dry samples would have
         // gone. A strip without a plug-in (or with bypass on) stays dry.
         let frames = data.len() / channels.max(1);
-        self.vst_ready = [false; 5];
-        for i in 0..5 {
+        self.vst_ready = [false; MAX_STRIPS];
+        for i in 0..strip_count {
             if !strip_on[i] {
                 continue;
             }
@@ -938,7 +924,7 @@ impl Dsp {
                 // Hardware and virtual input strips -> every bus they are
                 // routed to. A virtual strip that has not opened a device
                 // simply has no ring here and stays silent.
-                for i in 0..5 {
+                for i in 0..strip_count {
                     if !strip_on[i] {
                         continue;
                     }
@@ -1057,7 +1043,7 @@ impl Dsp {
         shared
             .source_peak
             .store(source_peak.to_bits(), Ordering::Relaxed);
-        for i in 0..5 {
+        for i in 0..strip_count {
             shared.strip_peak[i].store(strip_peak[i].to_bits(), Ordering::Relaxed);
         }
         for b in 0..5 {
@@ -1155,12 +1141,24 @@ pub struct AudioEngine {
 impl AudioEngine {
     /// One VST3 insert slot per input strip, shared with the output callback.
     pub fn vst(&self, slot: usize) -> Arc<crate::vst::VstChain> {
-        self.shared.vsts[slot.min(4)].clone()
+        self.shared.vsts[slot.min(MAX_STRIPS - 1)].clone()
     }
 
-    /// All five insert slots, in strip order.
-    pub fn vsts(&self) -> [Arc<crate::vst::VstChain>; 5] {
+    /// All insert slots, in strip order.
+    pub fn vsts(&self) -> [Arc<crate::vst::VstChain>; MAX_STRIPS] {
         self.shared.vsts.clone()
+    }
+
+    /// Number of visible/processed strips. The engine always allocates for
+    /// `MAX_STRIPS`; this only changes how many are mixed.
+    pub fn set_strip_count(&self, count: usize) {
+        self.shared
+            .active_strips
+            .store(count.clamp(BASE_STRIPS, MAX_STRIPS), Ordering::Relaxed);
+    }
+
+    pub fn strip_count(&self) -> usize {
+        self.shared.active_strips.load(Ordering::Relaxed)
     }
 
     pub fn new() -> Self {
@@ -1416,7 +1414,7 @@ impl AudioEngine {
     /// output callback then reads its frames and plays them through A1
     /// whenever that strip's A1 button is on.
     pub(crate) fn attach_input(&self, index: usize, input: Arc<InputShared>) {
-        if index >= 5 {
+        if index >= MAX_STRIPS {
             return;
         }
         let mut guard = lock_source(&self.shared.inputs);
@@ -1425,7 +1423,7 @@ impl AudioEngine {
 
     /// Disconnect an input, e.g. when the person chooses "No input".
     pub(crate) fn detach_input(&self, index: usize) {
-        if index >= 5 {
+        if index >= MAX_STRIPS {
             return;
         }
         let mut guard = lock_source(&self.shared.inputs);
@@ -1447,7 +1445,7 @@ impl AudioEngine {
         route: [bool; 5],
         any_solo: bool,
     ) {
-        if index >= 5 {
+        if index >= MAX_STRIPS {
             return;
         }
         let s = &self.shared.strips[index];
@@ -1477,7 +1475,7 @@ impl AudioEngine {
     /// Post-fader, post-pan peak of a hardware strip in the A1 mix. Used by
     /// the bus meters that have no physical output device.
     pub fn strip_peak(&self, index: usize) -> f32 {
-        if index >= 5 {
+        if index >= MAX_STRIPS {
             return 0.0;
         }
         load_f32(&self.shared.strip_peak[index])

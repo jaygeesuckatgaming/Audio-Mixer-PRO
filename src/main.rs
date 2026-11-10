@@ -12,7 +12,7 @@ mod audio;
 mod vc;
 mod vst;
 
-use audio::{AudioEngine, DemoKind, InputCapture};
+use audio::{AudioEngine, DemoKind, InputCapture, BASE_STRIPS, MAX_STRIPS};
 use eframe::egui::{
     self, Align2, Color32, FontId, Id, Pos2, Rect, Response, Sense, Stroke, Vec2,
 };
@@ -498,7 +498,9 @@ impl Strip {
     fn new(i: usize) -> Self {
         let hw = i < 3;
         let mut route = [false; 5];
-        route[0] = true;
+        if i < BASE_STRIPS {
+            route[0] = true;
+        }
         Strip {
             kind: if hw { StripKind::Hardware } else { StripKind::Virtual },
             name: if hw {
@@ -515,8 +517,10 @@ impl Strip {
                 .to_string()
             } else if i == 3 {
                 "Virtual 1 (VAIO)".to_string()
-            } else {
+            } else if i == 4 {
                 "Virtual 2 (AUX)".to_string()
+            } else {
+                "No input".to_string()
             },
             gain_db: 0.0,
             pan: 0.0,
@@ -765,6 +769,16 @@ impl VstSlot {
 
 struct MixerApp {
     strips: Vec<Strip>,
+    /// Visible strips (5..=MAX_STRIPS). Vectors stay MAX_STRIPS long so a
+    /// strip's audio/VST slot index never moves while it is active.
+    active_strips: usize,
+    /// Which page of up to five strips the console is showing.
+    strip_bank: usize,
+    /// Diagnostics only: add strips after the virtual cables attach.
+    pending_late_virtual_adds: usize,
+    /// Extra strips added before their virtual cable was enumerated; retried
+    /// once per watchdog tick until a free cable appears or the user picks one.
+    pending_auto_assign: Vec<usize>,
     buses: Vec<Bus>,
     /// One real capture stream per hardware strip (None until a device opens).
     captures: Vec<Option<InputCapture>>,
@@ -1224,8 +1238,9 @@ impl MixerApp {
         // Open the default microphone / line input on HW INPUT 1 right away so
         // its meter shows the real signal without any setup. The other two
         // hardware strips open a device when the person picks one.
-        let mut strips: Vec<Strip> = (0..5).map(Strip::new).collect();
-        let mut captures: Vec<Option<InputCapture>> = vec![None, None, None, None, None];
+        let mut strips: Vec<Strip> = (0..MAX_STRIPS).map(Strip::new).collect();
+        let mut captures: Vec<Option<InputCapture>> =
+            (0..MAX_STRIPS).map(|_| None).collect();
         let first_input = InputCapture::open(None);
         if first_input.available {
             strips[0].device = first_input.device.clone();
@@ -1234,6 +1249,10 @@ impl MixerApp {
 
         let mut app = MixerApp {
             strips,
+            active_strips: BASE_STRIPS,
+            strip_bank: 0,
+            pending_late_virtual_adds: 0,
+            pending_auto_assign: Vec::new(),
             buses: (0..5).map(Bus::new).collect(),
             captures,
             tape: Tape::new(),
@@ -1338,6 +1357,8 @@ impl MixerApp {
         if app.load_on_startup && has_saved_scene {
             app.load_settings(false);
         }
+        app.audio.set_strip_count(app.active_strips);
+        app.strip_bank = 0;
         if app.show_preset_on_startup {
             app.open_presets();
         }
@@ -1355,6 +1376,46 @@ impl MixerApp {
             app.select_demo(DemoKind::Track1);
             app.on_transport(Transport::Play);
         }
+        // Diagnostic: add virtual input strips at startup
+        // (`--add-virtual-inputs N`, up to the strip limit).
+        if let Some(pos) = std::env::args().position(|a| a == "--add-virtual-inputs") {
+            let count = std::env::args()
+                .nth(pos + 1)
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+                .min(MAX_STRIPS - BASE_STRIPS);
+            for _ in 0..count {
+                app.add_virtual_input();
+            }
+            app.picker = None;
+        }
+        if let Some(pos) = std::env::args().position(|a| a == "--add-virtual-inputs-late") {
+            if let Some(count) = std::env::args()
+                .nth(pos + 1)
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                app.pending_late_virtual_adds = count.min(MAX_STRIPS - BASE_STRIPS);
+            }
+        }
+        if let Some(pos) = std::env::args().position(|a| a == "--remove-virtual-inputs") {
+            let count = std::env::args()
+                .nth(pos + 1)
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            for _ in 0..count {
+                app.remove_last_virtual_input();
+            }
+            app.picker = None;
+        }
+        // Diagnostic: open a strip bank at startup (`--bank N`, 1-based).
+        if let Some(pos) = std::env::args().position(|a| a == "--bank") {
+            if let Some(bank) = std::env::args()
+                .nth(pos + 1)
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                app.strip_bank = bank.saturating_sub(1);
+            }
+        }
         // Diagnostic used while checking the virtual-input device list: start
         // with one strip's device picker open (`--picker 3` is Virtual 1).
         if let Some(pos) = std::env::args().position(|a| a == "--picker") {
@@ -1362,7 +1423,7 @@ impl MixerApp {
                 .nth(pos + 1)
                 .and_then(|v| v.parse::<usize>().ok())
             {
-                if i < 5 {
+                if i < MAX_STRIPS {
                     app.picker = Some(Picker::Strip(i));
                 }
             }
@@ -1433,7 +1494,7 @@ impl MixerApp {
                 .get(pos + 1)
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1)
-                .clamp(1, 5)
+                .clamp(1, MAX_STRIPS)
                 - 1;
             if let Some(path) = cli.get(pos + 2) {
                 app.load_vst(slot, Path::new(path), false);
@@ -1445,7 +1506,7 @@ impl MixerApp {
                 .get(pos + 1)
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1)
-                .clamp(1, 5);
+                .clamp(1, MAX_STRIPS);
             Some(slot - 1)
         };
         if let Some(slot) = optional_slot("--vst-open") {
@@ -1523,7 +1584,7 @@ impl MixerApp {
     /// Restore every strip's saved plug-in. Called once at startup and after
     /// the audio engine is rebuilt.
     fn restore_vst(&mut self, announce: bool) {
-        for slot in 0..self.vsts.len() {
+        for slot in 0..self.active_strips.min(self.vsts.len()) {
             let path_text = self.vsts[slot].path.trim().to_string();
             if path_text.is_empty() {
                 if self.vsts[slot].chain.has_plugin() {
@@ -1752,10 +1813,11 @@ impl MixerApp {
     fn sync_audio_controls(&self) {
         self.audio.set_tape(self.tape.gain_db, self.tape.route);
         self.audio.set_loop(self.tape.loop_playback);
+        self.audio.set_strip_count(self.active_strips);
         // The console has five buses; this rebuild has one physical output, so
         // the A1 card is the one whose fader, mute, mono and EQ are audible.
-        let any_solo = self.strips.iter().any(|s| s.solo);
-        for (i, s) in self.strips.iter().enumerate() {
+        let any_solo = self.strips[..self.active_strips].iter().any(|s| s.solo);
+        for (i, s) in self.strips.iter().take(self.active_strips).enumerate() {
             // The route buttons are real switches in the audio callback: an
             // input strip with A1 on is mixed into the A1 output with its
             // fader, pan, mute, solo and mono settings.
@@ -1888,7 +1950,7 @@ impl MixerApp {
 
         if self.auto_restart_all {
             let inputs = InputCapture::devices();
-            for i in 0..5 {
+            for i in 0..self.active_strips {
                 let Some(cap) = self.captures[i].as_ref() else {
                     continue;
                 };
@@ -1913,7 +1975,7 @@ impl MixerApp {
         // below opens them fresh.
         let vc_attached = self.vc.status().attached;
         if vc_attached && !self.vc_was_attached {
-            for i in 3..5 {
+            for i in 3..self.active_strips {
                 let name = &self.strips[i].device;
                 if !name.trim().is_empty()
                     && name != "Virtual 1 (VAIO)"
@@ -1924,7 +1986,21 @@ impl MixerApp {
                 }
             }
         }
+        if vc_attached && self.pending_late_virtual_adds > 0 {
+            let count = self
+                .pending_late_virtual_adds
+                .min(MAX_STRIPS - self.active_strips);
+            for _ in 0..count {
+                self.add_virtual_input();
+            }
+            self.pending_late_virtual_adds -= count;
+            self.picker = None;
+        }
         self.vc_was_attached = vc_attached;
+
+        // Finish auto-assigning extra inputs that were added before Windows
+        // enumerated their virtual cable.
+        self.retry_pending_auto_assign();
 
         // A virtual cable can finish attaching a moment after the mixer starts,
         // so the first restore attempt may find no endpoint. Keep retrying the
@@ -1979,7 +2055,7 @@ impl MixerApp {
     /// A sample-rate change needs every plug-in re-prepared. Each slot's own
     /// state is saved first so the reload keeps the current settings.
     fn reconfigure_vst(&mut self) {
-        for slot in 0..self.vsts.len() {
+        for slot in 0..self.active_strips.min(self.vsts.len()) {
             if self.vsts[slot].path.trim().is_empty() {
                 continue;
             }
@@ -1996,9 +2072,9 @@ impl MixerApp {
     /// maximum is held for 50 timer ticks (15 ms each), then the meter follows
     /// the live value.
     fn update_meters(&mut self, dt: f32) {
-        let any_solo = self.strips.iter().any(|s| s.solo);
+        let any_solo = self.strips[..self.active_strips].iter().any(|s| s.solo);
         let tape_source = self.audio.source_peak();
-        for i in 0..self.strips.len() {
+        for i in 0..self.active_strips {
             // A strip meters its open Windows capture endpoint. Virtual
             // Input 1 keeps the original's tape feed when it has no explicit
             // device, and Virtual Input 2 stays silent until a device is
@@ -2037,7 +2113,7 @@ impl MixerApp {
         let mut bus_source = [0.0f32; 5];
         for bi in 1..5 {
             let mut sum = 0.0f32;
-            for (si, s) in self.strips.iter().enumerate() {
+            for (si, s) in self.strips.iter().take(self.active_strips).enumerate() {
                 if !s.route[bi] || s.mute || (any_solo && !s.solo) {
                     continue;
                 }
@@ -2128,15 +2204,17 @@ impl MixerApp {
                 ));
             }
         }
-        // Rebuild extension: the two virtual strips store their chosen Windows
-        // capture endpoint in the same element (indices 4-5). The original's
-        // tag-driven reader only knows 1-3 and ignores these.
-        for i in 3..5 {
+        // Rebuild extension: virtual strips store their chosen Windows capture
+        // endpoint in the same element (indices 4+). The original's tag-driven
+        // reader only knows 1-3 and ignores these.
+        for i in 3..self.active_strips {
             let name = if self.strips[i].device.trim().is_empty() {
                 if i == 3 {
                     "Virtual 1 (VAIO)"
-                } else {
+                } else if i == 4 {
                     "Virtual 2 (AUX)"
+                } else {
+                    "No input"
                 }
             } else {
                 self.strips[i].device.as_str()
@@ -2182,7 +2260,13 @@ impl MixerApp {
                 i + 1
             ));
         }
-        for (i, s) in self.strips.iter().enumerate().skip(3) {
+        for (i, s) in self
+            .strips
+            .iter()
+            .enumerate()
+            .take(self.active_strips)
+            .skip(3)
+        {
             text.push_str(&format!(
                 "\t<LabelVirtualStrip{}>{}</LabelVirtualStrip{}>\n",
                 i - 2,
@@ -2194,7 +2278,7 @@ impl MixerApp {
             "\t<VMOptions MonitorOnSEL='{}' SliderRelative='0' />\n",
             self.monitor_on_sel as u8
         ));
-        for (i, s) in self.strips.iter().enumerate() {
+        for (i, s) in self.strips.iter().take(self.active_strips).enumerate() {
             // FUN_00528b40 bit layout: mute 0x1, solo 0x2, mono 0x4,
             // muc 0x8, prg_c 0x10, prg_g 0x20, busa 0x1000, busa2 0x2000,
             // busa3 0x4000, busb 0x10000, busb2 0x20000, vaio 0x40000000.
@@ -2453,9 +2537,10 @@ impl MixerApp {
         }
         // Rebuild extension: one VST3 insert per input strip. Unknown elements
         // are ignored by the original's tag-driven reader.
-        for (slot, vst) in self.vsts.iter().enumerate() {
-            // Write all five, even empty ones, so loading a scene clears a slot
-            // that the scene does not use instead of leaving the old plug-in.
+        for (slot, vst) in self.vsts.iter().take(self.active_strips).enumerate() {
+            // Write every active slot, even empty ones, so loading a scene
+            // clears a slot the scene does not use instead of leaving the old
+            // plug-in behind.
             text.push_str(&format!(
                 "<VstPlugin slot=\"{}\" path=\"{}\" bypass=\"{}\" />\n",
                 slot + 1,
@@ -2498,7 +2583,7 @@ impl MixerApp {
         };
         // The preset carries each strip's plug-in choice too, so recalling a
         // scene also recalls which plug-in runs on which channel.
-        for (slot, vst) in self.vsts.iter().enumerate() {
+        for (slot, vst) in self.vsts.iter().take(self.active_strips).enumerate() {
             block.push_str(&format!(
                 "\n<VstPlugin slot=\"{}\" path=\"{}\" bypass=\"{}\" />",
                 slot + 1,
@@ -2619,18 +2704,41 @@ impl MixerApp {
     }
 
     fn load_settings_xml(&mut self, text: &str) {
+        self.pending_auto_assign.clear();
         let mut tape_path = String::new();
         let mut tape_demo: i32 = -1;
         let mut recent: Vec<(usize, PathBuf)> = Vec::new();
         let mut recent_order = 0usize;
+
+        // A scene may add virtual inputs past the original five. Discover the
+        // highest strip referenced before applying labels/devices/VST slots.
+        let mut highest = BASE_STRIPS;
+        for tag in ["Strip", "InputDev"] {
+            for (attrs, _) in xml_elements(text, tag) {
+                if let Some(idx) = xml_attr(attrs, "index")
+                    .and_then(|value| value.parse::<usize>().ok())
+                {
+                    highest = highest.max(idx.min(MAX_STRIPS));
+                }
+            }
+        }
+        for (attrs, _) in xml_elements(text, "VstPlugin") {
+            if let Some(slot) = xml_attr(attrs, "slot")
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                highest = highest.max(slot.min(MAX_STRIPS));
+            }
+        }
+        self.active_strips = highest.clamp(BASE_STRIPS, MAX_STRIPS);
+        self.audio.set_strip_count(self.active_strips);
 
         // One element per strip. A scene from the earlier single-slot build has
         // no slot attribute, so the first element still lands on strip 1.
         for (order, (attrs, _)) in xml_elements(text, "VstPlugin").iter().enumerate() {
             let slot = xml_attr(attrs, "slot")
                 .and_then(|value| value.parse::<usize>().ok())
-                .map(|value| value.clamp(1, 5) - 1)
-                .unwrap_or_else(|| order.min(4));
+                .map(|value| value.clamp(1, MAX_STRIPS) - 1)
+                .unwrap_or_else(|| order.min(MAX_STRIPS - 1));
             if let Some(value) = xml_attr(attrs, "path") {
                 self.vsts[slot].path = xml_unescape(&value);
             }
@@ -2660,7 +2768,12 @@ impl MixerApp {
             }
         }
 
-        for (i, s) in self.strips.iter_mut().enumerate() {
+        for (i, s) in self
+            .strips
+            .iter_mut()
+            .take(self.active_strips)
+            .enumerate()
+        {
             let label = if i < 3 {
                 xml_elements(text, &format!("LabelStrip{}", i + 1))
                     .first()
@@ -2698,7 +2811,7 @@ impl MixerApp {
             let Some(idx) = xml_attr(attrs, "index").and_then(|v| v.parse::<usize>().ok()) else {
                 continue;
             };
-            if !(1..=5).contains(&idx) {
+            if !(1..=MAX_STRIPS).contains(&idx) {
                 continue;
             }
             let i = idx - 1;
@@ -2988,7 +3101,7 @@ impl MixerApp {
         }
         for (attrs, body) in xml_elements(text, "InputDev") {
             if let Some(idx) = xml_attr(attrs, "index").and_then(|v| v.parse::<usize>().ok()) {
-                if (1..=5).contains(&idx) {
+                if (1..=MAX_STRIPS).contains(&idx) {
                     if let Some(name) = xml_attr(attrs, "name") {
                         let name = xml_unescape(&name);
                         if name == "-" || name.trim().is_empty() {
@@ -2997,8 +3110,10 @@ impl MixerApp {
                             } else {
                                 self.strips[idx - 1].device = if idx == 4 {
                                     "Virtual 1 (VAIO)".to_string()
-                                } else {
+                                } else if idx == 5 {
                                     "Virtual 2 (AUX)".to_string()
+                                } else {
+                                    "No input".to_string()
                                 };
                             }
                         } else {
@@ -3079,14 +3194,166 @@ impl MixerApp {
         self.tape_recent = recent.into_iter().map(|(_, p)| p).take(6).collect();
     }
 
+    /// Bank 0 is the original five strips; later banks hold five additional
+    /// virtual inputs each.
+    fn bank_for_strip(index: usize) -> usize {
+        if index < BASE_STRIPS {
+            0
+        } else {
+            1 + (index - BASE_STRIPS) / 5
+        }
+    }
+
+    fn bank_start(bank: usize) -> usize {
+        if bank == 0 {
+            0
+        } else {
+            BASE_STRIPS + (bank - 1) * 5
+        }
+    }
+
+    /// Lowest unused `Microphone (Virtual Cable NN)` with NN >= 03. Cables 01
+    /// and 02 carry B1/B2, so input strips start at cable 03.
+    fn next_free_virtual_cable(&self) -> Option<String> {
+        let inputs = InputCapture::devices();
+        let used: Vec<String> = self
+            .strips
+            .iter()
+            .take(self.active_strips)
+            .map(|s| s.device.to_ascii_lowercase())
+            .collect();
+        Self::next_free_virtual_cable_from(&inputs, &used)
+    }
+
+    fn next_free_virtual_cable_from(inputs: &[String], used: &[String]) -> Option<String> {
+        let mut best: Option<(u32, String)> = None;
+        for name in inputs {
+            let lower = name.to_ascii_lowercase();
+            let Some(rest) = lower.strip_prefix("microphone (virtual cable ") else {
+                continue;
+            };
+            let Some(number) = rest.strip_suffix(')') else {
+                continue;
+            };
+            let Ok(number) = number.trim().parse::<u32>() else {
+                continue;
+            };
+            if number < 3 || used.iter().any(|d| d == &lower) {
+                continue;
+            }
+            if best
+                .as_ref()
+                .map(|(lowest, _)| number < *lowest)
+                .unwrap_or(true)
+            {
+                best = Some((number, name.clone()));
+            }
+        }
+        best.map(|(_, name)| name)
+    }
+
+    fn add_virtual_input(&mut self) {
+        if self.active_strips >= MAX_STRIPS {
+            self.toast(format!("Maximum of {MAX_STRIPS} input strips reached"));
+            return;
+        }
+        let idx = self.active_strips;
+        let mut strip = Strip::new(idx);
+        strip.kind = StripKind::Virtual;
+        strip.name = format!("VIRTUAL {}", idx - 2);
+        strip.device = "No input".to_string();
+        strip.route = [true, false, false, false, false];
+        strip.tape_feed = false;
+        self.strips[idx] = strip;
+        self.captures[idx] = None;
+        let chain = self.audio.vst(idx);
+        chain.close_editor();
+        chain.unload();
+        self.vsts[idx] = VstSlot::new(chain);
+        self.active_strips += 1;
+        self.audio.set_strip_count(self.active_strips);
+        self.strip_bank = Self::bank_for_strip(idx);
+
+        if let Some(cable) = self.next_free_virtual_cable() {
+            let capture = InputCapture::open(Some(&cable));
+            if capture.available {
+                self.strips[idx].device = capture.device.clone();
+                self.audio.attach_input(idx, capture.shared());
+                self.captures[idx] = Some(capture);
+                self.toast(format!(
+                    "Virtual {} added - listening to {cable}",
+                    idx - 2
+                ));
+                return;
+            }
+        }
+        self.pending_auto_assign.push(idx);
+        self.toast(format!("Virtual {} added - choose an input", idx - 2));
+        self.picker = Some(Picker::Strip(idx));
+    }
+
+    fn retry_pending_auto_assign(&mut self) {
+        if self.pending_auto_assign.is_empty() {
+            return;
+        }
+        let mut pending = std::mem::take(&mut self.pending_auto_assign);
+        pending.retain(|&idx| {
+            idx < self.active_strips && self.strips[idx].device == "No input"
+        });
+        for idx in pending {
+            if let Some(cable) = self.next_free_virtual_cable() {
+                let capture = InputCapture::open(Some(&cable));
+                if capture.available {
+                    self.strips[idx].device = capture.device.clone();
+                    self.audio.attach_input(idx, capture.shared());
+                    self.captures[idx] = Some(capture);
+                    self.toast(format!(
+                        "Virtual {} listening to {cable}",
+                        idx - 2
+                    ));
+                    continue;
+                }
+            }
+            self.pending_auto_assign.push(idx);
+        }
+    }
+
+    /// Removal is last-in-first-out so active strip/VST slot indexes never
+    /// move; the audio engine's preallocated slots stay aligned.
+    fn remove_last_virtual_input(&mut self) {
+        if self.active_strips <= BASE_STRIPS {
+            return;
+        }
+        let idx = self.active_strips - 1;
+        self.captures[idx] = None;
+        self.audio.detach_input(idx);
+        let chain = self.audio.vst(idx);
+        if let Some(slot) = self.vsts.get_mut(idx) {
+            slot.chain.close_editor();
+            slot.chain.unload();
+            *slot = VstSlot::new(chain);
+        }
+        if self.vst_panel == Some(idx) {
+            self.vst_panel = None;
+        }
+        self.pending_auto_assign.retain(|&x| x != idx);
+        self.strips[idx] = Strip::new(idx);
+        self.active_strips -= 1;
+        self.audio.set_strip_count(self.active_strips);
+        if self.strip_bank > Self::bank_for_strip(self.active_strips - 1) {
+            self.strip_bank = Self::bank_for_strip(self.active_strips - 1);
+        }
+        self.toast(format!("Virtual {} removed", idx - 2));
+    }
+
     /// Re-open the inputs named in a restored scene. Only names that exist on
     /// this machine are opened; a placeholder or an unplugged device stays
-    /// visible in the strip header so the person can reconnect it. The two
-    /// virtual strips are included: since this rebuild lists Windows capture
-    /// endpoints for them, a saved USB interface or virtual cable reopens too.
+    /// visible in the strip header so the person can reconnect it. Virtual
+    /// strips list Windows capture endpoints, so a saved USB interface or
+    /// virtual cable reopens too.
     fn apply_saved_inputs(&mut self) {
         let available = InputCapture::devices();
-        for i in 0..5 {
+        for i in 0..self.active_strips {
             let name = self.strips[i].device.clone();
             self.strips[i].tape_feed = i == 3 && name == "Virtual 1 (VAIO)";
             if name == "No input"
@@ -3327,12 +3594,23 @@ impl MixerApp {
     }
 
     fn reset_all(&mut self) {
-        self.strips = (0..5).map(Strip::new).collect();
+        self.strips = (0..MAX_STRIPS).map(Strip::new).collect();
+        self.captures = (0..MAX_STRIPS).map(|_| None).collect();
+        self.active_strips = BASE_STRIPS;
+        self.strip_bank = 0;
+        for i in 0..MAX_STRIPS {
+            self.audio.detach_input(i);
+        }
+        self.audio.set_strip_count(BASE_STRIPS);
         self.buses = (0..5).map(Bus::new).collect();
         self.audio.unload();
         self.tape = Tape::new();
         self.tape_error = None;
         self.tape_info = None;
+        self.vst_panel = None;
+        self.picker = None;
+        self.label_edit = None;
+        self.pending_auto_assign.clear();
         self.toast("Settings reset to default");
     }
 
@@ -3659,6 +3937,7 @@ impl MixerApp {
             let mut reset_gate = false;
             let mut copy_all = false;
             let mut paste = false;
+            let mut remove_last = false;
             let has_clip = self.strip_clip.is_some();
             hresp.context_menu(|ui| {
                 if ui.button("Edit label...").clicked() {
@@ -3709,6 +3988,13 @@ impl MixerApp {
                 {
                     paste = true;
                     ui.close_menu();
+                }
+                if idx >= BASE_STRIPS && idx + 1 == self.active_strips {
+                    ui.separator();
+                    if ui.button("Remove this virtual input").clicked() {
+                        remove_last = true;
+                        ui.close_menu();
+                    }
                 }
             });
             if open_label {
@@ -3764,6 +4050,10 @@ impl MixerApp {
                     clip.apply(&mut self.strips[idx]);
                     self.toast(format!("Pasted into {}", self.strips[idx].name));
                 }
+            }
+            if remove_last {
+                self.remove_last_virtual_input();
+                return;
             }
         }
         y += 29.0;
@@ -5898,7 +6188,9 @@ impl MixerApp {
             let mut open = true;
             let mut close_now = false;
             let title = match target {
-                Picker::Strip(i) => format!("Select Input Device - strip {}", i + 1),
+                Picker::Strip(i) => {
+                    format!("Select Input Device - {}", self.strip_label(i))
+                }
                 Picker::Bus(i) => format!("Select Output Device - BUS {}", self.buses[i].name),
             };
             let virtual_tail: [&str; 2] = ["Virtual 1 (VAIO)", "Virtual 2 (AUX)"];
@@ -5913,8 +6205,13 @@ impl MixerApp {
                         vec!["\u{2014} Windows input devices (USB, virtual cables, microphones) \u{2014}".to_string()];
                     list.extend(inputs);
                     if matches!(target, Picker::Strip(i) if self.strips[i].kind == StripKind::Virtual) {
-                        list.push("\u{2014} Virtual audio inputs \u{2014}".to_string());
-                        list.extend(virtual_tail.iter().map(|s| s.to_string()));
+                        // The original VAIO/AUX placeholders belong to the
+                        // two base virtual strips only; extra strips list real
+                        // capture endpoints.
+                        if matches!(target, Picker::Strip(3) | Picker::Strip(4)) {
+                            list.push("\u{2014} Virtual audio inputs \u{2014}".to_string());
+                            list.extend(virtual_tail.iter().map(|s| s.to_string()));
+                        }
                         list.push("No device".to_string());
                     } else {
                         list.push("No input".to_string());
@@ -5985,6 +6282,7 @@ impl MixerApp {
                         if ui.selectable_label(d == current, d.as_str()).clicked() {
                             match target {
                                 Picker::Strip(i) => {
+                                    self.pending_auto_assign.retain(|&x| x != i);
                                     if d == "No input"
                                         || d == "No input device found"
                                         || d == "No device"
@@ -6400,14 +6698,92 @@ impl eframe::App for MixerApp {
                 let pad = 8.0;
                 let gap = 4.0;
                 let gap_mid = 8.0;
+                let bank_h = 18.0;
+                let bank_top = rect.top() + 4.0;
+
+                let mut last_bank = if self.active_strips < MAX_STRIPS {
+                    Self::bank_for_strip(self.active_strips)
+                } else {
+                    Self::bank_for_strip(self.active_strips - 1)
+                };
+                let mut bx = rect.left() + pad;
+                for bank in 0..=last_bank {
+                    let chip = Rect::from_min_size(
+                        Pos2::new(bx, bank_top),
+                        Vec2::new(56.0, bank_h),
+                    );
+                    if top_button(
+                        ui,
+                        chip,
+                        &format!("BANK {}", bank + 1),
+                        self.strip_bank == bank,
+                        AMBER,
+                    ) {
+                        self.strip_bank = bank;
+                    }
+                    bx += 56.0 + 4.0;
+                }
+
+                let can_add = self.active_strips < MAX_STRIPS;
+                let add_rect = Rect::from_min_size(
+                    Pos2::new(rect.right() - pad - 132.0, bank_top),
+                    Vec2::new(132.0, bank_h),
+                );
+                let add_label = if can_add {
+                    "+ ADD VIRTUAL INPUT"
+                } else {
+                    "INPUT LIMIT"
+                };
+                if top_button(ui, add_rect, add_label, false, AMBER) && can_add {
+                    self.add_virtual_input();
+                    last_bank = if self.active_strips < MAX_STRIPS {
+                        Self::bank_for_strip(self.active_strips)
+                    } else {
+                        Self::bank_for_strip(self.active_strips - 1)
+                    };
+                }
+                self.strip_bank = self.strip_bank.min(last_bank);
+
                 let total_w = rect.width() - pad * 2.0 - gap * 9.0 - gap_mid;
                 let card_w = (total_w / 10.0).floor().max(60.0);
-                let h = rect.height() - 10.0;
-                let top = rect.top() + 5.0;
+                let top = bank_top + bank_h + 4.0;
+                let h = rect.bottom() - top - 5.0;
+                let start = Self::bank_start(self.strip_bank);
                 let mut x = rect.left() + pad;
-                for i in 0..5 {
+                for slot in 0..5 {
+                    let idx = start + slot;
                     let card = Rect::from_min_size(Pos2::new(x, top), Vec2::new(card_w, h));
-                    self.draw_strip_card(ui, card, i);
+                    if idx < self.active_strips {
+                        self.draw_strip_card(ui, card, idx);
+                    } else {
+                        ui.painter().rect_filled(card, 5.0, Color32::from_rgb(18, 21, 26));
+                        ui.painter()
+                            .rect_stroke(card, 5.0, Stroke::new(1.0, LINE));
+                        if idx == self.active_strips && self.active_strips < MAX_STRIPS {
+                            let r = ui.interact(
+                                card,
+                                Id::new(("add_strip_card", idx)),
+                                Sense::click(),
+                            );
+                            ui.painter().text(
+                                card.center(),
+                                Align2::CENTER_CENTER,
+                                "+",
+                                FontId::proportional(24.0),
+                                FAINT,
+                            );
+                            ui.painter().text(
+                                Pos2::new(card.center().x, card.center().y + 18.0),
+                                Align2::CENTER_CENTER,
+                                "ADD VIRTUAL INPUT",
+                                FontId::proportional(8.0),
+                                FAINT,
+                            );
+                            if r.clicked() {
+                                self.add_virtual_input();
+                            }
+                        }
+                    }
                     x += card_w + gap;
                 }
                 x += gap_mid - gap;
@@ -7446,6 +7822,37 @@ fn main() -> eframe::Result<()> {
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_free_cable_skips_bus_and_used_cables() {
+        let inputs = vec![
+            "Microphone (Virtual Cable 01)".to_string(),
+            "Microphone (Virtual Cable 02)".to_string(),
+            "Microphone (Virtual Cable 03)".to_string(),
+            "Microphone (Virtual Cable 04)".to_string(),
+            "CABLE Output (VB-Audio Virtual Cable)".to_string(),
+        ];
+        let used = vec![
+            "microphone (virtual cable 03)".to_string(),
+            "virtual 1 (vaio)".to_string(),
+        ];
+        assert_eq!(
+            MixerApp::next_free_virtual_cable_from(&inputs, &used).as_deref(),
+            Some("Microphone (Virtual Cable 04)")
+        );
+    }
+
+    #[test]
+    fn next_free_cable_none_when_all_used() {
+        let inputs = vec!["Microphone (Virtual Cable 03)".to_string()];
+        let used = vec!["microphone (virtual cable 03)".to_string()];
+        assert!(MixerApp::next_free_virtual_cable_from(&inputs, &used).is_none());
+    }
 }
 
 fn vc_file_logger() -> virtual_cables::LogFn {
