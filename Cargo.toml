@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = { version = "0.29.1", default-features = false, features = ["default_fonts", "glow"] }
-image = { version = "0.25.5", default-features = false, features = ["png"] }
+image = { version = "0.25.5", default-features = false, features = ["png", "ico"] }
 cpal = "0.16"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 # The original's file filter is "Audio (wav, mp3, bwf, aif, m4a)"; Symphonia
@@ -24,6 +24,26 @@ serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Controls_Dialogs", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+# WASAPI audio sessions for the per-strip app list. 0.54 is already in the
+# graph through cpal; these features add the session interfaces, the device
+# property store and the shell icon extraction.
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+
+[build-dependencies]
+embed-resource = "3"
 
 [profile.release]
 opt-level = 2

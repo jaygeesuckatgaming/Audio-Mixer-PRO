@@ -1182,6 +1182,13 @@ fn push_pcm(out: &mut Vec<u8>, value: f32, bytes: usize) {
 pub struct AudioEngine {
     shared: Arc<Shared>,
     _stream: Option<cpal::Stream>,
+    /// Keeps the thread that owns the stream alive. Dropping it closes the
+    /// stream, exactly like dropping `_stream` did.
+    stream_keeper: Option<std::sync::mpsc::Sender<()>>,
+    stream_thread: Option<std::thread::JoinHandle<()>>,
+    /// Result of a non-blocking start, polled by `poll_start`.
+    pub pending_start:
+        Option<std::sync::mpsc::Receiver<Result<(String, u32, u16), String>>>,
     pub device: String,
     pub sample_rate: u32,
     pub channels: u16,
@@ -1212,28 +1219,137 @@ impl AudioEngine {
         self.shared.active_strips.load(Ordering::Relaxed)
     }
 
-    pub fn new() -> Self {
-        let shared = Arc::new(Shared::new());
-        match Self::start(shared.clone()) {
-            Ok((stream, device, sample_rate, channels)) => Self {
-                shared,
-                _stream: Some(stream),
-                device,
-                sample_rate,
-                channels,
-                available: true,
-                status: "Audio engine running".to_string(),
-            },
-            Err(err) => Self {
-                shared,
-                _stream: None,
-                device: String::new(),
-                sample_rate: 48_000,
-                channels: 2,
-                available: false,
-                status: err,
-            },
+    /// Engine object with its shared state but no output stream yet. Startup
+    /// opens the stream on the first painted frame, so a slow or wedged audio
+    /// device can never keep the window from appearing.
+    pub fn idle() -> Self {
+        Self {
+            shared: Arc::new(Shared::new()),
+            _stream: None,
+            stream_keeper: None,
+            stream_thread: None,
+            pending_start: None,
+            device: String::new(),
+            sample_rate: 48_000,
+            channels: 2,
+            available: false,
+            status: "Audio engine starting".to_string(),
         }
+    }
+
+    /// Open the output stream on a helper thread. `cpal::Stream` is not `Send`,
+    /// so the thread that creates it must also own it: it parks until this
+    /// engine is dropped. The caller polls [`AudioEngine::poll_start`], which
+    /// means a wedged audio service can never freeze the UI thread.
+    pub fn start_stream_async(&mut self) {
+        if self.pending_start.is_some() {
+            return;
+        }
+        let shared = self.shared.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (keep_tx, keep_rx) = std::sync::mpsc::channel::<()>();
+        let spawned = std::thread::Builder::new()
+            .name("audio-start".to_string())
+            .spawn(move || match Self::start(shared) {
+                Ok((stream, device, sample_rate, channels)) => {
+                    let _ = result_tx.send(Ok((device, sample_rate, channels)));
+                    let _ = keep_rx.recv();
+                    drop(stream);
+                }
+                Err(err) => {
+                    let _ = result_tx.send(Err(err));
+                }
+            });
+        let Ok(handle) = spawned else {
+            self.status = "Could not start the audio thread".to_string();
+            return;
+        };
+        self.stream_thread = Some(handle);
+        self.stream_keeper = Some(keep_tx);
+        self.pending_start = Some(result_rx);
+        self.status = "Opening audio device".to_string();
+    }
+
+    /// Non-blocking poll of [`AudioEngine::start_stream_async`]. `None` means
+    /// still opening, `Some(ok)` means the attempt finished.
+    pub fn poll_start(&mut self) -> Option<bool> {
+        let receiver = self.pending_start.as_ref()?;
+        match receiver.try_recv() {
+            Ok(Ok((device, sample_rate, channels))) => {
+                self.device = device;
+                self.sample_rate = sample_rate;
+                self.channels = channels;
+                self.available = true;
+                self.status = "Audio engine running".to_string();
+                self.pending_start = None;
+                crate::diag_log(format!(
+                    "audio: stream opened on '{}' via helper thread",
+                    self.device
+                ));
+                Some(true)
+            }
+            Ok(Err(err)) => {
+                self.available = false;
+                self.status = err;
+                self.pending_start = None;
+                Some(false)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.available = false;
+                self.status = "Audio device did not respond".to_string();
+                self.pending_start = None;
+                Some(false)
+            }
+        }
+    }
+
+    /// Open the output stream on the existing shared state. The VST chains and
+    /// buffers created by [`AudioEngine::idle`] stay valid, so inserts loaded
+    /// before the stream came up keep working.
+    pub fn start_stream(&mut self) -> bool {
+        self.stop_stream();
+        match Self::start(self.shared.clone()) {
+            Ok((stream, device, sample_rate, channels)) => {
+                self._stream = Some(stream);
+                self.device = device;
+                self.sample_rate = sample_rate;
+                self.channels = channels;
+                self.available = true;
+                self.status = "Audio engine running".to_string();
+                crate::diag_log(format!("audio: stream opened on '{}'", self.device));
+                true
+            }
+            Err(err) => {
+                self._stream = None;
+                self.available = false;
+                self.status = err;
+                false
+            }
+        }
+    }
+
+    pub fn new() -> Self {
+        let mut engine = Self::idle();
+        engine.start_stream();
+        engine
+    }
+
+    /// The stream lives on the helper thread, so dropping the engine has to
+    /// release it explicitly.
+    pub fn stop_stream(&mut self) {
+        self.stream_keeper = None;
+        self._stream = None;
+        self.pending_start = None;
+        // The helper thread parks on the keep channel once the stream exists,
+        // so joining it is instant. If it is still stuck opening the device,
+        // leave it detached rather than block the caller.
+        if let Some(handle) = self.stream_thread.take() {
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+        self.available = false;
     }
 
     fn start(shared: Arc<Shared>) -> Result<(cpal::Stream, String, u32, u16), String> {
@@ -1297,9 +1413,18 @@ impl AudioEngine {
 
         let mut last_error = String::from("No audio output device could be opened");
         for i in order {
+            let name = devices[i].name().unwrap_or_default();
             match open_device(&devices[i], shared.clone(), format) {
-                Ok(opened) => return Ok(opened),
-                Err(err) => last_error = err,
+                Ok(opened) => {
+                    crate::diag_log(format!("audio: output opened on '{name}'"));
+                    return Ok(opened);
+                }
+                Err(err) => {
+                    if preferred.is_some_and(|p| p.eq_ignore_ascii_case(&name)) {
+                        crate::diag_log(format!("audio: preferred output '{name}' failed: {err}"));
+                    }
+                    last_error = err;
+                }
             }
         }
         Err(last_error)
@@ -1615,7 +1740,7 @@ impl AudioEngine {
         if main_buffer > MAIN_BUFFER_MAX {
             return Err(A1_BUFFER_ERROR.to_string());
         }
-        self._stream = None;
+        self.stop_stream();
         let format = OutputFormat {
             sample_rate,
             buffer_frames: main_buffer,
@@ -1628,6 +1753,10 @@ impl AudioEngine {
                 self.channels = channels;
                 self.available = true;
                 self.status = "Audio engine running".to_string();
+                crate::diag_log(format!(
+                    "audio: format applied, stream reopened on '{}' at {} Hz / {} frames",
+                    self.device, self.sample_rate, main_buffer
+                ));
                 Ok(())
             }
             Err(err) => {
@@ -1656,7 +1785,7 @@ impl AudioEngine {
         sample_rate: u32,
         main_buffer: u32,
     ) -> Result<(), String> {
-        self._stream = None;
+        self.stop_stream();
         let format = OutputFormat {
             sample_rate,
             buffer_frames: main_buffer,
@@ -1669,6 +1798,10 @@ impl AudioEngine {
                 self.channels = channels;
                 self.available = true;
                 self.status = "Audio engine running".to_string();
+                crate::diag_log(format!(
+                    "audio: format applied, stream reopened on '{}' at {} Hz / {} frames",
+                    self.device, self.sample_rate, main_buffer
+                ));
                 Ok(())
             }
             Err(err) => {
@@ -1934,13 +2067,35 @@ impl InputCapture {
         }
         let default_name = host.default_input_device().and_then(|d| d.name().ok());
         let mut order: Vec<usize> = Vec::new();
-        if let Some(name) = preferred {
-            if let Some(i) = devices.iter().position(|d| {
+        // An explicitly requested device is tried alone: silently falling back
+        // to a different input would capture the wrong source (for example a
+        // webcam instead of a virtual cable) with no visible hint.
+        let preferred_index = preferred.and_then(|name| {
+            devices.iter().position(|d| {
                 d.name()
                     .map(|n| n.eq_ignore_ascii_case(name))
                     .unwrap_or(false)
-            }) {
-                order.push(i);
+            })
+        });
+        if preferred.is_some() {
+            let Some(index) = preferred_index else {
+                return Self::failed(format!(
+                    "Input device not found: {}",
+                    preferred.unwrap_or_default()
+                ));
+            };
+            match Self::start(&devices[index]) {
+                Ok(capture) => return capture,
+                Err(err) => {
+                    crate::diag_log(format!(
+                        "audio: could not open '{}': {err}",
+                        preferred.unwrap_or_default()
+                    ));
+                    return Self::failed(format!(
+                        "Could not open {}: {err}",
+                        preferred.unwrap_or_default()
+                    ));
+                }
             }
         }
         // Windows often points the default recording device at a virtual

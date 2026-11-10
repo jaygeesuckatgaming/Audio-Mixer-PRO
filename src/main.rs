@@ -1,4 +1,7 @@
+#![windows_subsystem = "windows"]
+
 mod audio;
+mod sessions;
 mod vban;
 mod vc;
 mod vst;
@@ -7,6 +10,7 @@ use audio::{AudioEngine, DemoKind, InputCapture, BASE_STRIPS, MAX_STRIPS};
 use eframe::egui::{
     self, Align2, Color32, FontId, Id, Pos2, Rect, Response, Sense, Stroke, Vec2,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,6 +37,13 @@ const PURPLE: Color32 = Color32::from_rgb(146, 118, 208);
 const GAIN_MIN: f32 = -60.0;
 const GAIN_MAX: f32 = 12.0;
 const GAIN_STEP: f32 = 3.0;
+
+/// Inline application list in a virtual strip: header plus three rows, so the
+/// block keeps a stable height whether or not apps are playing.
+const APPS_HEADER_H: f32 = 11.0;
+const APPS_ROW_H: f32 = 22.0;
+const APPS_VISIBLE_ROWS: usize = 3;
+const APPS_BLOCK_H: f32 = APPS_HEADER_H + APPS_ROW_H * APPS_VISIBLE_ROWS as f32;
 
 // Menu command ids from FUN_0052faa0, handled by FUN_00543640.
 const CMD_RESTART_ENGINE: u32 = 80; // 0x50
@@ -852,6 +863,17 @@ impl VstSlot {
     }
 }
 
+/// Staged start-up. Each step runs on its own frame, after the window has
+/// painted, so a blocked audio device only stalls that step instead of keeping
+/// the whole console from appearing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupStep {
+    Engine,
+    Cables,
+    Devices,
+    Done,
+}
+
 struct MixerApp {
     strips: Vec<Strip>,
     /// Visible strips (5..=MAX_STRIPS). Vectors stay MAX_STRIPS long so a
@@ -919,6 +941,14 @@ struct MixerApp {
     preset_active: String,
     show_preset_on_startup: bool,
     show_info: Option<(String, String)>,
+    /// Applications rendering into each strip's virtual cable (WASAPI
+    /// sessions on the cable's render endpoint), listed inline in the strip.
+    apps: sessions::AppSessions,
+    apps_rows: HashMap<String, Vec<sessions::AppSession>>,
+    app_icons: HashMap<String, egui::TextureHandle>,
+    apps_open: [bool; MAX_STRIPS],
+    apps_scroll: [usize; MAX_STRIPS],
+    apps_targets: Vec<String>,
     /// One VST3 insert per input strip (rebuild extension, see vst.rs).
     vsts: Vec<VstSlot>,
     /// Which strip's VST selector is open, if any.
@@ -952,6 +982,14 @@ struct MixerApp {
     shot_requested: bool,
     first_frame: bool,
     startup_demo: Option<usize>,
+    /// Startup is staged across frames so the window is painted before any
+    /// audio call that can block inside the Windows audio service.
+    startup_step: StartupStep,
+    startup_wait: f64,
+    startup_settle: f64,
+    /// `--safe-mode` / `AMP_SAFE=1`: no engine, no captures, no cables, no
+    /// VSTs, no session scanning. Enough UI to fix a broken scene.
+    safe_mode: bool,
     /// Menu 0x55 "Auto Restart Audio Engine (A1 Device)": after 5 one-second
     /// ticks with A1 unavailable or the device list changed, re-open silently
     /// (FUN_0054b730, FUN_00527ad0(1, 1)).
@@ -967,6 +1005,16 @@ struct MixerApp {
     /// even when the person never pressed Save Settings.
     save_on_exit: bool,
     poll_clock: f64,
+    /// In-flight `output_devices()` probe. Enumeration blocks when the audio
+    /// service is wedged, so it never runs on the UI thread.
+    devices_probe: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    /// `--meter-log`: write each strip's capture peak to startup.log once a
+    /// second. Used to tell "no signal in the capture" apart from "routing".
+    meter_log: bool,
+    meter_clock: f64,
+    /// How often the engine has been reopened to reach the configured A1
+    /// device. A cable endpoint can show up a moment after the mix starts.
+    a1_reopen_tries: u8,
     restart_ticks: u32,
     last_outputs: Vec<String>,
     /// Whether the virtual cables were attached on the previous watchdog tick.
@@ -1322,26 +1370,27 @@ impl MixerApp {
             .insert(egui::TextStyle::Monospace, egui::FontId::monospace(9.0));
         cc.egui_ctx.set_style(style);
 
-        let audio = AudioEngine::new();
+        // The engine object exists immediately but opens no device until the
+        // first painted frame (see StartupStep). `--safe-mode` skips audio
+        // entirely so a wedged device graph can still be opened and fixed.
+        let safe_mode =
+            std::env::args().any(|arg| arg == "--safe-mode") || std::env::var_os("AMP_SAFE").is_some();
+        diag_log(if safe_mode {
+            "startup: safe mode"
+        } else {
+            "startup: constructing window"
+        });
+        let audio = AudioEngine::idle();
         let vst_chains = audio.vsts();
         let sample_rate = audio.sample_rate.max(8_000);
-        let audio_status = if audio.available {
-            String::new()
+        let audio_status = if safe_mode {
+            "Safe mode: audio disabled".to_string()
         } else {
-            format!("No audio output: {}", audio.status)
+            "Starting audio engine".to_string()
         };
 
-        // Open the default microphone / line input on HW INPUT 1 right away so
-        // its meter shows the real signal without any setup. The other two
-        // hardware strips open a device when the person picks one.
-        let mut strips: Vec<Strip> = (0..MAX_STRIPS).map(Strip::new).collect();
-        let mut captures: Vec<Option<StripInput>> =
-            (0..MAX_STRIPS).map(|_| None).collect();
-        let first_input = InputCapture::open(None);
-        if first_input.available {
-            strips[0].device = first_input.device.clone();
-            captures[0] = Some(StripInput::Cpal(first_input));
-        }
+        let strips: Vec<Strip> = (0..MAX_STRIPS).map(Strip::new).collect();
+        let captures: Vec<Option<StripInput>> = (0..MAX_STRIPS).map(|_| None).collect();
 
         let mut app = MixerApp {
             strips,
@@ -1394,6 +1443,12 @@ impl MixerApp {
             preset_active: "DEFAULT".to_string(),
             show_preset_on_startup: false,
             show_info: None,
+            apps: sessions::AppSessions::new(),
+            apps_rows: HashMap::new(),
+            app_icons: HashMap::new(),
+            apps_open: [true; MAX_STRIPS],
+            apps_scroll: [0; MAX_STRIPS],
+            apps_targets: Vec::new(),
             vsts: vst_chains.into_iter().map(VstSlot::new).collect(),
             vst_panel: None,
             vst_scan: None,
@@ -1424,12 +1479,24 @@ impl MixerApp {
             shot_requested: false,
             first_frame: true,
             startup_demo,
+            startup_step: if safe_mode {
+                StartupStep::Done
+            } else {
+                StartupStep::Engine
+            },
+            startup_wait: 0.0,
+            startup_settle: 0.0,
+            safe_mode,
             // FUN_00543160 resets AutoRestart and AutoRestartAll to 0.
             auto_restart_a1: false,
             auto_restart_all: false,
             load_on_startup: true,
             save_on_exit: true,
             poll_clock: 0.0,
+            devices_probe: None,
+            meter_log: std::env::args().any(|arg| arg == "--meter-log"),
+            meter_clock: 0.0,
+            a1_reopen_tries: 0,
             restart_ticks: 0,
             last_outputs: Vec::new(),
             vc_was_attached: false,
@@ -1447,39 +1514,22 @@ impl MixerApp {
         for (i, shared) in attached {
             app.audio.attach_input(i, shared);
         }
-        // A routing button that is lit over a strip with no capture device is
-        // misleading, so those strips start with A1 off; choosing a device in
-        // the strip header makes the button available again.
-        for i in 0..3 {
-            if app.captures[i].is_none() {
-                app.strips[i].route = [false; 5];
-            }
-        }
         // The original reads the last scene before the first paint
         // (FUN_0052f0b0 calls FUN_0052ec00 on LastSettings or VMB_StartupFile).
         app.read_persistence_flags();
         let has_saved_scene = settings_file().exists() || Path::new("mixer_settings.txt").exists();
         if app.load_on_startup && has_saved_scene {
-            app.load_settings(false);
+            // Parse the scene now (cheap, pure state) but do NOT open its
+            // devices yet: that is deferred until the cables have attached so
+            // no capture is opened while its USB endpoint is being replugged.
+            app.load_settings_parse(false);
         }
         app.audio.set_strip_count(app.active_strips);
         app.strip_bank = 0;
-        // Make the saved output period real before the first interaction.
-        // apply_audio_format falls back to the driver default if the requested
-        // buffer is refused, so this cannot leave the console silent.
-        if app.audio.available {
-            let _ = app.apply_audio_format();
-        }
         if app.show_preset_on_startup {
             app.open_presets();
         }
-        if let Some(index) = app.startup_demo {
-            if let Some(kind) = DemoKind::from_index(index) {
-                app.select_demo(kind);
-                app.on_transport(Transport::Play);
-                app.startup_demo = None;
-            }
-        }
+        diag_log("startup: scene parsed");
         // Diagnostic: play the demo into both virtual buses so the cable
         // capture endpoints can be measured from another process.
         if std::env::args().any(|a| a == "--bus-demo") {
@@ -1589,13 +1639,12 @@ impl MixerApp {
                 }
             }
         }
-        app.vc.apply(app.vc_cfg.clone());
-        // The USB cables attach asynchronously; try the saved capture devices
-        // once more after the server has been told to start.
-        app.apply_saved_inputs();
-        // The scene already named VST3 plug-ins? Put each one back in its own
-        // input insert before the first paint, like the rest of the saved scene.
-        app.restore_vst(false);
+        // Cables, capture devices and VSTs are opened by advance_startup once
+        // the window is up. A screenshot run has no human to wait for, so it
+        // still runs the whole sequence before the first frame.
+        if app.shot_path.is_some() {
+            app.run_startup_blocking();
+        }
         // Diagnostics used while checking the VST panels: open one, optionally
         // with a plug-in already loaded. Slots are 1-5 (strip order). Run after
         // the scene restore so a diagnostic load is not immediately replaced.
@@ -2057,17 +2106,59 @@ impl MixerApp {
     /// previous one, and after five consecutive ticks with a bad or moved A1
     /// stream calls FUN_00527ad0(1, 1) without a dialog.
     fn poll_audio_devices(&mut self, dt: f64) {
+        if self.safe_mode {
+            return;
+        }
+        // Enumeration calls into the audio service and can block for minutes
+        // when a device is wedged, so it runs off the UI thread. A probe still
+        // in flight means the service is not answering: skip the rest of this
+        // tick instead of stacking more audio calls behind it.
+        if let Some(probe) = self.devices_probe.take() {
+            match probe.try_recv() {
+                Ok(devices) => self.handle_device_list(devices),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.devices_probe = Some(probe);
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
         self.poll_clock += dt;
         if self.poll_clock < 1.0 {
             return;
         }
         self.poll_clock = 0.0;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("device-probe".to_string())
+            .spawn(move || {
+                let _ = sender.send(AudioEngine::output_devices());
+            })
+            .is_ok()
+        {
+            self.devices_probe = Some(receiver);
+        }
+    }
 
-        let devices = AudioEngine::output_devices();
+    /// React to a list that arrived from the probe thread.
+    fn handle_device_list(&mut self, devices: Vec<String>) {
         let list_changed = !self.last_outputs.is_empty() && devices != self.last_outputs;
         let a1_missing = !self.buses[0].device.is_empty()
             && !devices.iter().any(|n| n == &self.buses[0].device);
         self.last_outputs = devices;
+
+        // The configured A1 device may be a virtual cable that Windows only
+        // enumerates a second or two after the mix starts. Reopen once it is
+        // really present instead of silently staying on the default output.
+        if self.audio.available && !a1_missing && !self.buses[0].device.is_empty() {
+            let wanted = self.buses[0].device.clone();
+            if self.audio.device.eq_ignore_ascii_case(&wanted) {
+                self.a1_reopen_tries = 0;
+            } else if self.a1_reopen_tries < 5 {
+                self.a1_reopen_tries = self.a1_reopen_tries.saturating_add(1);
+                let _ = self.apply_audio_format();
+            }
+        }
 
         if self.audio.available && !list_changed && !a1_missing {
             self.restart_ticks = 0;
@@ -2111,15 +2202,11 @@ impl MixerApp {
         // below opens them fresh.
         let vc_attached = self.vc.status().attached;
         if vc_attached && !self.vc_was_attached {
-            for i in 3..self.active_strips {
+            for i in 0..self.active_strips {
                 if matches!(self.captures[i], Some(StripInput::Vban(_))) {
                     continue;
                 }
-                let name = &self.strips[i].device;
-                if !name.trim().is_empty()
-                    && name != "Virtual 1 (VAIO)"
-                    && name != "Virtual 2 (AUX)"
-                {
+                if cable_label(&self.strips[i].device).is_some() {
                     self.audio.detach_input(i);
                     self.captures[i] = None;
                 }
@@ -2137,15 +2224,19 @@ impl MixerApp {
         }
         self.vc_was_attached = vc_attached;
 
-        // Finish auto-assigning extra inputs that were added before Windows
-        // enumerated their virtual cable.
-        self.retry_pending_auto_assign();
+        // Opening a capture endpoint is another call into the audio service, so
+        // it only happens once the engine is actually up.
+        if self.audio.available {
+            // Finish auto-assigning extra inputs that were added before Windows
+            // enumerated their virtual cable.
+            self.retry_pending_auto_assign();
 
-        // A virtual cable can finish attaching a moment after the mixer starts,
-        // so the first restore attempt may find no endpoint. Keep retrying the
-        // saved capture devices quietly; otherwise the strip stays silent until
-        // the person deselects and reselects it.
-        self.apply_saved_inputs();
+            // A virtual cable can finish attaching a moment after the mixer
+            // starts, so the first restore attempt may find no endpoint. Keep
+            // retrying the saved capture devices quietly; otherwise the strip
+            // stays silent until the person reselects it.
+            self.apply_saved_inputs();
+        }
     }
 
     fn restart_engine(&mut self) {
@@ -2869,14 +2960,21 @@ impl MixerApp {
     }
 
     fn load_settings(&mut self, announce: bool) {
+        self.load_settings_parse(announce);
+        // <InputDev> only stores a name; open the stream again so the restored
+        // HW INPUT 1-3 really work after a restart.
+        self.apply_saved_inputs();
+        self.apply_vban_config();
+    }
+
+    /// Read the scene without opening any audio device. Construction uses this
+    /// so the window is painted before captures open; the Load button still
+    /// uses `load_settings`, which opens them immediately.
+    fn load_settings_parse(&mut self, announce: bool) {
         let path = settings_file();
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 self.load_settings_xml(&text);
-                // <InputDev> only stores a name; open the stream again so the
-                // restored HW INPUT 1-3 really work after a restart.
-                self.apply_saved_inputs();
-                self.apply_vban_config();
                 if announce {
                     self.toast("Settings loaded");
                 }
@@ -2884,9 +2982,198 @@ impl MixerApp {
             Err(_) => {
                 // Settings written by the earlier build still load.
                 self.load_settings_legacy();
-                self.apply_saved_inputs();
-                self.apply_vban_config();
             }
+        }
+    }
+
+    /// One start-up frame. Engine, cables and device opens each get their own
+    /// frame, after the console has painted, so a blocked WASAPI call behind
+    /// the Windows audio service can never hide the window.
+    fn startup_step_frame(&mut self, dt: f64) {
+        match self.startup_step {
+            StartupStep::Done => {}
+            StartupStep::Engine => {
+                if self.shot_path.is_some() {
+                    // Screenshot runs have no human to wait for, so the open is
+                    // still synchronous here - but bounded, so a wedged device
+                    // cannot trap the capture run forever.
+                    diag_log("startup: opening audio engine (screenshot)");
+                    self.audio.start_stream_async();
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    loop {
+                        if self.audio.poll_start().is_some() {
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            self.audio.stop_stream();
+                            self.audio.available = false;
+                            self.audio.status = "Audio device did not answer".to_string();
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    self.sample_rate = self.audio.sample_rate.max(8_000);
+                    self.audio.set_strip_count(self.active_strips);
+                    self.startup_step = StartupStep::Cables;
+                    self.startup_wait = 0.0;
+                    self.startup_settle = 0.0;
+                    if !self.audio.available {
+                        diag_log(format!(
+                            "startup: audio engine unavailable: {}",
+                            self.audio.status
+                        ));
+                    }
+                    return;
+                }
+                if self.audio.pending_start.is_none() && !self.audio.available && self.startup_wait == 0.0 {
+                    diag_log("startup: opening audio engine");
+                    self.audio.start_stream_async();
+                }
+                self.startup_wait += dt;
+                let outcome = self.audio.poll_start();
+                match outcome {
+                    Some(ok) => {
+                        self.sample_rate = self.audio.sample_rate.max(8_000);
+                        self.audio.set_strip_count(self.active_strips);
+                        if ok {
+                            diag_log("startup: audio engine ready");
+                        } else {
+                            diag_log(format!(
+                                "startup: audio engine unavailable: {}",
+                                self.audio.status
+                            ));
+                            self.toast_for(format!("Audio engine: {}", self.audio.status), 8.0);
+                        }
+                        self.startup_wait = 0.0;
+                        self.startup_settle = 0.0;
+                        self.startup_step = StartupStep::Cables;
+                    }
+                    None if self.startup_wait < 8.0 => {}
+                    None => {
+                        // The device open is wedged inside the audio service.
+                        // Abandon it (the helper thread stays blocked, the UI
+                        // does not) and continue without audio.
+                        self.audio.stop_stream();
+                        self.audio.available = false;
+                        self.audio.status = "Audio device did not answer".to_string();
+                        diag_log("startup: audio engine timed out");
+                        self.toast_for(
+                            "Audio device did not answer - running without audio",
+                            10.0,
+                        );
+                        self.startup_wait = 0.0;
+                        self.startup_settle = 0.0;
+                        self.startup_step = StartupStep::Cables;
+                    }
+                }
+            }
+            StartupStep::Cables => {
+                if self.vc_cfg.enabled {
+                    diag_log("startup: starting virtual cables");
+                    self.vc.apply(self.vc_cfg.clone());
+                }
+                self.startup_step = StartupStep::Devices;
+                self.startup_wait = 0.0;
+            }
+            StartupStep::Devices => {
+                let attached = !self.vc_cfg.enabled || self.vc.status().attached;
+                self.startup_wait += dt;
+                if attached {
+                    // "attached" only means the attach command returned; the
+                    // endpoints still need a moment to enumerate. Opening a
+                    // capture inside that window is what blocks in the audio
+                    // service.
+                    self.startup_settle += dt;
+                    if self.startup_settle < 0.6 {
+                        return;
+                    }
+                } else if self.startup_wait < 8.0 {
+                    return;
+                }
+                diag_log(if attached {
+                    "startup: cables attached, opening devices"
+                } else {
+                    "startup: cable attach still pending, opening available devices"
+                });
+                if self.audio.available {
+                    self.open_default_input();
+                    self.apply_saved_inputs();
+                    let _ = self.apply_audio_format();
+                    self.restore_vst(false);
+                } else {
+                    diag_log("startup: no engine, capture devices left closed");
+                }
+                self.disable_routes_without_input();
+                if let Some(index) = self.startup_demo.take() {
+                    if let Some(kind) = DemoKind::from_index(index) {
+                        self.select_demo(kind);
+                        self.on_transport(Transport::Play);
+                    }
+                }
+                if std::env::args().any(|arg| arg == "--bus-demo") {
+                    self.tape.route = [false, false, false, true, true];
+                    self.select_demo(DemoKind::Track1);
+                    self.on_transport(Transport::Play);
+                }
+                self.startup_step = StartupStep::Done;
+                diag_log("startup: done");
+            }
+        }
+    }
+
+    fn advance_startup(&mut self, dt: f64) {
+        if self.startup_step != StartupStep::Done {
+            self.startup_step_frame(dt);
+        }
+    }
+
+    /// Screenshot runs have no human waiting, so they run every step at once.
+    fn run_startup_blocking(&mut self) {
+        for _ in 0..8 {
+            if self.startup_step == StartupStep::Done {
+                break;
+            }
+            self.startup_step_frame(600.0);
+        }
+    }
+
+    /// A lit A1 button over a strip with no capture device is misleading, so
+    /// those strips keep A1 off. Runs once the scene's devices are open, so a
+    /// strip that really has an input keeps its saved routing.
+    fn disable_routes_without_input(&mut self) {
+        for i in 0..3 {
+            // Judge by the chosen device, not by whether its capture happened
+            // to be open at this instant: a cable endpoint can enumerate a
+            // second after the mix starts, and clearing its routing then would
+            // silence a strip that is about to work.
+            let name = self.strips[i].device.trim();
+            let has_device = !name.is_empty()
+                && !name.eq_ignore_ascii_case("No input")
+                && !name.eq_ignore_ascii_case("No input device found")
+                && !name.eq_ignore_ascii_case("No device");
+            if !has_device {
+                self.strips[i].route = [false; 5];
+            }
+        }
+    }
+
+    /// Open the default microphone for HW INPUT 1 when the scene did not name a
+    /// device for that strip. If it did, `apply_saved_inputs` opens that one.
+    fn open_default_input(&mut self) {
+        if self.captures[0].is_some() {
+            return;
+        }
+        let adopt_name = self.strips[0].device.is_empty()
+            || self.strips[0].device.eq_ignore_ascii_case("WDM: Microphone");
+        if !adopt_name {
+            return;
+        }
+        let capture = InputCapture::open(None);
+        if capture.available {
+            self.strips[0].device = capture.device.clone();
+            self.audio.attach_input(0, capture.shared());
+            self.captures[0] = Some(StripInput::Cpal(capture));
         }
     }
 
@@ -3706,8 +3993,19 @@ impl MixerApp {
             if !available.iter().any(|d| d.eq_ignore_ascii_case(&name)) {
                 continue;
             }
+            // A cable endpoint that still exists from the previous session is
+            // about to be unplugged and replugged. Opening it now yields a
+            // stream that is "running" but permanently silent, so wait for the
+            // attach to finish and let the retry open the fresh endpoint.
+            if self.vc_cfg.enabled
+                && cable_label(&name).is_some()
+                && !self.vc.status().attached
+            {
+                continue;
+            }
             let capture = InputCapture::open(Some(&name));
             if capture.available {
+                diag_log(format!("input {}: opened '{}'", i + 1, capture.device));
                 self.strips[i].device = capture.device.clone();
                 self.audio.attach_input(i, capture.shared());
                 self.captures[i] = Some(StripInput::Cpal(capture));
@@ -4124,6 +4422,250 @@ impl MixerApp {
     // Input strips
     // -----------------------------------------------------------------------
 
+    /// Cable a strip listens to, as the label the app list keys on
+    /// ("Virtual Cable 03"). Any input strip can capture one of the cable
+    /// microphones, so hardware strips get the list as well.
+    fn strip_cable(&self, idx: usize) -> Option<String> {
+        let strip = self.strips.get(idx)?;
+        cable_label(&strip.device)
+    }
+
+    /// Tell the session worker which cables are on screen, then take the latest
+    /// snapshot for this frame.
+    fn sync_app_targets(&mut self) {
+        if self.safe_mode || self.startup_step != StartupStep::Done {
+            if !self.apps_targets.is_empty() {
+                self.apps.set_targets(&[]);
+                self.apps_targets.clear();
+            }
+            return;
+        }
+        let mut targets: Vec<String> = (0..self.active_strips.min(self.strips.len()))
+            .filter_map(|idx| self.strip_cable(idx))
+            .collect();
+        targets.sort();
+        targets.dedup();
+        if targets != self.apps_targets {
+            self.apps.set_targets(&targets);
+            self.apps_targets = targets;
+        }
+        self.apps_rows = self.apps.snapshot();
+    }
+
+    /// Header plus up to three app rows, painted between the strip's EQ panel
+    /// and its routing buttons. Returns the vertical space used.
+    fn draw_apps_block(
+        &mut self,
+        ui: &egui::Ui,
+        idx: usize,
+        left: f32,
+        y: f32,
+        w: f32,
+        cable: &str,
+    ) -> f32 {
+        let open = self.apps_open[idx];
+        let rows: Vec<sessions::AppSession> =
+            self.apps_rows.get(cable).cloned().unwrap_or_default();
+        let count = rows.len();
+        let header = Rect::from_min_size(Pos2::new(left, y), Vec2::new(w, APPS_HEADER_H));
+        ui.painter().rect_filled(header, 2.0, TRACK);
+        ui.painter().rect_stroke(header, 2.0, Stroke::new(1.0, LINE));
+        ui.painter().text(
+            Pos2::new(header.left() + 4.0, header.center().y),
+            Align2::LEFT_CENTER,
+            if count == 0 {
+                "APPS".to_string()
+            } else {
+                format!("APPS {count}")
+            },
+            FontId::proportional(6.4),
+            if count > 0 { TEAL } else { FAINT },
+        );
+        ui.painter().text(
+            Pos2::new(header.right() - 4.0, header.center().y),
+            Align2::RIGHT_CENTER,
+            if open { "v" } else { ">" },
+            FontId::proportional(6.0),
+            FAINT,
+        );
+        let hresp = ui.interact(header, Id::new(("apps_head", idx)), Sense::click());
+        if hresp.clicked() {
+            self.apps_open[idx] = !open;
+        }
+        let _ = hresp.on_hover_text(format!(
+            "Applications playing into {cable}: click to {} the list",
+            if open { "hide" } else { "show" }
+        ));
+        if !open {
+            return APPS_HEADER_H;
+        }
+
+        let area = Rect::from_min_size(
+            Pos2::new(left, y + APPS_HEADER_H),
+            Vec2::new(w, APPS_ROW_H * APPS_VISIBLE_ROWS as f32),
+        );
+        ui.painter().rect_filled(area, 1.0, Color32::from_rgb(16, 19, 24));
+        if rows.is_empty() {
+            ui.painter().text(
+                area.center(),
+                Align2::CENTER_CENTER,
+                "No app is using this cable",
+                FontId::proportional(6.2),
+                FAINT,
+            );
+            return APPS_BLOCK_H;
+        }
+
+        let scroll_resp = ui.interact(area, Id::new(("apps_area", idx)), Sense::hover());
+        if scroll_resp.hovered() {
+            let wheel = ui.input(|i| i.raw_scroll_delta.y);
+            if wheel.abs() > 0.5 {
+                let max_offset = count.saturating_sub(APPS_VISIBLE_ROWS);
+                let offset = self.apps_scroll[idx] as i32 - wheel.signum() as i32;
+                self.apps_scroll[idx] = offset.clamp(0, max_offset as i32) as usize;
+            }
+        }
+        let offset = self.apps_scroll[idx].min(count.saturating_sub(APPS_VISIBLE_ROWS));
+
+        for (slot, row) in rows
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(APPS_VISIBLE_ROWS)
+        {
+            let ry = y + APPS_HEADER_H + (slot - offset) as f32 * APPS_ROW_H;
+            let rect = Rect::from_min_size(Pos2::new(left, ry), Vec2::new(w, APPS_ROW_H));
+            if row.peak > 0.001 && !row.muted {
+                ui.painter()
+                    .rect_filled(rect, 0.0, Color32::from_rgb(21, 28, 30));
+            }
+
+            let icon_rect = Rect::from_min_size(
+                Pos2::new(rect.left() + 3.0, rect.top() + 4.0),
+                Vec2::splat(13.0),
+            );
+            if let Some(icon) = &row.icon {
+                let key = row
+                    .exe
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("name:{}", row.name));
+                if !self.app_icons.contains_key(&key) {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [icon.width as usize, icon.height as usize],
+                        &icon.rgba,
+                    );
+                    let handle = ui.ctx().load_texture(
+                        format!("appicon:{key}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.app_icons.insert(key.clone(), handle);
+                }
+                if let Some(handle) = self.app_icons.get(&key) {
+                    ui.painter().image(
+                        handle.id(),
+                        icon_rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+            } else {
+                ui.painter()
+                    .rect_filled(icon_rect, 2.0, Color32::from_rgb(46, 52, 62));
+            }
+
+            let mute_rect = Rect::from_min_size(
+                Pos2::new(rect.right() - 16.0, rect.top() + 3.0),
+                Vec2::new(14.0, 10.0),
+            );
+            let name_w = (mute_rect.left() - (icon_rect.right() + 3.0)).max(10.0);
+            ui.painter().text(
+                Pos2::new(icon_rect.right() + 3.0, rect.top() + 2.0),
+                Align2::LEFT_TOP,
+                fit_text(ui.painter(), &row.name, 7.0, name_w),
+                FontId::proportional(7.0),
+                if row.muted { FAINT } else { TEXT },
+            );
+
+            let mute_resp = ui.interact(
+                mute_rect,
+                Id::new(("app_mute", idx, row.pid)),
+                Sense::click(),
+            );
+            ui.painter().rect_filled(
+                mute_rect,
+                2.0,
+                if row.muted {
+                    Color32::from_rgb(88, 32, 28)
+                } else {
+                    TRACK
+                },
+            );
+            ui.painter().rect_stroke(
+                mute_rect,
+                2.0,
+                Stroke::new(1.0, if row.muted { RED } else { LINE }),
+            );
+            ui.painter().text(
+                mute_rect.center(),
+                Align2::CENTER_CENTER,
+                "M",
+                FontId::proportional(6.4),
+                if row.muted { TEXT } else { DIM },
+            );
+            if mute_resp.clicked() {
+                self.apps.set_mute(cable, row.pid, !row.muted);
+            }
+            let _ = mute_resp.on_hover_text(format!(
+                "{}: {} this application",
+                row.name,
+                if row.muted { "unmute" } else { "mute" }
+            ));
+
+            let bar = Rect::from_min_size(
+                Pos2::new(icon_rect.right() + 3.0, rect.bottom() - 6.0),
+                Vec2::new((rect.right() - 3.0 - icon_rect.right() - 3.0).max(8.0), 3.0),
+            );
+            ui.painter().rect_filled(bar, 1.0, Color32::from_rgb(38, 44, 54));
+            ui.painter().rect_filled(
+                Rect::from_min_size(
+                    bar.left_top(),
+                    Vec2::new(bar.width() * row.volume.clamp(0.0, 1.0), bar.height()),
+                ),
+                1.0,
+                if row.muted { FAINT } else { TEAL.gamma_multiply(0.75) },
+            );
+            let peak_x = bar.left() + bar.width() * row.peak.sqrt().clamp(0.0, 1.0);
+            ui.painter().line_segment(
+                [
+                    Pos2::new(peak_x, bar.top() - 1.0),
+                    Pos2::new(peak_x, bar.bottom() + 1.0),
+                ],
+                Stroke::new(1.0, if row.muted { FAINT } else { TEXT }),
+            );
+            let vol_resp = ui.interact(
+                bar.expand2(Vec2::new(0.0, 2.0)),
+                Id::new(("app_vol", idx, row.pid)),
+                Sense::click_and_drag(),
+            );
+            if vol_resp.dragged() || vol_resp.clicked() {
+                if let Some(pos) = vol_resp.interact_pointer_pos() {
+                    let fraction = ((pos.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
+                    self.apps.set_volume(cable, row.pid, fraction);
+                }
+            }
+            let _ = vol_resp.on_hover_text(format!(
+                "{} ({} session(s)): volume {:.0}%, peak {:.0}%\nDrag the bar to set the app volume",
+                row.name,
+                row.sessions,
+                row.volume * 100.0,
+                row.peak * 100.0
+            ));
+        }
+        APPS_BLOCK_H
+    }
+
     fn draw_strip_card(&mut self, ui: &egui::Ui, card: Rect, idx: usize) {
         let accent = if idx < 3 { Color32::from_rgb(128, 168, 190) } else { TEAL };
         let inner = card.shrink2(Vec2::new(5.0, 4.0));
@@ -4240,24 +4782,25 @@ impl MixerApp {
             FontId::proportional(9.5),
             TEXT,
         );
+        // A cable endpoint's full name ("Microphone (Virtual Cable 03)") never
+        // fits the strip, so show the cable itself: that is the part the person
+        // needs to know. The complete name stays in the hover text.
+        let device_label = cable_label(&self.strips[idx].device)
+            .unwrap_or_else(|| self.strips[idx].device.clone());
         ui.painter().text(
             Pos2::new(header.left(), header.top() + 13.0),
             Align2::LEFT_TOP,
-            fit_text(
-                ui.painter(),
-                &self.strips[idx].device,
-                7.3,
-                w - 27.0,
-            ),
+            fit_text(ui.painter(), &device_label, 7.3, w - 27.0),
             FontId::proportional(7.3),
             DIM,
         );
         if hresp.clicked() && enabled && !over_vst {
             self.picker = Some(Picker::Strip(idx));
         }
-        let _ = hresp.clone().on_hover_text(
-            "Click to choose the input device, right click for the strip menu",
-        );
+        let _ = hresp.clone().on_hover_text(format!(
+            "{}\nClick to choose the input device, right click for the strip menu",
+            self.strips[idx].device
+        ));
         if !self.lock_gui {
             let mut open_label = false;
             let mut reset_all = false;
@@ -4268,6 +4811,7 @@ impl MixerApp {
             let mut reset_gate = false;
             let mut copy_all = false;
             let mut paste = false;
+            let mut toggle_apps = false;
             let mut remove_last = false;
             let has_clip = self.strip_clip.is_some();
             hresp.context_menu(|ui| {
@@ -4307,6 +4851,18 @@ impl MixerApp {
                         ui.close_menu();
                     }
                 }
+                if self.strip_cable(idx).is_some() {
+                    ui.separator();
+                    let label = if self.apps_open[idx] {
+                        "Hide apps on this strip"
+                    } else {
+                        "Show apps on this strip"
+                    };
+                    if ui.button(label).clicked() {
+                        toggle_apps = true;
+                        ui.close_menu();
+                    }
+                }
                 ui.separator();
                 // Commands 0x262 (Copy All) and 0x26c (Paste).
                 if ui.button("Copy All").clicked() {
@@ -4331,6 +4887,9 @@ impl MixerApp {
             if open_label {
                 self.label_buf = self.strips[idx].name.clone();
                 self.label_edit = Some(idx);
+            }
+            if toggle_apps {
+                self.apps_open[idx] = !self.apps_open[idx];
             }
             if reset_all {
                 // FUN_00538b20 command 600: hardware resets the panel, the
@@ -4652,6 +5211,12 @@ impl MixerApp {
             );
         }
         y += 48.0;
+
+        // Applications rendering into this strip's virtual cable. The block is
+        // only there for virtual strips bound to a Virtual Cable endpoint.
+        if let Some(cable) = self.strip_cable(idx) {
+            y += self.draw_apps_block(ui, idx, inner.left(), y, w, &cable);
+        }
 
         // routing buttons
         let g = 2.0;
@@ -7346,6 +7911,7 @@ impl eframe::App for MixerApp {
         }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         self.time += dt as f64;
+        self.advance_startup(dt as f64);
         self.poll_vst_scan();
         // Keep every open plug-in window alive (resize requests and its close
         // button), without ever drawing its settings inside the mixer.
@@ -7431,7 +7997,29 @@ impl eframe::App for MixerApp {
         }
 
         self.update_meters(dt);
+        if self.meter_log {
+            self.meter_clock += dt as f64;
+            if self.meter_clock >= 1.0 {
+                self.meter_clock = 0.0;
+                let mut row = String::new();
+                for i in 0..self.active_strips {
+                    let (name, raw) = match self.captures.get(i).and_then(|c| c.as_ref()) {
+                        Some(capture) => (capture.device().to_string(), capture.peak()),
+                        None => ("-".to_string(), 0.0),
+                    };
+                    row.push_str(&format!(
+                        "{}='{}' raw={:.3} meter={:.3}  ",
+                        i + 1,
+                        name,
+                        raw,
+                        self.strips[i].meter
+                    ));
+                }
+                diag_log(format!("meter: {row}"));
+            }
+        }
         self.poll_audio_devices(dt as f64);
+        self.sync_app_targets();
 
         egui::TopBottomPanel::top("topbar")
             .exact_height(38.0)
@@ -8293,6 +8881,19 @@ fn transport_button(
     resp.clicked() && enabled
 }
 
+/// "Microphone (Virtual Cable 03)" -> "Virtual Cable 03", the part of a USB
+/// cable endpoint name the narrow strip header can actually show.
+fn cable_label(device: &str) -> Option<String> {
+    let lower = device.to_ascii_lowercase();
+    let at = lower.find("virtual cable ")?;
+    let digits: String = lower[at + "virtual cable ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let number: u32 = digits.parse().ok()?;
+    Some(format!("Virtual Cable {number:02}"))
+}
+
 fn clock(secs: f32) -> String {
     let s = secs.max(0.0) as u32;
     format!("{:02}:{:02}", s / 60, s % 60)
@@ -8356,8 +8957,65 @@ fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Window/taskbar icon, decoded from the same .ico that `app.rc` embeds in the
+/// executable so the title bar and Explorer never disagree.
+fn window_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../icons/Icon_2_48_48_1.ico");
+    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Ico)
+        .ok()?
+        .to_rgba8();
+    Some(egui::IconData {
+        rgba: image.as_raw().clone(),
+        width: image.width(),
+        height: image.height(),
+    })
+}
+
+/// Sidecar diagnostics. The console is a GUI-subsystem binary, so a panic or a
+/// hang would otherwise leave no trace at all.
+fn diag_path(name: &str) -> PathBuf {
+    settings_canonical_path().with_file_name(name)
+}
+
+fn diag_log(message: impl AsRef<str>) {
+    use std::io::Write;
+    let path = diag_path("startup.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 512 * 1024 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "[{stamp}] {}", message.as_ref());
+    }
+}
+
+fn install_panic_log() {
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let path = diag_path("panic.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(file, "{info}");
+        }
+    }));
+}
+
 fn main() -> eframe::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
+    install_panic_log();
+    diag_log("main: entry");
     // Child-process VST3 scanner (see vst::start_scan). It only reads plug-in
     // metadata and writes a report, so a bad plug-in cannot hurt the console.
     if let Some(position) = raw_args.iter().position(|arg| arg == "--vst-scan-json") {
@@ -8389,6 +9047,16 @@ fn main() -> eframe::Result<()> {
         if let Err(err) = virtual_cables::win::run_attach_broker(&address, &token, &log) {
             eprintln!("virtual cables attach broker failed: {err}");
             std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if raw_args.iter().any(|arg| arg == "--apps-selftest") {
+        let report = sessions::self_test();
+        let path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("apps_selftest.txt");
+        if let Err(err) = std::fs::write(&path, &report) {
+            eprintln!("could not write apps_selftest.txt: {err}");
         }
         return Ok(());
     }
@@ -8556,15 +9224,20 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1024.0, 620.0])
+        // The original is a fixed-size borderless popup (style 0x82020000,
+        // no WS_THICKFRAME), so the console cannot be resized.
+        .with_resizable(false)
+        .with_decorations(false)
+        .with_transparent(false)
+        .with_title("Audio Mixer Pro");
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1024.0, 620.0])
-            // The original is a fixed-size borderless popup (style 0x82020000,
-            // no WS_THICKFRAME), so the console cannot be resized.
-            .with_resizable(false)
-            .with_decorations(false)
-            .with_transparent(false)
-            .with_title("Audio Mixer Pro"),
+        viewport,
         ..Default::default()
     };
 
