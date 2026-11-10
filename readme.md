@@ -17,6 +17,8 @@ VBAN with Auto discover streams.
 
 All Input strips can act as a Hardware Input or a Virtual Input.
 
+Scenes work kind of like scenes in OBS.
+
 Requires
  
 usbip-win2
