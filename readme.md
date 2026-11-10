@@ -8,7 +8,7 @@ Use at your own risc....
 
 Up to 16 Hardware/Virtual Inputs.
 
-Up to 32 Virtual Cables.
+Up to 32 Virtual Cables(1 and 2 reserved for B1 and B2).
 
 Separate VST 3´s for each channel.
 
@@ -20,6 +20,8 @@ All Input strips can act as a Hardware Input or a Virtual Input.
 Requires
  
 usbip-win2
+
+**Before installing make a restore point....**
 
 https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.8.1/USBip-0.9.8.1-x64.exe
 
