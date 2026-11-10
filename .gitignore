@@ -1,0 +1,37 @@
+# Rust build output
+/target/
+**/target/
+*.pdb
+*.dSYM/
+
+# Cargo lock from the standalone crate build. The application lock at
+# /Cargo.lock is committed because this is a binary application.
+/crates/virtual-cables/Cargo.lock
+
+# Runtime/user data
+/mixer_settings.xml
+/mixer_settings.txt
+/build-activity.log
+/shots/
+
+# Build and self-test logs
+*.log
+/vst_*.txt
+
+# Documentation is kept locally, not in the source+exe repository
+/MECHANICS.md
+/mechanics.json
+
+# IDE/editor/OS files
+.vscode/
+.idea/
+*.iml
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Compiled output: keep only the release exe
+/dist/*
+!/dist/audio_mixer_pro.exe
+/build/

@@ -1,0 +1,29 @@
+[package]
+name = "audio_mixer_pro"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "audio_mixer_pro"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.29.1", default-features = false, features = ["default_fonts", "glow"] }
+image = { version = "0.25.5", default-features = false, features = ["png"] }
+cpal = "0.16"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+# The original's file filter is "Audio (wav, mp3, bwf, aif, m4a)"; Symphonia
+# decodes all of those (WAV, MP3, AIFF, MP4/M4A AAC) in pure Rust.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "aiff", "wav", "pcm", "adpcm"] }
+virtual-cables = { path = "crates/virtual-cables" }
+# VST3 hosting for the HW Input 1 insert slot. `default-features = false`
+# because the app already owns its CPAL output stream and does not need the
+# crate's playback/process-isolation helpers, only discovery + Plugin.
+vst3-host = { version = "0.11.1", default-features = false }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Controls_Dialogs", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation"] }
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,18 @@
+[package]
+name = "virtual-cables"
+version = "0.1.0"
+edition = "2021"
+description = "USB/IP UAC2 virtual audio cables for Audio Mixer Pro"
+license = "BSD-3-Clause OR MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+getrandom = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
