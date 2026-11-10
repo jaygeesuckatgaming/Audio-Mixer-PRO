@@ -30,6 +30,19 @@ On the first run UAC will pop up... Just continue and the app starts(Dont worry 
 
 
 # Project Showcase
+**VST**
+
+![VST](https://i.ibb.co/8gmbtM7y/VST.png)
+
+**Add Input Strip**
+
+![Add-Input-strip](https://i.ibb.co/fcsR2y2/Add-Input-strip.png)
+
+**Audio Ducking**
+
+![Ducking](https://i.ibb.co/Y4xVVDRB/Ducking.png)
+
+
 
 
 
