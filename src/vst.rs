@@ -1,10 +1,3 @@
-//! VST3 insert slot for HW INPUT 1.
-//!
-//! The original console executable contains no VST loader at all (a search of
-//! its strings finds no VST/plug-in names; the only "VST" text lives in icon
-//! resources). This module is therefore a deliberate rebuild extension built
-//! from the person's VST3 hosting specification and the local VST3 SDK.
-//!
 //! Everything the audio callback touches is behind one `Mutex`. The lock is
 //! held for a whole block, which is short, and a parameterless atomic gate
 //! keeps the callback away from the mutex when no plug-in is loaded. A failed

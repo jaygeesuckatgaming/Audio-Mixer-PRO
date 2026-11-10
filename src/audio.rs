@@ -1,15 +1,3 @@
-// Real audio for the tape deck.
-//
-// The original program hands the recorder's stereo material to its audio
-// engine, and that engine feeds the selected output buses. This rebuild keeps
-// the same tape controls (play / stop / rewind / fast forward, playback gain,
-// A1-A3 and B1-B2 routing) but uses the default Windows output device and its
-// own small mixdown instead of a vendor virtual-audio driver.
-//
-// Every number used for playback gain and routing comes from the evidence
-// sheet (MECHANICS.md); the demo material is generated here so the rebuild has
-// something audible without shipping copyrighted audio.
-
 use crate::vban::TxRing;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
@@ -26,8 +14,6 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use virtual_cables::{Device, Mode};
 
-/// The original's tape counter window is 4:12 long in the installed scene.
-/// The generated demo tracks use the same displayed length.
 pub const DEMO_LEN_SECS: f32 = 252.0;
 /// Longest track this build will hold in memory. The original streams from
 /// disk; this rebuild decodes to RAM, so it stops at 30 minutes with a clear

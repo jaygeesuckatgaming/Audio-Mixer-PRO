@@ -1,13 +1,3 @@
-// A GUI binary built as a console program drags a black console window along
-// with it (or an empty Windows Terminal tab on Windows 11). Declare the Windows
-// subsystem so a normal launch only ever shows the mixer window.
-#![windows_subsystem = "windows"]
-
-// Audio Mixer Pro - a control-surface reconstruction of a virtual audio mixing console.
-// The layout, ranges and mixing rules come from the original program's evidence sheet
-// (see MECHANICS.md). The tape deck feeds a real audio output and every meter is driven
-// by measured audio (microphone capture, tape material and the A1 output peak).
-
 mod audio;
 mod vban;
 mod vc;
