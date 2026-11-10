@@ -1,4 +1,9 @@
 <div align="center">
+
+# Audio Mixer PRO
+
+![channels4_profile_circle_1](https://i.ibb.co/vxP16dyN/Main-View.png)
+
 Use at your own risc....
 
 Up to 16 Hardware/Virtual Inputs.
@@ -6,6 +11,7 @@ Up to 16 Hardware/Virtual Inputs.
 Up to 32 Virtual Cables.
 
 Separate VST 3´s for each channel.
+
 
 VBAN with Auto discover sources.
 
@@ -17,9 +23,13 @@ usbip-win2
 
 https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.8.1/USBip-0.9.8.1-x64.exe
 
+On the first run UAC will pop up... Just continue and the app starts(Dont worry you can check in the code that it isnt doing anything bad...) Now go to Cables and click install and it will install a small "app" that handles UAC.
+![channels4_profile_circle_1](https://i.ibb.co/jkSz8rz1/Virtual-Cables-srv-2.jpg)
+
+
 # Project Showcase
 
-![channels4_profile_circle_1](https://i.ibb.co/vxP16dyN/Main-View.png)
+
 
 
 </div>
