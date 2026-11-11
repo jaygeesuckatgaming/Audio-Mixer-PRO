@@ -32,6 +32,7 @@ Recomended VST 3 Plugins to get started.
 
 UhbikWrapper
 https://github.com/dlarseninclusive/UhbikWrapper/releases
+https://github.com/jaygeesuckatgaming/UhbikWrapper (Will be updated soon)
 
 EQ - TDR Nova/7Q
 https://www.tokyodawn.net/tdr-nova/
