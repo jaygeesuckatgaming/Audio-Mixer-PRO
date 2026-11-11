@@ -2,7 +2,7 @@
 
 # Audio Mixer PRO
 
-AI was used making this app
+AI was helping to make this app
 
 ![channels4_profile_circle_1](https://i.ibb.co/vxP16dyN/Main-View.png)
 
