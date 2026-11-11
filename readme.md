@@ -6,8 +6,6 @@ https://youtube.com/@jaygeeaiforfunz
 
 ![channels4_profile_circle_1](https://i.ibb.co/vxP16dyN/Main-View.png)
 
-Use at your own risc....
-
 Up to 16 Hardware/Virtual Inputs.
 
 Up to 32 Virtual Cables(1 and 2 reserved for B1 and B2).
