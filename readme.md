@@ -30,6 +30,9 @@ On the first run UAC will pop up... Just continue and the app starts(Dont worry 
 
 Recomended VST 3 Plugins to get started.
 
+UhbikWrapper
+https://github.com/dlarseninclusive/UhbikWrapper/releases
+
 EQ - TDR Nova/7Q
 https://www.tokyodawn.net/tdr-nova/
 
