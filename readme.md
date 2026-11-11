@@ -11,6 +11,7 @@ Up to 16 Hardware/Virtual Inputs.
 Up to 32 Virtual Cables(1 and 2 reserved for B1 and B2).
 
 Separate VST 3´s for each channel.
+"VST is a registered trademark of Steinberg Media Technologies GmbH."
 
 
 VBAN with Auto discover sources.
