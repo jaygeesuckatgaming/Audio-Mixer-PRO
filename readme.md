@@ -31,7 +31,8 @@ On the first run UAC will pop up... Just continue and the app starts(Dont worry 
 
 Recomended VST 3 Plugins to get started.
 
-UhbikWrapper
+UhbikWrapper for Windows
+https://github.com/jaygeesuckatgaming/Audio-Mixer-PRO/blob/main/Release/UhbikWrapper.vst_3_0.3.2.rar
 https://github.com/jaygeesuckatgaming/UhbikWrapper
 
 EQ - TDR Nova/7Q
