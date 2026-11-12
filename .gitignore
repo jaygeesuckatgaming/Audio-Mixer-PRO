@@ -34,6 +34,7 @@
 Thumbs.db
 
 # Compiled output: keep only the release exe
+/Release/
 /dist/*
 !/dist/audio_mixer_pro.exe
 /build/
