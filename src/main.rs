@@ -2028,12 +2028,15 @@ impl MixerApp {
                 i,
                 s.gain_db,
                 s.pan,
+                s.comp,
+                s.gate,
                 s.mute,
                 s.solo,
                 s.mono,
                 s.route,
                 any_solo,
             );
+            self.audio.set_strip_eq(i, s.eq);
         }
         for (i, bus) in self.buses.iter().enumerate() {
             self.audio.set_bus(
@@ -5095,6 +5098,11 @@ impl MixerApp {
                     1 => Color32::from_rgb(120, 200, 170),
                     _ => Color32::from_rgb(220, 180, 120),
                 };
+                let tip = match i {
+                    0 => "Low shelf 120 Hz: drag up/down, double click for 0 dB (0 dB bypasses)",
+                    1 => "Mid bell 1 kHz: drag up/down, double click for 0 dB (0 dB bypasses)",
+                    _ => "High shelf 6 kHz: drag up/down, double click for 0 dB (0 dB bypasses)",
+                };
                 draw_knob(
                     ui,
                     Pos2::new(inner.left() + cell * (i as f32 + 1.5), y + 11.0),
@@ -5106,8 +5114,16 @@ impl MixerApp {
                     accent2,
                     Id::new(("eq", idx, i)),
                     enabled,
-                    "3-band equalizer: drag up/down, double click for 0 dB",
+                    tip,
                 );
+                if vals[i].abs() > 0.05 {
+                    let activity = (vals[i].abs() / 12.0).clamp(0.0, 1.0);
+                    ui.painter().circle_stroke(
+                        Pos2::new(inner.left() + cell * (i as f32 + 1.5), y + 11.0),
+                        r * 1.2,
+                        Stroke::new(1.5, accent2.gamma_multiply(0.25 + 0.75 * activity)),
+                    );
+                }
             }
             self.strips[idx].eq = vals;
         } else {
@@ -5126,9 +5142,9 @@ impl MixerApp {
                 RED,
                 Id::new(("comp", idx)),
                 enabled,
-                "Compression audibility (audibility_c, strip +0x34): 0..10. \
-                 The engine keeps attack 10 ms, release 50 ms, ratio 1.0, \
-                 threshold -40 dB and auto make-up. Double click resets.",
+                "Compressor amount (audibility_c, strip +0x34): 0..10, 0 = bypass. \
+                 Threshold -24 dBFS, 6 dB soft knee, ratio 1:1..11:1, \
+                 attack 10 ms, release 150 ms, auto make-up. Double click resets.",
             );
             draw_knob(
                 ui,
@@ -5141,11 +5157,32 @@ impl MixerApp {
                 PURPLE,
                 Id::new(("gate", idx)),
                 enabled,
-                "Gate audibility (audibility_g, strip +0x38): 0..10. \
-                 The engine keeps threshold -60 dB, damping -60 dB, \
-                 100% side-chain, hold 200 ms and release 1250 ms. \
+                "Gate amount (audibility_g, strip +0x38): 0..10, 0 = bypass. \
+                 Gentle expander: threshold -55..-20 dBFS, 6 dB hysteresis, \
+                 -60 dB range, 1 ms open, 120 ms hold, 250 ms release. \
                  Double click resets.",
             );
+            // Thin rings show the live gain movement without changing the
+            // layout: red while the compressor pulls down, purple while the
+            // expander is attenuating.
+            let comp_gr = self.audio.strip_comp_gr_db(idx);
+            if comp > 0.0 && comp_gr < -0.3 {
+                let activity = (-comp_gr / 12.0).clamp(0.0, 1.0);
+                ui.painter().circle_stroke(
+                    Pos2::new(inner.left() + cell * 1.5, y + 11.0),
+                    r * 1.2,
+                    Stroke::new(1.5, RED.gamma_multiply(0.25 + 0.75 * activity)),
+                );
+            }
+            let gate_att = self.audio.strip_gate_att_db(idx);
+            if gate > 0.0 && gate_att < -0.5 {
+                let activity = (-gate_att / 60.0).clamp(0.0, 1.0);
+                ui.painter().circle_stroke(
+                    Pos2::new(inner.left() + cell * 2.5, y + 11.0),
+                    r * 1.2,
+                    Stroke::new(1.5, PURPLE.gamma_multiply(0.25 + 0.75 * activity)),
+                );
+            }
             self.strips[idx].comp = comp;
             self.strips[idx].gate = gate;
             // FUN_00528410 runs on every comp/gate change and clears the
@@ -5191,20 +5228,57 @@ impl MixerApp {
             DIM,
         );
         if !is_virtual {
+            let comp_gr = self.audio.strip_comp_gr_db(idx);
+            let (comp_text, comp_color) = if comp_gr < -0.3 {
+                (format!("{comp_gr:.1}"), RED)
+            } else {
+                (format!("{:.1}", self.strips[idx].comp), DIM)
+            };
             ui.painter().text(
                 Pos2::new(inner.left() + cell * 1.5, y + 31.0),
                 Align2::CENTER_TOP,
-                format!("{:.1}", self.strips[idx].comp),
+                comp_text,
                 FontId::proportional(6.5),
-                DIM,
+                comp_color,
             );
+            let gate_att = self.audio.strip_gate_att_db(idx);
+            let (gate_text, gate_color) = if gate_att < -0.5 {
+                (format!("{gate_att:.0}"), PURPLE)
+            } else {
+                (format!("{:.1}", self.strips[idx].gate), DIM)
+            };
             ui.painter().text(
                 Pos2::new(inner.left() + cell * 2.5, y + 31.0),
                 Align2::CENTER_TOP,
-                format!("{:.1}", self.strips[idx].gate),
+                gate_text,
                 FontId::proportional(6.5),
-                DIM,
+                gate_color,
             );
+        } else {
+            let colors = [
+                Color32::from_rgb(120, 170, 220),
+                Color32::from_rgb(120, 200, 170),
+                Color32::from_rgb(220, 180, 120),
+            ];
+            for band in 0..3 {
+                let value = self.strips[idx].eq[band];
+                let shown = if value.abs() < 0.05 {
+                    "0.0".to_string()
+                } else {
+                    format!("{value:+.1}")
+                };
+                ui.painter().text(
+                    Pos2::new(inner.left() + cell * (band as f32 + 1.5), y + 31.0),
+                    Align2::CENTER_TOP,
+                    shown,
+                    FontId::proportional(6.5),
+                    if value.abs() < 0.05 {
+                        DIM
+                    } else {
+                        colors[band]
+                    },
+                );
+            }
         }
         y += 44.0;
 
@@ -7657,14 +7731,16 @@ impl MixerApp {
                     }
                     outputs
                 }
-                Picker::Bus(_) => vec![
-                    "WDM: Speakers".to_string(),
-                    "WDM: Headphones".to_string(),
-                    "WDM: Line Out".to_string(),
-                    "Virtual Output 1".to_string(),
-                    "Virtual Output 2".to_string(),
-                    "ASIO: Audio Interface".to_string(),
-                ],
+                Picker::Bus(_) => {
+                    // A2/A3 are mixed into A1 in this rebuild, but their
+                    // pickers should still list the real Windows devices
+                    // instead of placeholder names.
+                    let mut outputs = AudioEngine::output_devices();
+                    if outputs.is_empty() {
+                        outputs.push("No audio output device".to_string());
+                    }
+                    outputs
+                }
             };
             let current = match target {
                 Picker::Strip(i) => self.strips[i].device.clone(),
@@ -9311,6 +9387,20 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if raw_args.iter().any(|arg| arg == "--eq-selftest") {
+        let path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("eq_selftest.txt");
+        audio::strip_eq_selftest(&path);
+        return Ok(());
+    }
+    if raw_args.iter().any(|arg| arg == "--dynamics-selftest") {
+        let path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("dynamics_selftest.txt");
+        audio::dynamics_selftest(&path);
+        return Ok(());
+    }
     if raw_args.iter().any(|arg| arg == "--ducking-selftest") {
         let path = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -9433,6 +9523,19 @@ fn main() -> eframe::Result<()> {
         } else if arg == "--play-demo" {
             startup_demo = args.next().and_then(|v| v.parse::<usize>().ok());
         }
+    }
+    if raw_args.iter().any(|arg| arg == "--list-devices") {
+        let outputs = AudioEngine::output_devices();
+        let inputs = InputCapture::devices();
+        println!("outputs ({}):", outputs.len());
+        for name in &outputs {
+            println!("  {name}");
+        }
+        println!("inputs ({}):", inputs.len());
+        for name in &inputs {
+            println!("  {name}");
+        }
+        return Ok(());
     }
     if audio_selftest {
         audio::selftest();

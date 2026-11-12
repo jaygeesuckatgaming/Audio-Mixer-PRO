@@ -28,6 +28,8 @@ const EQ_Q: f32 = 3.0;
 /// extend the console up to this many strips.
 pub const BASE_STRIPS: usize = 5;
 pub const MAX_STRIPS: usize = 16;
+/// The first strips are the hardware inputs; they own the COMP and GATE knobs.
+pub const DYNAMICS_STRIPS: usize = 3;
 
 // ---------------------------------------------------------------------------
 // A1 output format rules (FUN_00527ad0, StartAudioStream)
@@ -537,6 +539,12 @@ fn strip_route_mask(index: usize) -> u32 {
 struct StripMix {
     gain_db: AtomicU32,
     pan: AtomicU32,
+    /// Comp knob, 0..10 (`audibility_c`). 0 = bypass.
+    comp: AtomicU32,
+    /// Gate knob, 0..10 (`audibility_g`). 0 = bypass.
+    gate: AtomicU32,
+    /// Virtual-strip 3-band EQ (low shelf, mid bell, high shelf), dB.
+    eq: [AtomicU32; 3],
     /// bit 0 mute, bit 1 solo, bit 2 mono
     flags: AtomicU32,
     /// bit 0 A1, 1 A2, 2 A3, 3 B1, 4 B2
@@ -548,6 +556,9 @@ impl StripMix {
         Self {
             gain_db: f32_atomic(0.0),
             pan: f32_atomic(0.0),
+            comp: f32_atomic(0.0),
+            gate: f32_atomic(0.0),
+            eq: std::array::from_fn(|_| f32_atomic(0.0)),
             flags: AtomicU32::new(0),
             route: AtomicU32::new(1),
         }
@@ -619,6 +630,10 @@ struct Shared {
     duck_release_ms: AtomicU32,
     /// Current gain reduction in dB (0.0 = not ducking), for the UI meter.
     duck_gain_db: AtomicU32,
+    /// Live per-strip dynamics meters: compressor reduction (negative dB) and
+    /// gate attenuation (0 dB open, about -60 dB closed).
+    strip_comp_gr: [AtomicU32; MAX_STRIPS],
+    strip_gate_att: [AtomicU32; MAX_STRIPS],
     error: Mutex<Option<String>>,
 }
 
@@ -663,6 +678,8 @@ impl Shared {
             duck_attack_ms: f32_atomic(10.0),
             duck_release_ms: f32_atomic(300.0),
             duck_gain_db: f32_atomic(0.0),
+            strip_comp_gr: std::array::from_fn(|_| f32_atomic(0.0)),
+            strip_gate_att: std::array::from_fn(|_| f32_atomic(0.0)),
             error: Mutex::new(None),
         }
     }
@@ -694,6 +711,46 @@ impl Biquad {
             z1: 0.0,
             z2: 0.0,
         }
+    }
+
+    fn set_low_shelf(&mut self, freq: f32, gain_db: f32, sample_rate: f32) {
+        let f = freq.clamp(10.0, sample_rate * 0.45);
+        if gain_db.abs() < 0.005 {
+            *self = Self::identity();
+            return;
+        }
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * f / sample_rate;
+        let cos_w = w0.cos();
+        let sin_w = w0.sin();
+        let alpha = sin_w * 0.5 * std::f32::consts::SQRT_2;
+        let sqrt_a = a.sqrt();
+        let a0 = (a + 1.0) + (a - 1.0) * cos_w + 2.0 * sqrt_a * alpha;
+        self.b0 = a * ((a + 1.0) - (a - 1.0) * cos_w + 2.0 * sqrt_a * alpha) / a0;
+        self.b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w) / a0;
+        self.b2 = a * ((a + 1.0) - (a - 1.0) * cos_w - 2.0 * sqrt_a * alpha) / a0;
+        self.a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w) / a0;
+        self.a2 = ((a + 1.0) + (a - 1.0) * cos_w - 2.0 * sqrt_a * alpha) / a0;
+    }
+
+    fn set_high_shelf(&mut self, freq: f32, gain_db: f32, sample_rate: f32) {
+        let f = freq.clamp(10.0, sample_rate * 0.45);
+        if gain_db.abs() < 0.005 {
+            *self = Self::identity();
+            return;
+        }
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * f / sample_rate;
+        let cos_w = w0.cos();
+        let sin_w = w0.sin();
+        let alpha = sin_w * 0.5 * std::f32::consts::SQRT_2;
+        let sqrt_a = a.sqrt();
+        let a0 = (a + 1.0) - (a - 1.0) * cos_w + 2.0 * sqrt_a * alpha;
+        self.b0 = a * ((a + 1.0) + (a - 1.0) * cos_w + 2.0 * sqrt_a * alpha) / a0;
+        self.b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w) / a0;
+        self.b2 = a * ((a + 1.0) + (a - 1.0) * cos_w - 2.0 * sqrt_a * alpha) / a0;
+        self.a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_w) / a0;
+        self.a2 = ((a + 1.0) - (a - 1.0) * cos_w - 2.0 * sqrt_a * alpha) / a0;
     }
 
     fn set_peaking(&mut self, freq: f32, q: f32, gain_db: f32, sample_rate: f32) {
@@ -753,6 +810,18 @@ struct Dsp {
     /// Ducking detector envelope (linear, smoothed) and current gain (linear).
     duck_env: f32,
     duck_gain: f32,
+    /// Per-strip dynamics: detector envelopes, gains and gate state.
+    comp_env: [f32; MAX_STRIPS],
+    comp_gain: [f32; MAX_STRIPS],
+    gate_env: [f32; MAX_STRIPS],
+    gate_gain: [f32; MAX_STRIPS],
+    gate_hold: [u32; MAX_STRIPS],
+    gate_open: [bool; MAX_STRIPS],
+    /// Virtual-strip 3-band EQ: three biquads per channel per strip.
+    strip_eq_l: [[Biquad; 3]; MAX_STRIPS],
+    strip_eq_r: [[Biquad; 3]; MAX_STRIPS],
+    strip_eq_gain: [[f32; 3]; MAX_STRIPS],
+    strip_eq_ready: [bool; MAX_STRIPS],
 }
 
 impl Dsp {
@@ -779,6 +848,16 @@ impl Dsp {
             pcm: Vec::with_capacity(crate::vst::VST_MAX_BLOCK * 2 * 4),
             duck_env: 0.0,
             duck_gain: 1.0,
+            comp_env: [0.0; MAX_STRIPS],
+            comp_gain: [1.0; MAX_STRIPS],
+            gate_env: [0.0; MAX_STRIPS],
+            gate_gain: [1.0; MAX_STRIPS],
+            gate_hold: [0; MAX_STRIPS],
+            gate_open: [true; MAX_STRIPS],
+            strip_eq_l: std::array::from_fn(|_| [Biquad::identity(); 3]),
+            strip_eq_r: std::array::from_fn(|_| [Biquad::identity(); 3]),
+            strip_eq_gain: [[0.0; 3]; MAX_STRIPS],
+            strip_eq_ready: [false; MAX_STRIPS],
         }
     }
 
@@ -802,6 +881,39 @@ impl Dsp {
         }
     }
 
+    /// Rebuild a virtual strip's 3-band EQ when its gains changed. 0 dB on
+    /// all three bands leaves identity biquads, i.e. a bypass.
+    fn update_strip_eq(&mut self, shared: &Shared, strip_count: usize, sample_rate: f32) {
+        for i in DYNAMICS_STRIPS..strip_count {
+            let mut gains = [0.0f32; 3];
+            for band in 0..3 {
+                gains[band] = load_f32(&shared.strips[i].eq[band]).clamp(-12.0, 12.0);
+            }
+            if self.strip_eq_ready[i] && self.strip_eq_gain[i] == gains {
+                continue;
+            }
+            for band in 0..3 {
+                let gain = gains[band];
+                match band {
+                    0 => {
+                        self.strip_eq_l[i][band].set_low_shelf(120.0, gain, sample_rate);
+                        self.strip_eq_r[i][band].set_low_shelf(120.0, gain, sample_rate);
+                    }
+                    1 => {
+                        self.strip_eq_l[i][band].set_peaking(1000.0, 0.9, gain, sample_rate);
+                        self.strip_eq_r[i][band].set_peaking(1000.0, 0.9, gain, sample_rate);
+                    }
+                    _ => {
+                        self.strip_eq_l[i][band].set_high_shelf(6000.0, gain, sample_rate);
+                        self.strip_eq_r[i][band].set_high_shelf(6000.0, gain, sample_rate);
+                    }
+                }
+            }
+            self.strip_eq_gain[i] = gains;
+            self.strip_eq_ready[i] = true;
+        }
+    }
+
     fn render<T>(&mut self, data: &mut [T], channels: usize, shared: &Shared)
     where
         T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -813,6 +925,7 @@ impl Dsp {
             .load(Ordering::Relaxed)
             .clamp(BASE_STRIPS, MAX_STRIPS);
         self.update_eq(shared, sample_rate);
+        self.update_strip_eq(shared, strip_count, sample_rate);
 
         let mut active = shared.playing.load(Ordering::Relaxed);
         let tape_route = shared.route.load(Ordering::Relaxed);
@@ -852,6 +965,8 @@ impl Dsp {
         let mut strip_on = [false; MAX_STRIPS];
         let mut strip_gain = [0.0f32; MAX_STRIPS];
         let mut strip_pan = [0.0f32; MAX_STRIPS];
+        let mut strip_comp = [0.0f32; MAX_STRIPS];
+        let mut strip_gate = [0.0f32; MAX_STRIPS];
         let mut strip_flags = [0u32; MAX_STRIPS];
         let mut strip_route = [0u32; MAX_STRIPS];
         for i in 0..strip_count {
@@ -859,6 +974,8 @@ impl Dsp {
             strip_flags[i] = s.flags.load(Ordering::Relaxed);
             strip_gain[i] = db_to_lin(load_f32(&s.gain_db));
             strip_pan[i] = load_f32(&s.pan);
+            strip_comp[i] = load_f32(&s.comp).clamp(0.0, 10.0);
+            strip_gate[i] = load_f32(&s.gate).clamp(0.0, 10.0);
             // A strip is read when it is routed to any bus this callback
             // renders (A1, B1 or B2), it is not muted and, if any strip is
             // soloed, it is one of the soloed strips.
@@ -894,6 +1011,24 @@ impl Dsp {
         let duck_release = one_pole(load_f32(&shared.duck_release_ms), sample_rate);
         let level_attack = one_pole(5.0, sample_rate);
         let level_release = one_pole(80.0, sample_rate);
+
+        // Dynamics coefficients and fixed parameters. 0 on a knob = bypass.
+        let comp_det_attack = one_pole(5.0, sample_rate);
+        let comp_det_release = one_pole(100.0, sample_rate);
+        let comp_attack = one_pole(10.0, sample_rate);
+        let comp_release = one_pole(150.0, sample_rate);
+        let gate_det_attack = one_pole(1.0, sample_rate);
+        let gate_det_release = one_pole(20.0, sample_rate);
+        let gate_attack = one_pole(1.0, sample_rate);
+        let gate_release = one_pole(250.0, sample_rate);
+        let gate_hold_samples = (sample_rate * 0.120) as u32;
+        let gate_closed_gain = db_to_lin(-60.0);
+        let mut comp_makeup = [1.0f32; MAX_STRIPS];
+        let mut gate_threshold = [0.0f32; MAX_STRIPS];
+        for i in 0..MAX_STRIPS {
+            comp_makeup[i] = db_to_lin(0.6 * strip_comp[i]);
+            gate_threshold[i] = db_to_lin(-55.0 + 3.5 * strip_gate[i]);
+        }
 
         // Take a private reference to each capture stream, then one lock per
         // stream for the whole callback. No lock is taken per frame.
@@ -1044,7 +1179,7 @@ impl Dsp {
                     if !strip_on[i] {
                         continue;
                     }
-                    let s = if self.vst_ready[i] {
+                    let mut s = if self.vst_ready[i] {
                         // Already read (and possibly processed) above.
                         [self.vst_out_l[i][frame_no], self.vst_out_r[i][frame_no]]
                     } else {
@@ -1053,6 +1188,110 @@ impl Dsp {
                         };
                         self.readers[i].next(ring, input_rates[i], sample_rate as u32)
                     };
+
+                    // Gate/expander then compressor, pre-fader, on the strips
+                    // that own those knobs. 0 on a knob bypasses that stage.
+                    if i < DYNAMICS_STRIPS {
+                        if strip_gate[i] > 0.0 {
+                            let level = s[0].abs().max(s[1].abs());
+                            let coeff = if level > self.gate_env[i] {
+                                gate_det_attack
+                            } else {
+                                gate_det_release
+                            };
+                            self.gate_env[i] += (level - self.gate_env[i]) * coeff;
+                            if self.gate_open[i] {
+                                if self.gate_env[i] < gate_threshold[i] * 0.5 {
+                                    self.gate_hold[i] += 1;
+                                    if self.gate_hold[i] >= gate_hold_samples {
+                                        self.gate_open[i] = false;
+                                        self.gate_hold[i] = 0;
+                                    }
+                                } else {
+                                    self.gate_hold[i] = 0;
+                                }
+                            } else if self.gate_env[i] > gate_threshold[i] {
+                                self.gate_open[i] = true;
+                                self.gate_hold[i] = 0;
+                            }
+                            let target = if self.gate_open[i] {
+                                1.0
+                            } else {
+                                gate_closed_gain
+                            };
+                            let coeff = if target > self.gate_gain[i] {
+                                gate_attack
+                            } else {
+                                gate_release
+                            };
+                            self.gate_gain[i] += (target - self.gate_gain[i]) * coeff;
+                            s[0] *= self.gate_gain[i];
+                            s[1] *= self.gate_gain[i];
+                        } else {
+                            self.gate_gain[i] = 1.0;
+                            self.gate_open[i] = true;
+                            self.gate_env[i] = 0.0;
+                        }
+
+                        if strip_comp[i] > 0.0 {
+                            let level = s[0].abs().max(s[1].abs());
+                            let coeff = if level > self.comp_env[i] {
+                                comp_det_attack
+                            } else {
+                                comp_det_release
+                            };
+                            self.comp_env[i] += (level - self.comp_env[i]) * coeff;
+
+                            // Fixed -24 dBFS threshold, 6 dB soft knee and a
+                            // ratio taken from the knob (1:1 at 0, 11:1 at 10).
+                            let level_db = lin_to_db(self.comp_env[i]);
+                            let over = level_db + 24.0;
+                            let ratio = 1.0 + strip_comp[i];
+                            let slope = 1.0 - 1.0 / ratio;
+                            let knee = 6.0f32;
+                            let reduction_db = if over <= -knee * 0.5 {
+                                0.0
+                            } else if over < knee * 0.5 {
+                                let t = over + knee * 0.5;
+                                (t * t) / (2.0 * knee) * slope
+                            } else {
+                                over * slope
+                            };
+                            let target = db_to_lin(-reduction_db);
+                            let coeff = if target < self.comp_gain[i] {
+                                comp_attack
+                            } else {
+                                comp_release
+                            };
+                            self.comp_gain[i] += (target - self.comp_gain[i]) * coeff;
+                            let applied = self.comp_gain[i] * comp_makeup[i];
+                            s[0] *= applied;
+                            s[1] *= applied;
+                        } else {
+                            self.comp_gain[i] = 1.0;
+                            self.comp_env[i] = 0.0;
+                        }
+                    } else {
+                        self.gate_gain[i] = 1.0;
+                        self.gate_open[i] = true;
+                        self.gate_env[i] = 0.0;
+                        self.comp_gain[i] = 1.0;
+                        self.comp_env[i] = 0.0;
+                    }
+
+                    if i >= DYNAMICS_STRIPS && self.strip_eq_ready[i] {
+                        let mut l = s[0];
+                        l = self.strip_eq_l[i][0].process(l);
+                        l = self.strip_eq_l[i][1].process(l);
+                        l = self.strip_eq_l[i][2].process(l);
+                        let mut r = s[1];
+                        r = self.strip_eq_r[i][0].process(r);
+                        r = self.strip_eq_r[i][1].process(r);
+                        r = self.strip_eq_r[i][2].process(r);
+                        s[0] = l;
+                        s[1] = r;
+                    }
+
                     let gain = strip_gain[i];
                     let (pl, pr) = pan_gains(strip_pan[i] * 2.0);
                     let mut sl = s[0] * gain * pl;
@@ -1177,6 +1416,20 @@ impl Dsp {
             .to_bits(),
             Ordering::Relaxed,
         );
+        for i in 0..MAX_STRIPS {
+            let reduction = if strip_comp[i] > 0.0 {
+                lin_to_db(self.comp_gain[i])
+            } else {
+                0.0
+            };
+            let attenuation = if strip_gate[i] > 0.0 {
+                lin_to_db(self.gate_gain[i])
+            } else {
+                0.0
+            };
+            shared.strip_comp_gr[i].store(reduction.to_bits(), Ordering::Relaxed);
+            shared.strip_gate_att[i].store(attenuation.to_bits(), Ordering::Relaxed);
+        }
         shared
             .source_peak
             .store(source_peak.to_bits(), Ordering::Relaxed);
@@ -1739,6 +1992,24 @@ impl AudioEngine {
         load_f32(&self.shared.duck_gain_db)
     }
 
+    /// Live compressor gain reduction for a strip (negative dB, 0.0 = idle).
+    pub fn strip_comp_gr_db(&self, index: usize) -> f32 {
+        self.shared
+            .strip_comp_gr
+            .get(index)
+            .map(load_f32)
+            .unwrap_or(0.0)
+    }
+
+    /// Live gate attenuation for a strip (0 dB open, about -60 dB closed).
+    pub fn strip_gate_att_db(&self, index: usize) -> f32 {
+        self.shared
+            .strip_gate_att
+            .get(index)
+            .map(load_f32)
+            .unwrap_or(0.0)
+    }
+
     pub fn bus_peak(&self, index: usize) -> f32 {
         if index >= 5 {
             return 0.0;
@@ -1770,11 +2041,27 @@ impl AudioEngine {
 
     /// The strip-level half of the console: fader, pan, mute/solo/mono and
     /// the five routing buttons. A1 is bit 0, then A2, A3, B1, B2.
+    /// Virtual-strip 3-band EQ gains in dB (low shelf, mid bell, high shelf).
+    pub fn set_strip_eq(&self, index: usize, eq: [f32; 3]) {
+        if index >= MAX_STRIPS {
+            return;
+        }
+        for band in 0..3 {
+            self.shared.strips[index].eq[band].store(
+                eq[band].clamp(-12.0, 12.0).to_bits(),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn set_strip(
         &self,
         index: usize,
         gain_db: f32,
         pan: f32,
+        comp: f32,
+        gate: f32,
         mute: bool,
         solo: bool,
         mono: bool,
@@ -1787,6 +2074,8 @@ impl AudioEngine {
         let s = &self.shared.strips[index];
         s.gain_db.store(gain_db.to_bits(), Ordering::Relaxed);
         s.pan.store(pan.to_bits(), Ordering::Relaxed);
+        s.comp.store(comp.clamp(0.0, 10.0).to_bits(), Ordering::Relaxed);
+        s.gate.store(gate.clamp(0.0, 10.0).to_bits(), Ordering::Relaxed);
         let mut flags = 0u32;
         if mute {
             flags |= 1;
@@ -3639,6 +3928,231 @@ pub fn ducking_selftest(report_path: &Path) {
         "PASS {}
 ",
         pass_duck && pass_recover && pass_disabled && pass_under
+    ));
+    let _ = std::fs::write(report_path, report);
+}
+
+/// End-to-end check of the per-strip dynamics: 0 must be a bypass, the
+/// compressor must pull a loud tone down, the expander must mute a quiet one
+/// while passing a loud one, and virtual strips must not be touched.
+pub fn dynamics_selftest(report_path: &Path) {
+    let shared = Arc::new(Shared::new());
+    shared.sample_rate.store(48_000, Ordering::Relaxed);
+    shared.active_strips.store(5, Ordering::Relaxed);
+    shared.strips[0].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
+    shared.strips[3].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
+
+    let hardware = Arc::new(InputShared::new());
+    let virtuals = Arc::new(InputShared::new());
+    hardware.rate.store(48_000, Ordering::Relaxed);
+    virtuals.rate.store(48_000, Ordering::Relaxed);
+    {
+        let mut inputs = lock_source(&shared.inputs);
+        inputs[0] = Some(hardware.clone());
+        inputs[3] = Some(virtuals.clone());
+    }
+
+    let mut dsp = Dsp::new();
+    let mut run = |ring: &Arc<InputShared>,
+                   strip: usize,
+                   comp: f32,
+                   gate: f32,
+                   level: f32,
+                   frames: usize|
+     -> f32 {
+        // Fresh envelopes and buffers per phase so nothing leaks across.
+        dsp.comp_env[strip] = 0.0;
+        dsp.comp_gain[strip] = 1.0;
+        dsp.gate_env[strip] = 0.0;
+        dsp.gate_gain[strip] = 1.0;
+        dsp.gate_hold[strip] = 0;
+        dsp.gate_open[strip] = true;
+        dsp.readers[strip] = InputReader::new();
+        *lock_source(&ring.ring) = SampleRing::new();
+        shared.strips[strip]
+            .comp
+            .store(comp.to_bits(), Ordering::Relaxed);
+        shared.strips[strip]
+            .gate
+            .store(gate.to_bits(), Ordering::Relaxed);
+
+        let block = 512usize;
+        let mut buffer = vec![0.0f32; block * 2];
+        let mut peak = 0.0f32;
+        let mut done = 0usize;
+        while done < frames {
+            {
+                let mut samples = lock_source(&ring.ring);
+                for _ in 0..block {
+                    samples.push([level, level]);
+                }
+            }
+            dsp.render(&mut buffer, 2, &shared);
+            if done + block > frames / 2 {
+                for v in &buffer {
+                    peak = peak.max(v.abs());
+                }
+            }
+            done += block;
+        }
+        peak
+    };
+
+    let pan_center = std::f32::consts::FRAC_1_SQRT_2;
+    let reference = run(&hardware, 0, 0.0, 0.0, 0.5, 24_000);
+    let compressed = run(&hardware, 0, 8.0, 0.0, 0.5, 24_000);
+    let quiet_comp = run(&hardware, 0, 8.0, 0.0, 0.01, 48_000);
+    let gate_closed = run(&hardware, 0, 0.0, 8.0, 0.005_6, 48_000);
+    let gate_open = run(&hardware, 0, 0.0, 8.0, 0.316, 24_000);
+    let virtual_passthrough = run(&virtuals, 3, 8.0, 8.0, 0.5, 24_000);
+
+    let expected_quiet = 0.01 * pan_center * db_to_lin(0.6 * 8.0);
+    let expected_loud = 0.316 * pan_center;
+
+    let comp_db = 20.0 * (compressed / reference.max(1e-9)).log10();
+    let pass_reference = reference > 0.3;
+    let pass_comp = comp_db < -4.0;
+    let pass_release = (quiet_comp - expected_quiet).abs() < expected_quiet * 0.25;
+    let pass_gate_closed = gate_closed < 0.001;
+    let pass_gate_open = (gate_open - expected_loud).abs() < expected_loud * 0.15;
+    let pass_virtual = (virtual_passthrough - reference).abs() < reference * 0.02;
+
+    let mut report = String::new();
+    report.push_str(&format!("reference peak {reference:.4}\n"));
+    report.push_str(&format!(
+        "compressor peak {compressed:.4}  reduction {comp_db:.2} dB  pass {pass_comp}\n"
+    ));
+    report.push_str(&format!(
+        "compressor release peak {quiet_comp:.4} (expected {expected_quiet:.4})  pass {pass_release}\n"
+    ));
+    report.push_str(&format!(
+        "gate closed peak {gate_closed:.5}  pass {pass_gate_closed}\n"
+    ));
+    report.push_str(&format!(
+        "gate open peak {gate_open:.4} (expected {expected_loud:.4})  pass {pass_gate_open}\n"
+    ));
+    report.push_str(&format!(
+        "virtual strip peak {virtual_passthrough:.4}  pass {pass_virtual}\n"
+    ));
+    report.push_str(&format!("reference pass {pass_reference}\n"));
+    report.push_str(&format!(
+        "PASS {}\n",
+        pass_reference
+            && pass_comp
+            && pass_release
+            && pass_gate_closed
+            && pass_gate_open
+            && pass_virtual
+    ));
+    let _ = std::fs::write(report_path, report);
+}
+
+/// End-to-end check of the virtual strips' 3-band EQ: flat must be a bypass,
+/// the three bands must boost and cut, and hardware strips must ignore them.
+pub fn strip_eq_selftest(report_path: &Path) {
+    let shared = Arc::new(Shared::new());
+    shared.sample_rate.store(48_000, Ordering::Relaxed);
+    shared.active_strips.store(5, Ordering::Relaxed);
+    shared.strips[0].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
+    shared.strips[3].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
+
+    let virtuals = Arc::new(InputShared::new());
+    let hardware = Arc::new(InputShared::new());
+    virtuals.rate.store(48_000, Ordering::Relaxed);
+    hardware.rate.store(48_000, Ordering::Relaxed);
+    {
+        let mut inputs = lock_source(&shared.inputs);
+        inputs[0] = Some(hardware.clone());
+        inputs[3] = Some(virtuals.clone());
+    }
+
+    let mut dsp = Dsp::new();
+    let mut run = |ring: &Arc<InputShared>,
+                   strip: usize,
+                   eq: [f32; 3],
+                   freq: f32,
+                   frames: usize|
+     -> f32 {
+        for band in 0..3 {
+            shared.strips[strip].eq[band]
+                .store(eq[band].to_bits(), Ordering::Relaxed);
+        }
+        dsp.readers[strip] = InputReader::new();
+        *lock_source(&ring.ring) = SampleRing::new();
+
+        let block = 512usize;
+        let mut buffer = vec![0.0f32; block * 2];
+        let mut phase = 0.0f32;
+        let step = 2.0 * std::f32::consts::PI * freq / 48_000.0;
+        let mut peak = 0.0f32;
+        let mut done = 0usize;
+        while done < frames {
+            {
+                let mut samples = lock_source(&ring.ring);
+                for _ in 0..block {
+                    let v = 0.3 * phase.sin();
+                    phase += step;
+                    if phase > 2.0 * std::f32::consts::PI {
+                        phase -= 2.0 * std::f32::consts::PI;
+                    }
+                    samples.push([v, v]);
+                }
+            }
+            dsp.render(&mut buffer, 2, &shared);
+            if done + block > frames / 2 {
+                for v in &buffer {
+                    peak = peak.max(v.abs());
+                }
+            }
+            done += block;
+        }
+        peak
+    };
+
+    let flat = run(&virtuals, 3, [0.0, 0.0, 0.0], 1000.0, 24_000);
+    let mid_boost = run(&virtuals, 3, [0.0, 12.0, 0.0], 1000.0, 24_000);
+    let mid_cut = run(&virtuals, 3, [0.0, -12.0, 0.0], 1000.0, 24_000);
+    let low_boost = run(&virtuals, 3, [12.0, 0.0, 0.0], 120.0, 24_000);
+    let flat_low = run(&virtuals, 3, [0.0, 0.0, 0.0], 120.0, 24_000);
+    let high_boost = run(&virtuals, 3, [0.0, 0.0, 12.0], 6000.0, 24_000);
+    let flat_high = run(&virtuals, 3, [0.0, 0.0, 0.0], 6000.0, 24_000);
+    let hw_flat = run(&hardware, 0, [0.0, 0.0, 0.0], 1000.0, 24_000);
+    let hw_eq = run(&hardware, 0, [12.0, 12.0, 12.0], 1000.0, 24_000);
+
+    let mid_ratio = mid_boost / flat.max(1e-9);
+    let cut_ratio = mid_cut / flat.max(1e-9);
+    let low_ratio = low_boost / flat_low.max(1e-9);
+    let high_ratio = high_boost / flat_high.max(1e-9);
+    let hw_diff = (hw_eq - hw_flat).abs() / hw_flat.max(1e-9);
+
+    let pass_flat = flat > 0.1;
+    let pass_mid_boost = mid_ratio > 2.5;
+    let pass_mid_cut = cut_ratio < 0.5;
+    let pass_low = low_ratio > 1.5;
+    let pass_high = high_ratio > 1.5;
+    let pass_hardware = hw_diff < 0.02;
+
+    let mut report = String::new();
+    report.push_str(&format!("flat peak {flat:.4}\n"));
+    report.push_str(&format!(
+        "mid boost x{mid_ratio:.2}  pass {pass_mid_boost}\n"
+    ));
+    report.push_str(&format!("mid cut x{cut_ratio:.2}  pass {pass_mid_cut}\n"));
+    report.push_str(&format!("low shelf x{low_ratio:.2}  pass {pass_low}\n"));
+    report.push_str(&format!("high shelf x{high_ratio:.2}  pass {pass_high}\n"));
+    report.push_str(&format!(
+        "hardware eq changed by {:.2}%  pass {pass_hardware}\n",
+        hw_diff * 100.0
+    ));
+    report.push_str(&format!("flat pass {pass_flat}\n"));
+    report.push_str(&format!(
+        "PASS {}\n",
+        pass_flat
+            && pass_mid_boost
+            && pass_mid_cut
+            && pass_low
+            && pass_high
+            && pass_hardware
     ));
     let _ = std::fs::write(report_path, report);
 }
