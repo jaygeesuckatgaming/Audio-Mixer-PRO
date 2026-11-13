@@ -2013,7 +2013,7 @@ impl MixerApp {
         self.toast("Cassette ejected - audio file released");
     }
 
-    fn sync_audio_controls(&self) {
+    fn sync_audio_controls(&mut self) {
         self.audio.set_tape(self.tape.gain_db, self.tape.route);
         self.audio.set_loop(self.tape.loop_playback);
         self.audio.set_strip_count(self.active_strips);
@@ -2071,6 +2071,11 @@ impl MixerApp {
         // so a CABLES restart swaps in the new USB devices.
         self.audio
             .set_virtual_outputs(self.vc.device(1), self.vc.device(2));
+        // A1/A2/A3 are equal output streams fed by the internal mixer.
+        let a1 = self.buses[0].device.clone();
+        let a2 = self.buses[1].device.clone();
+        let a3 = self.buses[2].device.clone();
+        self.audio.set_bus_outputs(&a1, &a2, &a3);
         self.audio.set_vban_tx(self.vban.tx_targets());
     }
 
@@ -2088,18 +2093,11 @@ impl MixerApp {
     }
 
     fn apply_audio_format(&mut self) -> Result<(), String> {
-        let preferred = self.buses[0].device.clone();
-        let preferred = if AudioEngine::output_devices()
-            .iter()
-            .any(|name| name == &preferred)
-        {
-            Some(preferred)
-        } else {
-            None
-        };
-        let result =
-            self.audio
-                .apply_format(self.sample_rate, self.main_buffer, preferred.as_deref());
+        // A1 is just one output bus now; the mixer rate/buffer come from the
+        // System Settings and every bus device is opened by set_bus_outputs.
+        let result = self
+            .audio
+            .apply_format(self.sample_rate, self.main_buffer, None);
         self.sample_rate = self.audio.sample_rate.max(8_000);
         if result.is_ok() {
             self.reload_tape_audio();
@@ -2192,24 +2190,9 @@ impl MixerApp {
     /// React to a list that arrived from the probe thread.
     fn handle_device_list(&mut self, devices: Vec<String>) {
         let list_changed = !self.last_outputs.is_empty() && devices != self.last_outputs;
-        let a1_missing = !self.buses[0].device.is_empty()
-            && !devices.iter().any(|n| n == &self.buses[0].device);
         self.last_outputs = devices;
 
-        // The configured A1 device may be a virtual cable that Windows only
-        // enumerates a second or two after the mix starts. Reopen once it is
-        // really present instead of silently staying on the default output.
-        if self.audio.available && !a1_missing && !self.buses[0].device.is_empty() {
-            let wanted = self.buses[0].device.clone();
-            if self.audio.device.eq_ignore_ascii_case(&wanted) {
-                self.a1_reopen_tries = 0;
-            } else if self.a1_reopen_tries < 5 {
-                self.a1_reopen_tries = self.a1_reopen_tries.saturating_add(1);
-                let _ = self.apply_audio_format();
-            }
-        }
-
-        if self.audio.available && !list_changed && !a1_missing {
+        if self.audio.available && !list_changed {
             self.restart_ticks = 0;
         } else {
             self.restart_ticks += 1;
@@ -3817,6 +3800,17 @@ impl MixerApp {
                 }
             }
         }
+        for bus in 0..3 {
+            let name = self.buses[bus].device.clone();
+            let placeholder = name.starts_with("WDM:")
+                || name.starts_with("ASIO:")
+                || name == "Virtual Output 1"
+                || name == "Virtual Output 2";
+            if placeholder {
+                self.buses[bus].device.clear();
+            }
+        }
+
         if let Some((attrs, body)) = xml_elements(text, "TapeFile").first() {
             tape_demo = xml_attr(attrs, "demo")
                 .and_then(|v| v.parse::<i32>().ok())
@@ -5655,7 +5649,16 @@ impl MixerApp {
         ui.painter().text(
             Pos2::new(header.left(), header.top() + 13.0),
             Align2::LEFT_TOP,
-            fit_text(ui.painter(), &self.buses[idx].device, 7.3, w + 2.0),
+            fit_text(
+                ui.painter(),
+                &if self.buses[idx].device.trim().is_empty() {
+                    "No device".to_string()
+                } else {
+                    self.buses[idx].device.clone()
+                },
+                7.3,
+                w + 2.0,
+            ),
             FontId::proportional(7.3),
             DIM,
         );
@@ -6903,7 +6906,7 @@ impl MixerApp {
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.label(format!(
-                        "A1: {} | {} Hz | {} frames | {:.1} ms buffer | callback load {:.0}%",
+                        "Mixer: {} | {} Hz | {} frames | {:.1} ms ring | callback load {:.0}%",
                         self.audio.device,
                         self.audio.sample_rate,
                         self.audio.callback_frames(),
@@ -7732,11 +7735,9 @@ impl MixerApp {
                     outputs
                 }
                 Picker::Bus(_) => {
-                    // A2/A3 are mixed into A1 in this rebuild, but their
-                    // pickers should still list the real Windows devices
-                    // instead of placeholder names.
-                    let mut outputs = AudioEngine::output_devices();
-                    if outputs.is_empty() {
+                    let mut outputs = vec!["No device".to_string()];
+                    outputs.extend(AudioEngine::output_devices());
+                    if outputs.len() == 1 {
                         outputs.push("No audio output device".to_string());
                     }
                     outputs
@@ -7866,40 +7867,14 @@ impl MixerApp {
                                         }
                                     }
                                 }
-                                Picker::Bus(i) if i == 0 => {
-                                    match self.audio.set_output_device(
-                                        &d,
-                                        self.sample_rate,
-                                        self.main_buffer,
-                                    ) {
-                                        Ok(()) => {
-                                            self.sample_rate =
-                                                self.audio.sample_rate.max(8_000);
-                                            self.buses[0].device = d.clone();
-                                            self.reload_tape_audio();
-                                            self.reconfigure_vst();
-                                            self.toast(format!(
-                                                "A1 output: {} ({} Hz)",
-                                                d, self.audio.sample_rate
-                                            ));
-                                        }
-                                        Err(err) => {
-                                            // Keep the choice so the automatic retry can use it once the device is free.
-                                            self.buses[0].device = d.clone();
-                                            self.toast_for(
-                                                format!(
-                                                    "Could not use {d}: {err}\n\nAnother \
-                                                     application may be holding the audio device. \
-                                                     Quit it, then press Restart Audio Engine (Ctrl+R)."
-                                                ),
-                                                10.0,
-                                            );
-                                        }
-                                    }
-                                }
                                 Picker::Bus(i) => {
-                                    self.buses[i].device = d.clone();
-                                    self.toast(format!("Device selected: {d}"));
+                                    if d == "No device" {
+                                        self.buses[i].device.clear();
+                                        self.toast(format!("BUS A{}: no output device", i + 1));
+                                    } else {
+                                        self.buses[i].device = d.clone();
+                                        self.toast(format!("Device selected: {d}"));
+                                    }
                                 }
                             }
                             self.picker = None;
@@ -9612,7 +9587,8 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    diag_log("main: creating window");
+    let result = eframe::run_native(
         "Audio Mixer Pro",
         options,
         Box::new(move |cc| {
@@ -9622,7 +9598,13 @@ fn main() -> eframe::Result<()> {
                 startup_demo,
             )))
         }),
-    )
+    );
+    if let Err(err) = &result {
+        // A GUI-subsystem binary prints nothing, and a missing OpenGL context
+        // (for example a VM without 3D acceleration) fails exactly here.
+        diag_log(format!("main: window creation failed: {err}"));
+    }
+    result
 }
 
 #[cfg(test)]

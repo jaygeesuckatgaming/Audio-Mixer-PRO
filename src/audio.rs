@@ -1,6 +1,7 @@
 use crate::vban::TxRing;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
+use std::collections::VecDeque;
 use std::f64::consts::TAU;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -15,6 +16,12 @@ use symphonia::core::probe::Hint;
 use virtual_cables::{Device, Mode};
 
 pub const DEMO_LEN_SECS: f32 = 252.0;
+/// Frames held in each A2/A3 output ring. The master (A1) callback writes
+/// the bus mix; the secondary device streams consume it at their own rate.
+const BUS_RING_FRAMES: usize = 16_384;
+/// Frames of silence pushed into a bus ring when its stream opens, so the
+/// consumer starts with headroom instead of an immediate underrun.
+const BUS_PREFILL_FRAMES: usize = 1024;
 /// Longest track this build will hold in memory. The original streams from
 /// disk; this rebuild decodes to RAM, so it stops at 30 minutes with a clear
 /// message instead of failing silently.
@@ -588,6 +595,12 @@ struct Shared {
     /// B1 and B2 feed the capture endpoint of two USB cables. The console
     /// binds cables 1 and 2 when the virtual-cable server is running.
     virtual_outputs: Mutex<[Option<Arc<Device>>; 2]>,
+    /// A1/A2/A3 output rings. The internal mixer writes each bus mix here and
+    /// the per-bus output streams replay it on their own devices.
+    bus_out_rings: [Mutex<VecDeque<(f32, f32)>>; 3],
+    bus_out_active: [AtomicBool; 3],
+    /// Frames rendered per mixer callback.
+    mixer_block: AtomicU32,
     /// Outgoing VBAN streams: (bus index, sender ring).
     vban_tx: Mutex<Vec<(usize, Arc<TxRing>)>>,
     /// Live capture streams for all five input strips, in strip order. The
@@ -658,6 +671,9 @@ impl Shared {
             bus_eq_on: std::array::from_fn(|_| AtomicBool::new(false)),
             bus_eq_gain: std::array::from_fn(|_| std::array::from_fn(|_| f32_atomic(0.0))),
             virtual_outputs: Mutex::new([None, None]),
+            bus_out_rings: std::array::from_fn(|_| Mutex::new(VecDeque::with_capacity(BUS_RING_FRAMES))),
+            bus_out_active: [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)],
+            mixer_block: AtomicU32::new(512),
             vban_tx: Mutex::new(Vec::new()),
             inputs: Mutex::new(std::array::from_fn(|_| None)),
             strips: std::array::from_fn(|_| StripMix::new()),
@@ -1400,6 +1416,22 @@ impl Dsp {
             }
         }
 
+        // Publish the A2/A3 bus mixes for their output streams. The rings are
+        // bounded: if a secondary device runs slower, its oldest frames are
+        // dropped instead of letting latency grow.
+        for b in 0..3 {
+            if !shared.bus_out_active[b].load(Ordering::Relaxed) {
+                continue;
+            }
+            let mut ring = lock_source(&shared.bus_out_rings[b]);
+            for f in 0..frames {
+                if ring.len() >= BUS_RING_FRAMES {
+                    ring.pop_front();
+                }
+                ring.push_back((self.out_bus_l[b][f], self.out_bus_r[b][f]));
+            }
+        }
+
         // If the source reached the end, the remaining frames in this callback
         // stay silent and the transport switches back to STOPPED.
         if finished {
@@ -1541,11 +1573,6 @@ fn push_pcm(out: &mut Vec<u8>, value: f32, bytes: usize) {
 
 pub struct AudioEngine {
     shared: Arc<Shared>,
-    _stream: Option<cpal::Stream>,
-    /// Keeps the thread that owns the stream alive. Dropping it closes the
-    /// stream, exactly like dropping `_stream` did.
-    stream_keeper: Option<std::sync::mpsc::Sender<()>>,
-    stream_thread: Option<std::thread::JoinHandle<()>>,
     /// Result of a non-blocking start, polled by `poll_start`.
     pub pending_start:
         Option<std::sync::mpsc::Receiver<Result<(String, u32, u16), String>>>,
@@ -1554,6 +1581,16 @@ pub struct AudioEngine {
     pub channels: u16,
     pub available: bool,
     pub status: String,
+    /// Internal mixer thread: the clock for the whole console, independent of
+    /// any audio device (Voicemeeter-style).
+    mixer_stop: Option<Arc<AtomicBool>>,
+    mixer_join: Option<std::thread::JoinHandle<()>>,
+    mixer_block: usize,
+    /// Output streams for A1, A2 and A3. Each consumes its own bus ring.
+    bus_streams: [Option<cpal::Stream>; 3],
+    bus_device_names: [String; 3],
+    bus_retry_at: [Option<std::time::Instant>; 3],
+    bus_last_request: [String; 3],
 }
 
 impl AudioEngine {
@@ -1585,53 +1622,49 @@ impl AudioEngine {
     pub fn idle() -> Self {
         Self {
             shared: Arc::new(Shared::new()),
-            _stream: None,
-            stream_keeper: None,
-            stream_thread: None,
             pending_start: None,
             device: String::new(),
             sample_rate: 48_000,
             channels: 2,
             available: false,
             status: "Audio engine starting".to_string(),
+            mixer_stop: None,
+            mixer_join: None,
+            mixer_block: 512,
+            bus_streams: [None, None, None],
+            bus_device_names: [String::new(), String::new(), String::new()],
+            bus_retry_at: [None, None, None],
+            bus_last_request: [String::new(), String::new(), String::new()],
         }
     }
 
-    /// Open the output stream on a helper thread. `cpal::Stream` is not `Send`,
-    /// so the thread that creates it must also own it: it parks until this
-    /// engine is dropped. The caller polls [`AudioEngine::poll_start`], which
-    /// means a wedged audio service can never freeze the UI thread.
+    /// Engine with the mixer already running (restart paths that own the
+    /// engine outright).
+    pub fn new() -> Self {
+        let mut engine = Self::idle();
+        engine.start_stream();
+        engine
+    }
+
+    /// Start the internal mixer. No audio device is opened here: the mixer is
+    /// the console's clock and every bus output consumes a ring that it fills.
     pub fn start_stream_async(&mut self) {
-        if self.pending_start.is_some() {
+        if self.available || self.pending_start.is_some() {
             return;
         }
-        let shared = self.shared.clone();
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let (keep_tx, keep_rx) = std::sync::mpsc::channel::<()>();
-        let spawned = std::thread::Builder::new()
-            .name("audio-start".to_string())
-            .spawn(move || match Self::start(shared) {
-                Ok((stream, device, sample_rate, channels)) => {
-                    let _ = result_tx.send(Ok((device, sample_rate, channels)));
-                    let _ = keep_rx.recv();
-                    drop(stream);
-                }
-                Err(err) => {
-                    let _ = result_tx.send(Err(err));
-                }
-            });
-        let Ok(handle) = spawned else {
-            self.status = "Could not start the audio thread".to_string();
-            return;
+        let rate = self.sample_rate.max(8_000);
+        let block = self.mixer_block.max(64);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let result = self.start_mixer(rate, block);
+        let message = match &result {
+            Ok(()) => Ok((self.device.clone(), rate, 2)),
+            Err(err) => Err(err.clone()),
         };
-        self.stream_thread = Some(handle);
-        self.stream_keeper = Some(keep_tx);
-        self.pending_start = Some(result_rx);
-        self.status = "Opening audio device".to_string();
+        let _ = sender.send(message);
+        self.pending_start = Some(receiver);
     }
 
-    /// Non-blocking poll of [`AudioEngine::start_stream_async`]. `None` means
-    /// still opening, `Some(ok)` means the attempt finished.
+    /// Non-blocking poll of [`AudioEngine::start_stream_async`].
     pub fn poll_start(&mut self) -> Option<bool> {
         let receiver = self.pending_start.as_ref()?;
         match receiver.try_recv() {
@@ -1640,12 +1673,10 @@ impl AudioEngine {
                 self.sample_rate = sample_rate;
                 self.channels = channels;
                 self.available = true;
-                self.status = "Audio engine running".to_string();
+                if self.status.is_empty() {
+                    self.status = "Internal mixer running".to_string();
+                }
                 self.pending_start = None;
-                crate::diag_log(format!(
-                    "audio: stream opened on '{}' via helper thread",
-                    self.device
-                ));
                 Some(true)
             }
             Ok(Err(err)) => {
@@ -1657,137 +1688,68 @@ impl AudioEngine {
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.available = false;
-                self.status = "Audio device did not respond".to_string();
+                self.status = "The mixer did not start".to_string();
                 self.pending_start = None;
                 Some(false)
             }
         }
     }
 
-    /// Open the output stream on the existing shared state. The VST chains and
-    /// buffers created by [`AudioEngine::idle`] stay valid, so inserts loaded
-    /// before the stream came up keep working.
+    /// Start the mixer synchronously (screenshot and restart paths).
     pub fn start_stream(&mut self) -> bool {
-        self.stop_stream();
-        match Self::start(self.shared.clone()) {
-            Ok((stream, device, sample_rate, channels)) => {
-                self._stream = Some(stream);
-                self.device = device;
-                self.sample_rate = sample_rate;
-                self.channels = channels;
-                self.available = true;
-                self.status = "Audio engine running".to_string();
-                crate::diag_log(format!("audio: stream opened on '{}'", self.device));
-                true
-            }
-            Err(err) => {
-                self._stream = None;
-                self.available = false;
-                self.status = err;
-                false
-            }
-        }
+        self.start_mixer(self.sample_rate.max(8_000), self.mixer_block.max(64))
+            .is_ok()
     }
 
-    pub fn new() -> Self {
-        let mut engine = Self::idle();
-        engine.start_stream();
-        engine
-    }
-
-    /// The stream lives on the helper thread, so dropping the engine has to
-    /// release it explicitly.
     pub fn stop_stream(&mut self) {
-        self.stream_keeper = None;
-        self._stream = None;
+        self.stop_mixer();
         self.pending_start = None;
-        // The helper thread parks on the keep channel once the stream exists,
-        // so joining it is instant. If it is still stuck opening the device,
-        // leave it detached rather than block the caller.
-        if let Some(handle) = self.stream_thread.take() {
-            if handle.is_finished() {
-                let _ = handle.join();
-            }
+        for b in 0..3 {
+            self.bus_streams[b] = None;
+            self.bus_device_names[b].clear();
+            self.bus_retry_at[b] = None;
+            self.bus_last_request[b].clear();
+            self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
+            lock_source(&self.shared.bus_out_rings[b]).clear();
         }
         self.available = false;
     }
 
-    fn start(shared: Arc<Shared>) -> Result<(cpal::Stream, String, u32, u16), String> {
-        Self::start_with(shared, None)
+    fn start_mixer(&mut self, rate: u32, block: usize) -> Result<(), String> {
+        if rate == 0 || block == 0 {
+            return Err("Invalid mixer format".to_string());
+        }
+        self.stop_mixer();
+        self.shared.sample_rate.store(rate, Ordering::Relaxed);
+        self.shared.mixer_block.store(block as u32, Ordering::Relaxed);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let shared = self.shared.clone();
+        let handle = std::thread::Builder::new()
+            .name("mixer".to_string())
+            .spawn(move || mixer_loop(shared, flag, block, rate))
+            .map_err(|e| format!("Could not start the mixer thread: {e}"))?;
+        self.mixer_stop = Some(stop);
+        self.mixer_join = Some(handle);
+        self.mixer_block = block;
+        self.sample_rate = rate;
+        self.channels = 2;
+        self.device = "Internal mixer".to_string();
+        self.available = true;
+        self.status = format!("Internal mixer running at {rate} Hz");
+        crate::diag_log(format!(
+            "audio: internal mixer started at {rate} Hz / {block} frames"
+        ));
+        Ok(())
     }
 
-    fn start_with(
-        shared: Arc<Shared>,
-        preferred: Option<&str>,
-    ) -> Result<(cpal::Stream, String, u32, u16), String> {
-        Self::start_with_format(shared, preferred, None)
-    }
-
-    fn start_with_format(
-        shared: Arc<Shared>,
-        preferred: Option<&str>,
-        format: Option<OutputFormat>,
-    ) -> Result<(cpal::Stream, String, u32, u16), String> {
-        let host = cpal::default_host();
-        let devices: Vec<cpal::Device> = host
-            .output_devices()
-            .map_err(|e| format!("Could not list audio outputs: {e}"))?
-            .collect();
-        if devices.is_empty() {
-            return Err("No audio output device found".to_string());
+    fn stop_mixer(&mut self) {
+        if let Some(stop) = self.mixer_stop.take() {
+            stop.store(true, Ordering::Relaxed);
         }
-        let default_name = host.default_output_device().and_then(|d| d.name().ok());
-        let mut order: Vec<usize> = Vec::new();
-        if let Some(name) = preferred {
-            if let Some(i) = devices.iter().position(|d| {
-                d.name()
-                    .map(|n| n.eq_ignore_ascii_case(name))
-                    .unwrap_or(false)
-            }) {
-                order.push(i);
-            }
+        if let Some(handle) = self.mixer_join.take() {
+            let _ = handle.join();
         }
-        if let Some(name) = &default_name {
-            if let Some(i) = devices.iter().position(|d| {
-                d.name()
-                    .map(|n| n.eq_ignore_ascii_case(name))
-                    .unwrap_or(false)
-            }) {
-                if !order.contains(&i) {
-                    order.push(i);
-                }
-            }
-        }
-        if preferred.is_none() {
-            if let Some(i) = preferred_speaker_index(&devices) {
-                if !order.contains(&i) {
-                    order.insert(0, i);
-                }
-            }
-        }
-        for i in 0..devices.len() {
-            if !order.contains(&i) {
-                order.push(i);
-            }
-        }
-
-        let mut last_error = String::from("No audio output device could be opened");
-        for i in order {
-            let name = devices[i].name().unwrap_or_default();
-            match open_device(&devices[i], shared.clone(), format) {
-                Ok(opened) => {
-                    crate::diag_log(format!("audio: output opened on '{name}'"));
-                    return Ok(opened);
-                }
-                Err(err) => {
-                    if preferred.is_some_and(|p| p.eq_ignore_ascii_case(&name)) {
-                        crate::diag_log(format!("audio: preferred output '{name}' failed: {err}"));
-                    }
-                    last_error = err;
-                }
-            }
-        }
-        Err(last_error)
     }
 
     pub fn load_demo(&mut self, kind: DemoKind) {
@@ -1987,6 +1949,106 @@ impl AudioEngine {
             .store(release_ms.clamp(10.0, 2000.0).to_bits(), Ordering::Relaxed);
     }
 
+    /// Open or close the A1/A2/A3 output streams. The internal mixer fills
+    /// each bus ring; these streams replay it on the selected devices. Cheap to
+    /// call every frame: it only acts when a device name changed or a previous
+    /// attempt is ready to retry.
+    pub fn set_bus_outputs(&mut self, a1: &str, a2: &str, a3: &str) {
+        if !self.available || self.sample_rate == 0 {
+            return;
+        }
+        let requested = [a1, a2, a3];
+        let now = std::time::Instant::now();
+        let same_request = (0..3).all(|b| {
+            self.bus_last_request[b].eq_ignore_ascii_case(requested[b])
+        });
+        if same_request {
+            let retry_due = (0..3).any(|b| {
+                self.bus_streams[b].is_none()
+                    && !self.bus_device_names[b].is_empty()
+                    && self
+                        .bus_retry_at[b]
+                        .map(|at| now >= at)
+                        .unwrap_or(true)
+            });
+            if !retry_due {
+                return;
+            }
+        }
+        for b in 0..3 {
+            self.bus_last_request[b] = requested[b].to_string();
+        }
+
+        let names = AudioEngine::output_devices();
+        // The same endpoint may be used by more than one bus (Voicemeeter
+        // allows that too); only an unknown or empty name is skipped.
+        let wanted = requested.map(|name| {
+            if name.is_empty() || !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        });
+
+        for b in 0..3 {
+            let desired = wanted[b].clone();
+            if self.bus_streams[b].is_some() {
+                if desired.as_deref() == Some(self.bus_device_names[b].as_str()) {
+                    continue;
+                }
+                self.bus_streams[b] = None;
+                self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
+                lock_source(&self.shared.bus_out_rings[b]).clear();
+                self.bus_device_names[b].clear();
+            }
+            let Some(name) = desired else {
+                self.bus_device_names[b].clear();
+                self.bus_retry_at[b] = None;
+                continue;
+            };
+            if self.bus_device_names[b].eq_ignore_ascii_case(&name) {
+                if self
+                    .bus_retry_at[b]
+                    .map(|at| std::time::Instant::now() < at)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+            }
+            self.bus_device_names[b] = name.clone();
+            match open_bus_output(&name, self.shared.clone(), b) {
+                Ok((stream, rate)) => {
+                    self.bus_streams[b] = Some(stream);
+                    self.bus_retry_at[b] = None;
+                    {
+                        let mut ring = lock_source(&self.shared.bus_out_rings[b]);
+                        ring.clear();
+                        for _ in 0..BUS_PREFILL_FRAMES {
+                            ring.push_back((0.0, 0.0));
+                        }
+                    }
+                    self.shared.bus_out_active[b].store(true, Ordering::Relaxed);
+                    crate::diag_log(format!(
+                        "audio: bus A{} output on '{}' at {} Hz",
+                        b + 1,
+                        name,
+                        rate
+                    ));
+                }
+                Err(err) => {
+                    self.bus_retry_at[b] = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(3),
+                    );
+                    crate::diag_log(format!(
+                        "audio: bus A{} output '{}' failed: {err}",
+                        b + 1,
+                        name
+                    ));
+                }
+            }
+        }
+    }
+
     /// Current ducking gain reduction in dB (negative, 0.0 when idle).
     pub fn duck_gain_db(&self) -> f32 {
         load_f32(&self.shared.duck_gain_db)
@@ -2120,11 +2182,11 @@ impl AudioEngine {
         load_f32(&self.shared.callback_load)
     }
 
-    /// One output buffer at the current rate. Real device latency also
-    /// includes the driver/WASAPI engine period.
+    /// Ring latency: the prefilled frames plus one mixer block.
     pub fn output_latency_ms(&self) -> f32 {
         let rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1) as f32;
-        self.callback_frames() as f32 / rate * 1000.0
+        let block = self.shared.mixer_block.load(Ordering::Relaxed) as f32;
+        (BUS_PREFILL_FRAMES as f32 + block) / rate * 1000.0
     }
 
     /// Peak of the tape material before the A1 fader and EQ. This is the level
@@ -2158,15 +2220,15 @@ impl AudioEngine {
         out
     }
 
-    /// Apply the rules of FUN_00527ad0 to the real output: only the seven
-    /// standard sample rates and a main buffer of at most 2048 samples. The
-    /// requested period is used when the driver accepts it; otherwise the
-    /// driver's default period is kept at the requested sample rate.
+    /// Apply FUN_00527ad0's rules to the internal mixer: only the seven
+    /// standard sample rates and a main buffer of at most 2048 frames. The
+    /// mixer is restarted at that rate; output devices are unaffected apart
+    /// from how fast they consume their rings.
     pub fn apply_format(
         &mut self,
         sample_rate: u32,
         main_buffer: u32,
-        preferred: Option<&str>,
+        _preferred: Option<&str>,
     ) -> Result<(), String> {
         if !SAMPLE_RATES.contains(&sample_rate) {
             return Err(A1_RATE_ERROR.to_string());
@@ -2174,88 +2236,13 @@ impl AudioEngine {
         if main_buffer > MAIN_BUFFER_MAX {
             return Err(A1_BUFFER_ERROR.to_string());
         }
-        self.stop_stream();
-        let format = OutputFormat {
-            sample_rate,
-            buffer_frames: main_buffer,
-        };
-        match Self::start_with_format(self.shared.clone(), preferred, Some(format)) {
-            Ok((stream, device, sample_rate, channels)) => {
-                self._stream = Some(stream);
-                self.device = device;
-                self.sample_rate = sample_rate;
-                self.channels = channels;
-                self.available = true;
-                self.status = "Audio engine running".to_string();
-                crate::diag_log(format!(
-                    "audio: format applied, stream reopened on '{}' at {} Hz / {} frames",
-                    self.device, self.sample_rate, main_buffer
-                ));
-                Ok(())
-            }
-            Err(err) => {
-                // Keep the console alive and return to a working output.
-                if let Ok((stream, device, sample_rate, channels)) =
-                    Self::start_with(self.shared.clone(), preferred)
-                {
-                    self._stream = Some(stream);
-                    self.device = device;
-                    self.sample_rate = sample_rate;
-                    self.channels = channels;
-                    self.available = true;
-                    self.status = "Audio engine running".to_string();
-                } else {
-                    self.available = false;
-                    self.status = err.clone();
-                }
-                Err(err)
-            }
-        }
-    }
-
-    pub fn set_output_device(
-        &mut self,
-        name: &str,
-        sample_rate: u32,
-        main_buffer: u32,
-    ) -> Result<(), String> {
-        self.stop_stream();
-        let format = OutputFormat {
-            sample_rate,
-            buffer_frames: main_buffer,
-        };
-        match Self::start_with_format(self.shared.clone(), Some(name), Some(format)) {
-            Ok((stream, device, sample_rate, channels)) => {
-                self._stream = Some(stream);
-                self.device = device;
-                self.sample_rate = sample_rate;
-                self.channels = channels;
-                self.available = true;
-                self.status = "Audio engine running".to_string();
-                crate::diag_log(format!(
-                    "audio: format applied, stream reopened on '{}' at {} Hz / {} frames",
-                    self.device, self.sample_rate, main_buffer
-                ));
-                Ok(())
-            }
-            Err(err) => {
-                // Keep the console alive and try to return to a working output.
-                if let Ok((stream, device, sample_rate, channels)) =
-                    Self::start_with(self.shared.clone(), None)
-                {
-                    self._stream = Some(stream);
-                    self.device = device;
-                    self.sample_rate = sample_rate;
-                    self.channels = channels;
-                    self.available = true;
-                    self.status = "Audio engine running".to_string();
-                } else {
-                    self.available = false;
-                    self.status = err.clone();
-                }
-                Err(err)
-            }
-        }
+        let block = (main_buffer as usize).clamp(64, 2048);
+        self.start_mixer(sample_rate, block)?;
+        crate::diag_log(format!(
+            "audio: mixer restarted at {} Hz / {} frames",
+            sample_rate, block
+        ));
+        Ok(())
     }
 
     pub fn output_error(&self) -> Option<String> {
@@ -2927,6 +2914,214 @@ fn open_device(
         .play()
         .map_err(|e| format!("Could not start {device_name}: {e}"))?;
     Ok((stream, device_name, config.sample_rate.0, config.channels))
+}
+
+#[cfg(windows)]
+struct MixerTimer(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl MixerTimer {
+    fn new() -> Option<Self> {
+        use windows::Win32::System::Threading::{
+            CreateWaitableTimerExW, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+        };
+        unsafe {
+            CreateWaitableTimerExW(
+                None,
+                windows::core::PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+            .ok()
+            .map(Self)
+        }
+    }
+
+    fn wait(&self, duration: std::time::Duration) {
+        use windows::Win32::System::Threading::{SetWaitableTimerEx, WaitForSingleObject};
+        let due = -((duration.as_nanos() / 100).max(1) as i64);
+        unsafe {
+            if SetWaitableTimerEx(self.0, &due, 0, None, None, None, 0).is_ok() {
+                WaitForSingleObject(self.0, u32::MAX);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MixerTimer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// The console clock. Renders the DSP on a fixed schedule, independent of any
+/// audio device, and publishes every active bus ring. This is what lets A1 be
+/// switched off without silencing A2/A3.
+fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u32) {
+    let mut dsp = Dsp::new();
+    let mut buffer = vec![0.0f32; block.max(1) * 2];
+    let period = std::time::Duration::from_nanos(
+        ((block.max(1) as f64 / rate.max(1) as f64) * 1e9) as u64,
+    );
+
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
+    #[cfg(windows)]
+    let timer = MixerTimer::new();
+
+    let mut next = std::time::Instant::now();
+    loop {
+        let now = std::time::Instant::now();
+        if next > now {
+            let wait = next - now;
+            #[cfg(windows)]
+            match &timer {
+                Some(timer) => timer.wait(wait),
+                None => std::thread::sleep(wait),
+            }
+            #[cfg(not(windows))]
+            std::thread::sleep(wait);
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        dsp.render(&mut buffer, 2, &shared);
+        next += period;
+        let now = std::time::Instant::now();
+        if next < now {
+            next = now + period;
+        }
+    }
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        self.stop_mixer();
+    }
+}
+
+/// Open one secondary bus device and start its stream.
+fn open_bus_output(
+    name: &str,
+    shared: Arc<Shared>,
+    bus: usize,
+) -> Result<(cpal::Stream, u32), String> {
+    let host = cpal::default_host();
+    let device = host
+        .output_devices()
+        .map_err(|e| format!("Could not list audio outputs: {e}"))?
+        .find(|d| {
+            d.name()
+                .map(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("Output device not found: {name}"))?;
+    let default = device
+        .default_output_config()
+        .map_err(|e| format!("Could not read the format of {name}: {e}"))?;
+    let sample_format = default.sample_format();
+    let config = default.config();
+    let rate = config.sample_rate.0;
+    let stream = build_bus_stream_for_format(sample_format, &device, &config, shared, bus)?;
+    stream
+        .play()
+        .map_err(|e| format!("Could not start {name}: {e}"))?;
+    Ok((stream, rate))
+}
+
+fn build_bus_stream_for_format(
+    sample_format: cpal::SampleFormat,
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    shared: Arc<Shared>,
+    bus: usize,
+) -> Result<cpal::Stream, String> {
+    match sample_format {
+        cpal::SampleFormat::F32 => build_bus_stream::<f32>(device, config, shared, bus),
+        cpal::SampleFormat::I16 => build_bus_stream::<i16>(device, config, shared, bus),
+        cpal::SampleFormat::U16 => build_bus_stream::<u16>(device, config, shared, bus),
+        cpal::SampleFormat::I32 => build_bus_stream::<i32>(device, config, shared, bus),
+        cpal::SampleFormat::U32 => build_bus_stream::<u32>(device, config, shared, bus),
+        cpal::SampleFormat::I8 => build_bus_stream::<i8>(device, config, shared, bus),
+        cpal::SampleFormat::U8 => build_bus_stream::<u8>(device, config, shared, bus),
+        cpal::SampleFormat::I64 => build_bus_stream::<i64>(device, config, shared, bus),
+        cpal::SampleFormat::U64 => build_bus_stream::<u64>(device, config, shared, bus),
+        cpal::SampleFormat::F64 => build_bus_stream::<f64>(device, config, shared, bus),
+        cpal::SampleFormat::I24 => build_bus_stream::<cpal::I24>(device, config, shared, bus),
+        other => Err(format!("Unsupported audio sample format: {other}")),
+    }
+}
+
+fn build_bus_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    shared: Arc<Shared>,
+    bus: usize,
+) -> Result<cpal::Stream, String>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32> + 'static,
+{
+    let channels = config.channels as usize;
+    let output_rate = config.sample_rate.0 as f32;
+    let error_shared = shared.clone();
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
+                let master_rate = shared.sample_rate.load(Ordering::Relaxed) as f32;
+                let step = if output_rate > 0.0 {
+                    (master_rate / output_rate).max(0.01)
+                } else {
+                    1.0
+                };
+                let mut accumulator = 0.0f32;
+                let mut last = (0.0f32, 0.0f32);
+                let mut ring = lock_source(&shared.bus_out_rings[bus]);
+                for frame in data.chunks_mut(channels) {
+                    accumulator += step;
+                    while accumulator >= 1.0 {
+                        match ring.pop_front() {
+                            Some(sample) => {
+                                last = sample;
+                                accumulator -= 1.0;
+                            }
+                            None => {
+                                last = (0.0, 0.0);
+                                accumulator = 0.0;
+                                break;
+                            }
+                        }
+                    }
+                    if channels == 1 {
+                        frame[0] = T::from_sample((last.0 + last.1) * 0.5);
+                    } else {
+                        frame[0] = T::from_sample(last.0);
+                        frame[1] = T::from_sample(last.1);
+                        for sample in frame.iter_mut().skip(2) {
+                            *sample = T::from_sample(0.0f32);
+                        }
+                    }
+                }
+                let excess = ring.len().saturating_sub(BUS_RING_FRAMES / 2);
+                if excess > 0 {
+                    let _ = ring.drain(..excess);
+                }
+            },
+            move |err| {
+                *lock_source(&error_shared.error) =
+                    Some(format!("A2/A3 output error: {err}"));
+            },
+            None,
+        )
+        .map_err(|e| format!("Could not build a bus output stream: {e}"))
 }
 
 fn build_stream_for_format(
