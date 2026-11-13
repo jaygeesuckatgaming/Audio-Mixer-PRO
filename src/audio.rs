@@ -597,8 +597,8 @@ struct Shared {
     virtual_outputs: Mutex<[Option<Arc<Device>>; 2]>,
     /// A1/A2/A3 output rings. The internal mixer writes each bus mix here and
     /// the per-bus output streams replay it on their own devices.
-    bus_out_rings: [Mutex<VecDeque<(f32, f32)>>; 3],
-    bus_out_active: [AtomicBool; 3],
+    bus_out_rings: [Mutex<VecDeque<(f32, f32)>>; 5],
+    bus_out_active: [AtomicBool; 5],
     /// Frames rendered per mixer callback.
     mixer_block: AtomicU32,
     /// Outgoing VBAN streams: (bus index, sender ring).
@@ -672,7 +672,7 @@ impl Shared {
             bus_eq_gain: std::array::from_fn(|_| std::array::from_fn(|_| f32_atomic(0.0))),
             virtual_outputs: Mutex::new([None, None]),
             bus_out_rings: std::array::from_fn(|_| Mutex::new(VecDeque::with_capacity(BUS_RING_FRAMES))),
-            bus_out_active: [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)],
+            bus_out_active: std::array::from_fn(|_| AtomicBool::new(false)),
             mixer_block: AtomicU32::new(512),
             vban_tx: Mutex::new(Vec::new()),
             inputs: Mutex::new(std::array::from_fn(|_| None)),
@@ -1419,7 +1419,7 @@ impl Dsp {
         // Publish the A2/A3 bus mixes for their output streams. The rings are
         // bounded: if a secondary device runs slower, its oldest frames are
         // dropped instead of letting latency grow.
-        for b in 0..3 {
+        for b in 0..5 {
             if !shared.bus_out_active[b].load(Ordering::Relaxed) {
                 continue;
             }
@@ -1586,11 +1586,12 @@ pub struct AudioEngine {
     mixer_stop: Option<Arc<AtomicBool>>,
     mixer_join: Option<std::thread::JoinHandle<()>>,
     mixer_block: usize,
-    /// Output streams for A1, A2 and A3. Each consumes its own bus ring.
-    bus_streams: [Option<cpal::Stream>; 3],
-    bus_device_names: [String; 3],
-    bus_retry_at: [Option<std::time::Instant>; 3],
-    bus_last_request: [String; 3],
+    /// Output streams for A1, A2, A3 and (in driver mode) B1, B2. Each
+    /// consumes its own bus ring.
+    bus_streams: [Option<cpal::Stream>; 5],
+    bus_device_names: [String; 5],
+    bus_retry_at: [Option<std::time::Instant>; 5],
+    bus_last_request: [String; 5],
 }
 
 impl AudioEngine {
@@ -1631,10 +1632,10 @@ impl AudioEngine {
             mixer_stop: None,
             mixer_join: None,
             mixer_block: 512,
-            bus_streams: [None, None, None],
-            bus_device_names: [String::new(), String::new(), String::new()],
-            bus_retry_at: [None, None, None],
-            bus_last_request: [String::new(), String::new(), String::new()],
+            bus_streams: std::array::from_fn(|_| None),
+            bus_device_names: std::array::from_fn(|_| String::new()),
+            bus_retry_at: std::array::from_fn(|_| None),
+            bus_last_request: std::array::from_fn(|_| String::new()),
         }
     }
 
@@ -1704,7 +1705,7 @@ impl AudioEngine {
     pub fn stop_stream(&mut self) {
         self.stop_mixer();
         self.pending_start = None;
-        for b in 0..3 {
+        for b in 0..5 {
             self.bus_streams[b] = None;
             self.bus_device_names[b].clear();
             self.bus_retry_at[b] = None;
@@ -1953,17 +1954,17 @@ impl AudioEngine {
     /// each bus ring; these streams replay it on the selected devices. Cheap to
     /// call every frame: it only acts when a device name changed or a previous
     /// attempt is ready to retry.
-    pub fn set_bus_outputs(&mut self, a1: &str, a2: &str, a3: &str) {
+    pub fn set_bus_outputs(&mut self, names_in: [&str; 5]) {
         if !self.available || self.sample_rate == 0 {
             return;
         }
-        let requested = [a1, a2, a3];
+        let requested = names_in;
         let now = std::time::Instant::now();
-        let same_request = (0..3).all(|b| {
+        let same_request = (0..5).all(|b| {
             self.bus_last_request[b].eq_ignore_ascii_case(requested[b])
         });
         if same_request {
-            let retry_due = (0..3).any(|b| {
+            let retry_due = (0..5).any(|b| {
                 self.bus_streams[b].is_none()
                     && !self.bus_device_names[b].is_empty()
                     && self
@@ -1975,7 +1976,7 @@ impl AudioEngine {
                 return;
             }
         }
-        for b in 0..3 {
+        for b in 0..5 {
             self.bus_last_request[b] = requested[b].to_string();
         }
 
@@ -1990,7 +1991,7 @@ impl AudioEngine {
             }
         });
 
-        for b in 0..3 {
+        for b in 0..5 {
             let desired = wanted[b].clone();
             if self.bus_streams[b].is_some() {
                 if desired.as_deref() == Some(self.bus_device_names[b].as_str()) {
@@ -2029,8 +2030,8 @@ impl AudioEngine {
                     }
                     self.shared.bus_out_active[b].store(true, Ordering::Relaxed);
                     crate::diag_log(format!(
-                        "audio: bus A{} output on '{}' at {} Hz",
-                        b + 1,
+                        "audio: bus {} output on '{}' at {} Hz",
+                        Self::bus_label(b),
                         name,
                         rate
                     ));
@@ -2040,12 +2041,21 @@ impl AudioEngine {
                         std::time::Instant::now() + std::time::Duration::from_secs(3),
                     );
                     crate::diag_log(format!(
-                        "audio: bus A{} output '{}' failed: {err}",
-                        b + 1,
+                        "audio: bus {} output '{}' failed: {err}",
+                        Self::bus_label(b),
                         name
                     ));
                 }
             }
+        }
+    }
+
+    /// Human-readable bus name: A1..A3 are the console's main buses, B1/B2
+    /// are the virtual cable buses.
+    fn bus_label(bus: usize) -> String {
+        match bus {
+            0..=2 => format!("A{}", bus + 1),
+            _ => format!("B{}", bus - 2),
         }
     }
 

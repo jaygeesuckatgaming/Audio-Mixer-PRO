@@ -1046,6 +1046,9 @@ struct MixerApp {
     a1_reopen_tries: u8,
     restart_ticks: u32,
     last_outputs: Vec<String>,
+    /// True when the kernel virtual-cable driver's endpoints are in use
+    /// instead of the USB/IP cables.
+    driver_mode: bool,
     /// Whether the virtual cables were attached on the previous watchdog tick.
     /// The first attach after startup means any capture opened earlier can be
     /// stale, so the two virtual strips are re-opened once.
@@ -1530,6 +1533,7 @@ impl MixerApp {
             a1_reopen_tries: 0,
             restart_ticks: 0,
             last_outputs: Vec::new(),
+            driver_mode: false,
             vc_was_attached: false,
         };
 
@@ -2067,15 +2071,33 @@ impl MixerApp {
             self.duck.attack_ms,
             self.duck.release_ms,
         );
-        // B1/B2 live on the capture side of cables 1 and 2. Rebind every sync
-        // so a CABLES restart swaps in the new USB devices.
-        self.audio
-            .set_virtual_outputs(self.vc.device(1), self.vc.device(2));
-        // A1/A2/A3 are equal output streams fed by the internal mixer.
+        // B1/B2 reach cables 1 and 2. With the kernel driver they are plain
+        // render endpoints fed by the internal mixer; otherwise the mix is
+        // written into the USB cable's capture endpoint.
+        if self.driver_mode {
+            self.audio.set_virtual_outputs(None, None);
+        } else {
+            self.audio
+                .set_virtual_outputs(self.vc.device(1), self.vc.device(2));
+        }
         let a1 = self.buses[0].device.clone();
         let a2 = self.buses[1].device.clone();
         let a3 = self.buses[2].device.clone();
-        self.audio.set_bus_outputs(&a1, &a2, &a3);
+        let (b1, b2) = if self.driver_mode {
+            (
+                cable_render_device(&self.last_outputs, "Virtual Cable 01"),
+                cable_render_device(&self.last_outputs, "Virtual Cable 02"),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        self.audio.set_bus_outputs([
+            a1.as_str(),
+            a2.as_str(),
+            a3.as_str(),
+            b1.as_str(),
+            b2.as_str(),
+        ]);
         self.audio.set_vban_tx(self.vban.tx_targets());
     }
 
@@ -3118,7 +3140,10 @@ impl MixerApp {
                 }
             }
             StartupStep::Cables => {
-                if self.vc_cfg.enabled {
+                self.driver_mode = driver_cables_present();
+                if self.driver_mode {
+                    diag_log("startup: virtual cable driver detected, USB/IP disabled");
+                } else if self.vc_cfg.enabled {
                     diag_log("startup: starting virtual cables");
                     self.vc.apply(self.vc_cfg.clone());
                 }
@@ -3887,7 +3912,10 @@ impl MixerApp {
         let mut best: Option<(u32, String)> = None;
         for name in inputs {
             let lower = name.to_ascii_lowercase();
-            let Some(rest) = lower.strip_prefix("microphone (virtual cable ") else {
+            let Some(rest) = lower
+                .strip_prefix("microphone array (virtual cable ")
+                .or_else(|| lower.strip_prefix("microphone (virtual cable "))
+            else {
                 continue;
             };
             let Some(number) = rest.strip_suffix(')') else {
@@ -9189,6 +9217,33 @@ fn transport_button(
 
 /// "Microphone (Virtual Cable 03)" -> "Virtual Cable 03", the part of a USB
 /// cable endpoint name the narrow strip header can actually show.
+/// True when the kernel driver's cable endpoints are already present. The
+/// driver exposes four speaker endpoints named "Speakers (Virtual Cable NN)";
+/// the USB/IP cables only exist while the mixer's own server runs, so seeing
+/// them before the server starts means the driver is installed.
+fn driver_cables_present() -> bool {
+    let devices = AudioEngine::output_devices();
+    let mut labels: Vec<String> = devices
+        .iter()
+        .filter(|d| d.to_ascii_lowercase().starts_with("speakers"))
+        .filter_map(|d| cable_label(d))
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels.len() >= 4
+}
+
+fn cable_render_device(devices: &[String], label: &str) -> String {
+    devices
+        .iter()
+        .find(|d| {
+            d.to_ascii_lowercase().starts_with("speakers")
+                && cable_label(d).as_deref() == Some(label)
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn cable_label(device: &str) -> Option<String> {
     let lower = device.to_ascii_lowercase();
     let at = lower.find("virtual cable ")?;
