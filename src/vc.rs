@@ -137,6 +137,8 @@ impl VirtualCables {
         .collapsible(false)
         .resizable(true)
         .default_width(560.0)
+        .min_width(560.0)
+        .max_width(680.0)
         .frame(frame)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
@@ -303,7 +305,7 @@ impl VirtualCables {
                         .color(state_color),
                 );
                 ui.label(
-                    egui::RichText::new(status.message.clone())
+                    egui::RichText::new(truncate(&status.message, 80))
                         .size(10.0)
                         .color(TEXT),
                 );
@@ -342,7 +344,7 @@ impl VirtualCables {
                             ui.set_min_width(ui.available_width());
                             for line in self.logs() {
                                 ui.label(
-                                    egui::RichText::new(line)
+                                    egui::RichText::new(truncate(&line, 110))
                                         .monospace()
                                         .size(9.0)
                                         .color(DIM),
@@ -645,4 +647,14 @@ fn make_log(log: &Arc<Mutex<VecDeque<String>>>) -> LogFn {
             buffer.pop_front();
         }
     })
+}
+
+/// Shorten a line for display so long status/log text cannot resize windows.
+fn truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push(char::from_u32(0x2026).unwrap_or('.'));
+    out
 }
