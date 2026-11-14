@@ -40,3 +40,4 @@ Thumbs.db
 /dist/*
 !/dist/audio_mixer_pro.exe
 /build/
+target_check/

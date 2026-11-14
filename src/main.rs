@@ -9625,8 +9625,26 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // UI zoom. The console is a fixed-size window, so on a small or scaled
+    // display the only practical knob is the zoom factor.
+    let zoom = raw_args
+        .iter()
+        .position(|arg| arg == "--zoom")
+        .and_then(|index| raw_args.get(index + 1))
+        .and_then(|value| value.parse::<f32>().ok())
+        .or_else(|| {
+            std::env::var("AMP_ZOOM")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+        })
+        .filter(|factor| (0.5..=3.0).contains(factor))
+        .unwrap_or(1.0);
+    diag_log(format!("main: ui zoom {zoom}"));
+
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1024.0, 620.0])
+        // The console is a fixed-size window: zooming the UI without growing
+        // the window would clip the extra content, so both scale together.
+        .with_inner_size([1024.0 * zoom, 620.0 * zoom])
         // The original is a fixed-size borderless popup (style 0x82020000,
         // no WS_THICKFRAME), so the console cannot be resized.
         .with_resizable(false)
@@ -9647,6 +9665,9 @@ fn main() -> eframe::Result<()> {
         "Audio Mixer Pro",
         options,
         Box::new(move |cc| {
+            if (zoom - 1.0).abs() > f32::EPSILON {
+                cc.egui_ctx.set_zoom_factor(zoom);
+            }
             Ok(Box::new(MixerApp::new(
                 cc,
                 shot_path.clone(),
