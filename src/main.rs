@@ -3924,7 +3924,9 @@ impl MixerApp {
             let Ok(number) = number.trim().parse::<u32>() else {
                 continue;
             };
-            if number < 3 || used.iter().any(|d| d == &lower) {
+            // Every cable is bidirectional, so any free cable can feed a
+            // virtual strip (cables already used by a strip are skipped).
+            if used.iter().any(|d| d == &lower) {
                 continue;
             }
             if best
@@ -6466,7 +6468,7 @@ impl MixerApp {
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
         if self.show_vc {
             let mut open = self.show_vc;
-            self.vc.draw(ctx, &mut open);
+            self.vc.draw(ctx, &mut open, self.driver_mode);
             self.show_vc = open;
         }
         if self.show_system {

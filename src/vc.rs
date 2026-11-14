@@ -119,7 +119,7 @@ impl VirtualCables {
         self.log.lock().unwrap().iter().cloned().collect()
     }
 
-    pub fn draw(&mut self, ctx: &egui::Context, open: &mut bool) {
+    pub fn draw(&mut self, ctx: &egui::Context, open: &mut bool, driver_mode: bool) {
         let mut cfg = self.cfg.clone();
         let status = self.status();
         let frame = egui::Frame::window(&ctx.style())
@@ -141,13 +141,23 @@ impl VirtualCables {
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
             ui.set_min_width(536.0);
-            ui.label(
-                egui::RichText::new(
-                    "USB audio loopback devices that Windows can record from and play to.",
-                )
-                .size(9.0)
-                .color(DIM),
-            );
+            if driver_mode {
+                ui.label(
+                    egui::RichText::new(
+                        "KERNEL DRIVER ACTIVE: Virtual Cable 01..04 come from the installed                          audio driver. USB/IP is not used and the settings below are ignored.",
+                    )
+                    .size(9.0)
+                    .color(GREEN),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "USB audio loopback devices that Windows can record from and play to.",
+                    )
+                    .size(9.0)
+                    .color(DIM),
+                );
+            }
             ui.add_space(6.0);
 
             let mut enabled_changed = false;
@@ -156,7 +166,12 @@ impl VirtualCables {
                 .spacing([14.0, 6.0])
                 .show(ui, |ui| {
                     ui.label(egui::RichText::new("Enabled").color(TEXT));
-                    enabled_changed = ui.checkbox(&mut cfg.enabled, "").changed();
+                    enabled_changed = ui
+                        .add_enabled(
+                            !driver_mode,
+                            egui::Checkbox::new(&mut cfg.enabled, ""),
+                        )
+                        .changed();
                     ui.end_row();
 
                     ui.label(egui::RichText::new("Cables").color(TEXT));
