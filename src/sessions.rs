@@ -607,7 +607,8 @@ pub fn self_test() -> String {
             let Some(name) = friendly_name(&device) else {
                 continue;
             };
-            if !name.to_ascii_lowercase().contains("virtual cable") {
+            let lower = name.to_ascii_lowercase();
+            if !lower.contains("virtual cable") && !lower.contains("usb cable") {
                 continue;
             }
             report.push_str(&format!("\n{name}\n"));
