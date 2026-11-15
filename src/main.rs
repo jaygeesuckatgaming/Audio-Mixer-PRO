@@ -2087,13 +2087,10 @@ impl MixerApp {
         } else {
             (String::new(), String::new())
         };
-        self.audio.set_bus_outputs([
-            a1.as_str(),
-            a2.as_str(),
-            a3.as_str(),
-            b1.as_str(),
-            b2.as_str(),
-        ]);
+        self.audio.set_bus_outputs_with(
+            &self.last_outputs,
+            [a1.as_str(), a2.as_str(), a3.as_str(), b1.as_str(), b2.as_str()],
+        );
         self.audio.set_vban_tx(self.vban.tx_targets());
     }
 

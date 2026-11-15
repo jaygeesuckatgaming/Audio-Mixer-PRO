@@ -1958,6 +1958,17 @@ impl AudioEngine {
         if !self.available || self.sample_rate == 0 {
             return;
         }
+        // Called from the UI thread: use the device list the probe thread
+        // already produced instead of enumerating here, because enumeration
+        // blocks while the cables are being re-enumerated.
+        let available = AudioEngine::output_devices();
+        self.set_bus_outputs_with(&available, names_in);
+    }
+
+    pub fn set_bus_outputs_with(&mut self, available: &[String], names_in: [&str; 5]) {
+        if !self.available || self.sample_rate == 0 {
+            return;
+        }
         let requested = names_in;
         let now = std::time::Instant::now();
         let same_request = (0..5).all(|b| {
@@ -1980,7 +1991,7 @@ impl AudioEngine {
             self.bus_last_request[b] = requested[b].to_string();
         }
 
-        let names = AudioEngine::output_devices();
+        let names = available;
         // The same endpoint may be used by more than one bus (Voicemeeter
         // allows that too); only an unknown or empty name is skipped.
         let wanted = requested.map(|name| {
