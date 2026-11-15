@@ -2,16 +2,17 @@
 
 # Audio Mixer PRO
 
-https://youtube.com/@jaygeeaiforfunz
-
 ![channels4_profile_circle_1](https://i.ibb.co/vxP16dyN/Main-View.png)
+
+Use at your own risc....
+
+** 4 Kernel Virtual Cables Only test signed at the moment so you have to enable test signing **
 
 Up to 16 Hardware/Virtual Inputs.
 
 Up to 32 Virtual Cables(1 and 2 reserved for B1 and B2).
 
 Separate VST 3´s for each channel.
-"VST is a registered trademark of Steinberg Media Technologies GmbH."
 
 
 VBAN with Auto discover sources.
@@ -26,14 +27,14 @@ usbip-win2
 
 https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.8.1/USBip-0.9.8.1-x64.exe
 
-On the first run UAC will pop up... Just continue and the app starts(Dont worry you can check in the code that it isnt doing anything bad...) Now go to Cables and click install and it will install a small "server" that handles UAC.
+On the first run UAC will pop up... Just continue and the app starts(Dont worry you can check in the code that it isnt doing anything bad...) Now go to Cables and click install and it will install a small "app" that handles UAC.
 ![channels4_profile_circle_1](https://i.ibb.co/jkSz8rz1/Virtual-Cables-srv-2.jpg)
 
 Recomended VST 3 Plugins to get started.
 
-UhbikWrapper for Windows with refresh.
-https://github.com/jaygeesuckatgaming/UhbikWrapper/blob/master/Release/UhbikWrapper.vst_3_0.3.2.rar
-https://github.com/jaygeesuckatgaming/UhbikWrapper
+UhbikWrapper
+https://github.com/dlarseninclusive/UhbikWrapper/releases
+https://github.com/jaygeesuckatgaming/UhbikWrapper (Will be updated soon)
 
 EQ - TDR Nova/7Q
 https://www.tokyodawn.net/tdr-nova/
