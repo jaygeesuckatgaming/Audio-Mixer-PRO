@@ -2005,14 +2005,30 @@ impl AudioEngine {
 
         let names = available;
         // The same endpoint may be used by more than one bus (Voicemeeter
-        // allows that too); only an unknown or empty name is skipped.
-        let wanted = requested.map(|name| {
-            if name.is_empty() || !names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-                None
-            } else {
-                Some(name.to_string())
+        // allows that too); only an unknown or empty name is skipped. A stored
+        // name that no longer matches verbatim is resolved against the live
+        // list, so a renamed or differently formatted device still opens
+        // without the user having to pick it again.
+        let resolve = |name: &str| -> Option<String> {
+            if name.is_empty() {
+                return None;
             }
-        });
+            if let Some(exact) = names.iter().find(|n| n.eq_ignore_ascii_case(name)) {
+                return Some(exact.clone());
+            }
+            let needle = name.trim().to_ascii_lowercase();
+            if needle.chars().count() < 4 {
+                return None;
+            }
+            names
+                .iter()
+                .find(|candidate| {
+                    let hay = candidate.trim().to_ascii_lowercase();
+                    hay.len() >= 4 && (hay.contains(&needle) || needle.contains(&hay))
+                })
+                .cloned()
+        };
+        let wanted = requested.map(resolve);
 
         for b in 0..5 {
             let desired = wanted[b].clone();
