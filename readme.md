@@ -4,8 +4,6 @@
 
 ![channels4_profile_circle_1](https://i.ibb.co/vxP16dyN/Main-View.png)
 
-Use at your own risc....
-
 ** 4 Kernel Virtual Cables Only test signed at the moment so you have to enable test signing **
 
 Up to 16 Hardware/Virtual Inputs.
