@@ -9655,6 +9655,12 @@ fn main() -> eframe::Result<()> {
         // The console is a fixed-size window: zooming the UI without growing
         // the window would clip the extra content, so both scale together.
         .with_inner_size([1024.0 * zoom, 620.0 * zoom])
+        // An undecorated window can come up minimized or off-screen when the
+        // desktop size changed (for example after a VM display resize), so pin
+        // a visible spot and ask for focus.
+        .with_position(egui::pos2(40.0, 40.0))
+        .with_visible(true)
+        .with_active(true)
         // The original is a fixed-size borderless popup (style 0x82020000,
         // no WS_THICKFRAME), so the console cannot be resized.
         .with_resizable(false)
