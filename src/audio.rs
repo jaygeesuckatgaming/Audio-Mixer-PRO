@@ -831,6 +831,9 @@ struct Dsp {
     // capture endpoint as PCM, so other applications can record them.
     out_bus_l: [Vec<f32>; MAX_BUSES],
     out_bus_r: [Vec<f32>; MAX_BUSES],
+    /// Post-fader strip stems, filled for VBAN streams that send a strip.
+    out_strip_l: [Vec<f32>; MAX_STRIPS],
+    out_strip_r: [Vec<f32>; MAX_STRIPS],
     pcm: Vec<u8>,
     /// Ducking detector envelope (linear, smoothed) and current gain (linear).
     duck_env: f32,
@@ -870,6 +873,8 @@ impl Dsp {
             vst_ready: [false; MAX_STRIPS],
             out_bus_l: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             out_bus_r: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
+            out_strip_l: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
+            out_strip_r: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             pcm: Vec::with_capacity(crate::vst::VST_MAX_BLOCK * 2 * 4),
             duck_env: 0.0,
             duck_gain: 1.0,
@@ -1122,6 +1127,14 @@ impl Dsp {
                 self.out_bus_l[bus].resize(frames, 0.0);
                 self.out_bus_r[bus].resize(frames, 0.0);
             }
+            // Strip stems stay silent unless the strip is processed below, so
+            // a muted or soloed-out strip never repeats stale audio.
+            for strip in 0..MAX_STRIPS {
+                self.out_strip_l[strip].resize(frames, 0.0);
+                self.out_strip_r[strip].resize(frames, 0.0);
+                self.out_strip_l[strip].fill(0.0);
+                self.out_strip_r[strip].fill(0.0);
+            }
 
             for (frame_no, frame) in data.chunks_mut(channels.max(1)).enumerate() {
                 let mut bus_l = [0.0f32; MAX_BUSES];
@@ -1332,6 +1345,9 @@ impl Dsp {
                         sr *= duck_now;
                     }
                     strip_peak[i] = strip_peak[i].max(sl.abs()).max(sr.abs());
+                    self.out_strip_l[i][frame_no] = sl;
+                    self.out_strip_r[i][frame_no] = sr;
+
                     if strip_route[i] & STRIP_ROUTE_A1 != 0 {
                         bus_l[0] += sl;
                         bus_r[0] += sr;
@@ -1509,9 +1525,14 @@ impl Dsp {
     /// copy only; the actual UDP send happens on the sender threads.
     fn write_vban(&self, shared: &Shared, frames: usize) {
         let targets = lock_source(&shared.vban_tx);
-        for (bus, ring) in targets.iter() {
-            if *bus < 5 {
-                ring.push_block(&self.out_bus_l[*bus], &self.out_bus_r[*bus], frames);
+        for (code, ring) in targets.iter() {
+            if *code < MAX_BUSES {
+                ring.push_block(&self.out_bus_l[*code], &self.out_bus_r[*code], frames);
+            } else {
+                let strip = code - MAX_BUSES;
+                if strip < MAX_STRIPS {
+                    ring.push_block(&self.out_strip_l[strip], &self.out_strip_r[strip], frames);
+                }
             }
         }
     }

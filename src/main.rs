@@ -2883,9 +2883,10 @@ impl MixerApp {
                 .rsplit_once(':')
                 .unwrap_or((out.target.as_str(), "6980"));
             text.push_str(&format!(
-                "\t<VBANStreamOut index='{}' bus='{}' name=\"{}\" ip='{}' port='{}' SR='{}' ch='{}' NQ='{}' format='{}' />\n",
+                "\t<VBANStreamOut index='{}' bus='{}' strip='{}' name=\"{}\" ip='{}' port='{}' SR='{}' ch='{}' NQ='{}' format='{}' />\n",
                 index + 1,
                 out.bus,
+                out.strip.map(|strip| strip as i64).unwrap_or(-1),
                 xml_escape(&out.name),
                 xml_escape(ip),
                 port,
@@ -3421,7 +3422,12 @@ impl MixerApp {
         for (attrs, _) in xml_elements(text, "VBANStreamOut") {
             let mut out = vban::VbanOutConfig::default();
             if let Some(value) = xml_attr(attrs, "bus").and_then(|v| v.parse::<usize>().ok()) {
-                out.bus = value.min(4);
+                out.bus = value.min(audio::MAX_BUSES - 1);
+            }
+            if let Some(value) = xml_attr(attrs, "strip").and_then(|v| v.parse::<i64>().ok()) {
+                if value >= 0 {
+                    out.strip = Some((value as usize).min(MAX_STRIPS - 1));
+                }
             }
             if let Some(value) = xml_attr(attrs, "name") {
                 out.name = xml_unescape(&value);
@@ -6947,23 +6953,46 @@ impl MixerApp {
                     );
                     ui.label(
                         egui::RichText::new(
-                            "Sends A1/A2/A3/B1/B2 to another machine. Allow UDP to the target port.",
+                            "Sends a bus (A1..B3) or a single input strip (CH1..) to another machine. Allow UDP to the target port.",
                         )
                         .size(9.0)
                         .color(FAINT),
                     );
                     let bus_labels = ["A1", "A2", "A3", "B1", "B2", "B3"];
+                    let strip_names: Vec<String> = (0..self.active_strips)
+                        .map(|i| format!("CH{}", i + 1))
+                        .collect();
                     let mut remove = None;
                     for (index, out) in self.vban_out.iter_mut().enumerate() {
+                        let current = match out.strip {
+                            Some(strip) => strip_names
+                                .get(strip)
+                                .cloned()
+                                .unwrap_or_else(|| format!("CH{}", strip + 1)),
+                            None => bus_labels
+                                .get(out.bus)
+                                .copied()
+                                .unwrap_or("A1")
+                                .to_string(),
+                        };
                         ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_source(("vban_bus", index))
-                                .width(48.0)
-                                .selected_text(
-                                    bus_labels.get(out.bus).copied().unwrap_or("A1"),
-                                )
+                            egui::ComboBox::from_id_source(("vban_src", index))
+                                .width(56.0)
+                                .selected_text(current)
                                 .show_ui(ui, |ui| {
                                     for (i, label) in bus_labels.iter().enumerate() {
-                                        ui.selectable_value(&mut out.bus, i, *label);
+                                        let selected = out.strip.is_none() && out.bus == i;
+                                        if ui.selectable_label(selected, *label).clicked() {
+                                            out.bus = i;
+                                            out.strip = None;
+                                        }
+                                    }
+                                    ui.separator();
+                                    for (i, label) in strip_names.iter().enumerate() {
+                                        let selected = out.strip == Some(i);
+                                        if ui.selectable_label(selected, label).clicked() {
+                                            out.strip = Some(i);
+                                        }
                                     }
                                 });
                             ui.add(

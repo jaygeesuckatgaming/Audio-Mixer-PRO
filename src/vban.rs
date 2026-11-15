@@ -348,6 +348,9 @@ pub struct SenderInfo {
 #[derive(Clone, Debug)]
 pub struct VbanOutConfig {
     pub bus: usize,
+    /// When set, the stream carries this input strip (post-fader) instead of a
+    /// bus.
+    pub strip: Option<usize>,
     pub name: String,
     pub target: String,
     pub sample_rate: u32,
@@ -360,6 +363,7 @@ impl Default for VbanOutConfig {
     fn default() -> Self {
         Self {
             bus: 0,
+            strip: None,
             name: "Audio Mixer PRO".to_string(),
             target: "192.168.1.100:6980".to_string(),
             sample_rate: 48_000,
@@ -461,6 +465,7 @@ struct SenderStats {
 
 struct VbanSender {
     bus: usize,
+    strip: Option<usize>,
     local_port: u16,
     tx: Arc<TxRing>,
     stop: Arc<AtomicBool>,
@@ -566,7 +571,8 @@ impl VbanSender {
             })
             .map_err(|err| format!("could not start VBAN sender: {err}"))?;
         Ok(Self {
-            bus: config.bus.min(5),
+            bus: config.bus.min(crate::audio::MAX_BUSES - 1),
+            strip: config.strip,
             local_port,
             tx,
             stop,
@@ -922,11 +928,19 @@ impl VbanHub {
     }
 
     pub fn tx_targets(&self) -> Vec<(usize, Arc<TxRing>)> {
+        // Bus indices come first; strip sends are offset past MAX_BUSES so the
+        // audio thread can tell them apart without another type.
         self.senders
             .lock()
             .unwrap()
             .iter()
-            .map(|s| (s.bus, s.tx.clone()))
+            .map(|s| {
+                let code = match s.strip {
+                    Some(strip) => crate::audio::MAX_BUSES + strip,
+                    None => s.bus,
+                };
+                (code, s.tx.clone())
+            })
             .collect()
     }
 
@@ -1082,6 +1096,7 @@ pub fn vban_selftest() {
     let target = receiver.local_addr().expect("VBAN test target");
     let config = VbanOutConfig {
         bus: 0,
+        strip: None,
         name: "VBAN TX Test".to_string(),
         target: target.to_string(),
         sample_rate: 48_000,
