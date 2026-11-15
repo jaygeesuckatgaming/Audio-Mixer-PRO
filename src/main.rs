@@ -4488,6 +4488,14 @@ impl MixerApp {
         if drag.drag_started() && !over_button {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
+        // Start the drag on the press as well: if a native resize left the
+        // pointer state stale, waiting for drag_started can miss the gesture.
+        if drag.contains_pointer()
+            && !over_button
+            && ui.input(|i| i.pointer.primary_pressed())
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
 
         let title_rect = Rect::from_min_size(Pos2::new(rect.left() + 42.0, rect.top() + 5.0), Vec2::new(120.0, 28.0));
         p.text(
@@ -6341,15 +6349,36 @@ impl MixerApp {
             .order(egui::Order::Tooltip)
             .interactable(true)
             .show(ctx, |ui| {
-                let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::drag());
-                if response.hovered() || response.dragged() {
+                // Hover sense on purpose: egui drag state is not involved, so
+                // the pointer cannot stay captured once the OS takes over the
+                // resize (which used to block the title-bar drag afterwards).
+                let (rect, response) =
+                    ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+                if response.contains_pointer() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
                 }
-                if response.drag_started() {
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::BeginResize(
-                            egui::ResizeDirection::SouthEast,
-                        ));
+                if response.contains_pointer() && ui.input(|i| i.pointer.primary_pressed()) {
+                    let maximized =
+                        ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+                    if maximized {
+                        // A maximized window sits on the screen corner, where
+                        // the OS ignores a resize request: restore first so the
+                        // grip always does something useful.
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+                    } else {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                                egui::ResizeDirection::SouthEast,
+                            ));
+                    }
+                    // The OS takes the pointer for the resize and egui never sees
+                    // the release. Clear the pointer state so a later press on
+                    // the title bar starts a normal drag instead of being
+                    // swallowed by a drag that never ended.
+                    ui.ctx().input_mut(|i| {
+                        i.pointer = egui::PointerState::default();
+                    });
                 }
                 let painter = ui.painter();
                 for i in 0..3 {
