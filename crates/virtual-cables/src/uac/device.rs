@@ -91,6 +91,18 @@ pub struct Device {
 
 impl Device {
     pub fn new(number: u8, latency_ms: u32, mode: Mode, max_rate: u32) -> Result<Self, String> {
+        Self::new_with_min(number, latency_ms, 20, mode, max_rate)
+    }
+
+    /// Like `new`, but decides how short the injection delay may get. The
+    /// floor trades latency against dropouts on a busy USB/IP stack.
+    pub fn new_with_min(
+        number: u8,
+        latency_ms: u32,
+        min_latency_ms: u32,
+        mode: Mode,
+        max_rate: u32,
+    ) -> Result<Self, String> {
         let max_rate = clamp_rate(max_rate);
         let descriptors = Descriptors::new(number, mode, max_rate)?;
         let latency_ms = latency_ms.clamp(10, 2000);
@@ -103,7 +115,8 @@ impl Device {
         // B1/B2 are written into their own ring. Keep that feed short so a
         // continuously running mixer cannot fill a 250 ms queue before the
         // streaming app starts reading it.
-        let inject_ms = latency_ms.clamp(20, 40);
+        let floor = min_latency_ms.clamp(5, 40).min(latency_ms.max(5));
+        let inject_ms = latency_ms.clamp(floor, 40);
         let inject_capacity = (bytes_per_second * inject_ms / 1000).max(1) as usize;
         let resampler_frames = (MAX_SAMPLE_RATE * latency_ms / 1000).max(256) as usize;
         Ok(Self {

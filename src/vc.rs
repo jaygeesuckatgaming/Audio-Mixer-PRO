@@ -196,7 +196,7 @@ impl VirtualCables {
                         .width(130.0)
                         .selected_text(format!("{} ms", cfg.buffer_ms))
                         .show_ui(ui, |ui| {
-                            for ms in [30u32, 40, 60, 100, 150, 250] {
+                            for ms in [20u32, 30, 40, 60, 100, 150, 250] {
                                 ui.selectable_value(
                                     &mut cfg.buffer_ms,
                                     ms,
@@ -204,6 +204,21 @@ impl VirtualCables {
                                 );
                             }
                         });
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("Min latency").color(TEXT));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut cfg.min_latency_ms)
+                                .range(5..=40)
+                                .suffix(" ms"),
+                        );
+                        ui.label(
+                            egui::RichText::new("lower = less delay, more dropouts")
+                                .size(9.0)
+                                .color(FAINT),
+                        );
+                    });
                     ui.end_row();
 
                     ui.label(egui::RichText::new("Max rate").color(TEXT));

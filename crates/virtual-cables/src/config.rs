@@ -7,6 +7,9 @@ pub struct Config {
     pub enabled: bool,
     pub cables: u8,
     pub buffer_ms: u32,
+    /// Lowest injection latency the cable may use (5..=40 ms). The ring is
+    /// still `buffer_ms` deep; this only caps how long audio is held back.
+    pub min_latency_ms: u32,
     pub max_rate: u32,
     pub uac_mode: Mode,
 }
@@ -19,6 +22,7 @@ impl Default for Config {
             // Balanced default: enough slack for USB/IP, much lower than the
             // old 250 ms default that dominated end-to-end latency.
             buffer_ms: 60,
+            min_latency_ms: 20,
             max_rate: 48_000,
             uac_mode: Mode::Uac2,
         }
@@ -29,6 +33,7 @@ impl Config {
     pub fn normalized(mut self) -> Self {
         self.cables = self.cables.clamp(1, 32);
         self.buffer_ms = self.buffer_ms.clamp(20, 5000);
+        self.min_latency_ms = self.min_latency_ms.clamp(5, 40);
         self.max_rate = self.max_rate.clamp(MIN_SAMPLE_RATE, MAX_SAMPLE_RATE);
         self
     }
@@ -53,6 +58,11 @@ impl Config {
                 "BUFFER_MS" => {
                     if let Ok(n) = value.parse::<u32>() {
                         config.buffer_ms = n.clamp(20, 5000);
+                    }
+                }
+                "MIN_LATENCY_MS" => {
+                    if let Ok(n) = value.parse::<u32>() {
+                        config.min_latency_ms = n.clamp(5, 40);
                     }
                 }
                 "UAC_MODE" => {

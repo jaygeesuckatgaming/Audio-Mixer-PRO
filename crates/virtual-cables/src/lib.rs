@@ -24,7 +24,13 @@ pub type LogFn = Arc<dyn Fn(String) + Send + Sync>;
 pub fn self_test(cfg: &Config) -> Result<String, String> {
     let mut report = String::new();
     for number in 1..=cfg.cables {
-        let device = Device::new(number, cfg.buffer_ms, cfg.uac_mode, cfg.max_rate)?;
+        let device = Device::new_with_min(
+            number,
+            cfg.buffer_ms,
+            cfg.min_latency_ms,
+            cfg.uac_mode,
+            cfg.max_rate,
+        )?;
         device
             .descriptors
             .validate()
