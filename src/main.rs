@@ -8138,66 +8138,74 @@ impl MixerApp {
                             }
                         });
                     ui.separator();
-                    ui.add(
-                        egui::Slider::new(&mut self.duck.depth_db, -30.0..=0.0)
-                            .text("Depth (dB)"),
-                    )
-                    .on_hover_text(
-                        "How far the targets are turned down while ducking is fully engaged.
-                         0 dB = no change, -6 dB = half as loud, -12 dB = a quarter as loud.",
+                    duck_param_row(
+                        ui,
+                        &mut self.duck.depth_db,
+                        -30.0,
+                        0.0,
+                        0.1,
+                        " dB",
+                        "Depth (dB)",
+                        "How far the targets drop while ducking is engaged. 0 dB = no change, -12 dB is a typical voice-over duck.",
                     );
-                    ui.label(
-                        egui::RichText::new(
-                            "Amount of gain reduction applied to the targets. 0 = off, -12 dB is a typical voice-over duck.",
-                        )
-                        .size(9.0)
-                        .color(DIM),
+                    duck_param_row(
+                        ui,
+                        &mut self.duck.threshold_db,
+                        -60.0,
+                        -6.0,
+                        0.5,
+                        " dBFS",
+                        "Threshold (dBFS)",
+                        "How loud the source must be before it ducks anything. Quiet sources need a lower threshold.",
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.duck.threshold_db, -60.0..=-6.0)
-                            .text("Threshold (dBFS)"),
-                    )
-                    .on_hover_text(
-                        "Source level that starts ducking. Below it the targets play untouched;
-                         above it they are pushed down. Lower values mean the source has to be louder.",
+                    duck_param_row(
+                        ui,
+                        &mut self.duck.attack_ms,
+                        1.0,
+                        100.0,
+                        0.5,
+                        " ms",
+                        "Attack (ms)",
+                        "How fast the targets drop. Short keeps speech intelligible, long sounds gentler.",
                     );
-                    ui.label(
-                        egui::RichText::new(
-                            "How loud the source must be before it ducks anything. Quiet sources need a lower threshold.",
-                        )
-                        .size(9.0)
-                        .color(DIM),
+                    duck_param_row(
+                        ui,
+                        &mut self.duck.release_ms,
+                        20.0,
+                        1000.0,
+                        2.0,
+                        " ms",
+                        "Release (ms)",
+                        "How long the targets stay down after the source goes quiet. Short recovers fast, long holds through pauses.",
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.duck.attack_ms, 1.0..=100.0)
-                            .text("Attack (ms)"),
-                    )
-                    .on_hover_text(
-                        "Time to reach full reduction once the source crosses the threshold.
-                         Short = snappy but can click; long = smooth but lets the first syllables through.",
+
+                    ui.separator();
+                    // Live levels. Dragging anywhere on either bar sets the
+                    // threshold, so the marker and the slider stay in sync.
+                    let source_level = self.audio.duck_source_level();
+                    let target_level = (0..self.active_strips)
+                        .filter(|i| (self.duck.targets & (1u32 << i)) != 0)
+                        .map(|i| self.audio.strip_peak(i))
+                        .fold(0.0f32, f32::max);
+                    let mut threshold = self.duck.threshold_db;
+                    let mut changed = duck_meter(
+                        ui,
+                        "Source Volume",
+                        "duck_source_meter",
+                        source_level,
+                        &mut threshold,
                     );
-                    ui.label(
-                        egui::RichText::new(
-                            "How fast the targets drop. Short keeps speech intelligible, long sounds gentler.",
-                        )
-                        .size(9.0)
-                        .color(DIM),
+                    changed |= duck_meter(
+                        ui,
+                        "Target Volume",
+                        "duck_target_meter",
+                        target_level,
+                        &mut threshold,
                     );
-                    ui.add(
-                        egui::Slider::new(&mut self.duck.release_ms, 20.0..=1000.0)
-                            .text("Release (ms)"),
-                    )
-                    .on_hover_text(
-                        "Time to return to normal level after the source falls below the threshold.
-                         Too short pumps on every pause; too long keeps music quiet between sentences.",
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            "How long the targets stay down after the source goes quiet. Short recovers fast, long holds through pauses.",
-                        )
-                        .size(9.0)
-                        .color(DIM),
-                    );
+                    if changed {
+                        self.duck.threshold_db = threshold;
+                    }
+
                     ui.separator();
                     let reduction = self.audio.duck_gain_db();
                     ui.label(format!("Gain reduction: {reduction:.1} dB"));
@@ -9043,6 +9051,94 @@ fn fader(
             ui.label(format!("{}", fmt_db(*value)));
         });
     }
+}
+
+/// One ducking parameter: compact bar slider, editable value, name, and a
+/// one-line explanation of what it does.
+fn duck_param_row(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    lo: f32,
+    hi: f32,
+    speed: f32,
+    suffix: &str,
+    name: &str,
+    hint: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 18.0],
+            egui::Slider::new(value, lo..=hi).show_value(false),
+        );
+        ui.add(
+            egui::DragValue::new(value)
+                .range(lo..=hi)
+                .speed(speed)
+                .max_decimals(1)
+                .suffix(suffix),
+        );
+        ui.label(egui::RichText::new(name).color(TEXT));
+    });
+    ui.label(egui::RichText::new(hint).size(9.0).color(DIM));
+}
+
+/// Horizontal level bar on a -60..0 dBFS scale with a draggable threshold
+/// marker. Returns true when the marker moved the threshold.
+fn duck_meter(
+    ui: &mut egui::Ui,
+    name: &str,
+    id_source: &str,
+    level: f32,
+    threshold_db: &mut f32,
+) -> bool {
+    let level_db = lin_to_db(level).clamp(-60.0, 0.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(name).size(10.0).color(TEXT));
+        ui.label(
+            egui::RichText::new(format!("{level_db:.1} dB"))
+                .size(9.0)
+                .color(DIM),
+        );
+    });
+
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 12.0),
+        Sense::click_and_drag(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, TRACK);
+    painter.rect_stroke(rect, 2.0, Stroke::new(1.0, LINE));
+
+    let fill = ((level_db + 60.0) / 60.0).clamp(0.0, 1.0);
+    if fill > 0.0 {
+        painter.rect_filled(
+            Rect::from_min_size(
+                rect.left_top(),
+                Vec2::new(rect.width() * fill, rect.height()),
+            ),
+            2.0,
+            GREEN,
+        );
+    }
+
+    let tick = ((*threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
+    let x = rect.left() + rect.width() * tick;
+    painter.line_segment(
+        [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+        Stroke::new(2.0, AMBER),
+    );
+    let _ = id_source;
+
+    let mut changed = false;
+    if response.dragged() || response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let t = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+            *threshold_db = (-60.0 + t * 60.0).clamp(-60.0, -6.0);
+            changed = true;
+        }
+    }
+    response.on_hover_text("Drag to set the threshold");
+    changed
 }
 
 fn meter_widget(

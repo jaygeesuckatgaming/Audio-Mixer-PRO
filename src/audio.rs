@@ -643,6 +643,9 @@ struct Shared {
     duck_release_ms: AtomicU32,
     /// Current gain reduction in dB (0.0 = not ducking), for the UI meter.
     duck_gain_db: AtomicU32,
+    /// Smoothed level of the ducking source (linear peak) as the detector
+    /// sees it, for the window's Source Volume meter.
+    duck_source_level: AtomicU32,
     /// Live per-strip dynamics meters: compressor reduction (negative dB) and
     /// gate attenuation (0 dB open, about -60 dB closed).
     strip_comp_gr: [AtomicU32; MAX_STRIPS],
@@ -694,6 +697,7 @@ impl Shared {
             duck_attack_ms: f32_atomic(10.0),
             duck_release_ms: f32_atomic(300.0),
             duck_gain_db: f32_atomic(0.0),
+            duck_source_level: f32_atomic(0.0),
             strip_comp_gr: std::array::from_fn(|_| f32_atomic(0.0)),
             strip_gate_att: std::array::from_fn(|_| f32_atomic(0.0)),
             error: Mutex::new(None),
@@ -1439,6 +1443,9 @@ impl Dsp {
             shared.finished.store(true, Ordering::Relaxed);
         }
         shared.position.store(pos, Ordering::Relaxed);
+        shared
+            .duck_source_level
+            .store(self.duck_env.to_bits(), Ordering::Relaxed);
         shared.duck_gain_db.store(
             if duck_source.is_some() && duck_enabled {
                 lin_to_db(self.duck_gain)
@@ -2073,6 +2080,12 @@ impl AudioEngine {
     /// Current ducking gain reduction in dB (negative, 0.0 when idle).
     pub fn duck_gain_db(&self) -> f32 {
         load_f32(&self.shared.duck_gain_db)
+    }
+
+    /// Smoothed level of the ducking source (linear peak), as the detector
+    /// uses it for the threshold test.
+    pub fn duck_source_level(&self) -> f32 {
+        load_f32(&self.shared.duck_source_level)
     }
 
     /// Live compressor gain reduction for a strip (negative dB, 0.0 = idle).
