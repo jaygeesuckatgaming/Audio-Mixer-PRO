@@ -480,7 +480,7 @@ struct Strip {
     color_panel: [f32; 2],
     /// +0x18 / +0x1c ModPanelx / ModPanely (x -0.5..+0.5, y 0..1).
     mod_panel: [f32; 2],
-    route: [bool; 5],
+    route: [bool; audio::MAX_BUSES],
     mute: bool,
     solo: bool,
     mono: bool,
@@ -500,7 +500,7 @@ struct Strip {
 impl Strip {
     fn new(i: usize) -> Self {
         let hw = i < 3;
-        let mut route = [false; 5];
+        let mut route = [false; audio::MAX_BUSES];
         if i < BASE_STRIPS {
             route[0] = true;
         }
@@ -658,7 +658,7 @@ struct StripClip {
     panel_type: u8,
     color_panel: [f32; 2],
     mod_panel: [f32; 2],
-    route: [bool; 5],
+    route: [bool; audio::MAX_BUSES],
     mute: bool,
     solo: bool,
     mono: bool,
@@ -742,13 +742,15 @@ struct Bus {
 
 impl Bus {
     fn new(i: usize) -> Self {
-        let names = ["A1", "A2", "A3", "B1", "B2"];
+        let names = ["A1", "A2", "A3", "B1", "B2", "B3"];
         let devices = [
             "WDM: Speakers",
             "WDM: Headphones",
             "WDM: Line Out",
             "Virtual Cable 01",
             "Virtual Cable 02",
+            // B3 has no automatic cable: pick a device (or a VBAN stream).
+            "",
         ];
         let freqs = [50.0, 200.0, 800.0, 2000.0, 8000.0, 12000.0];
         let mut eq = [EqBand {
@@ -789,7 +791,7 @@ struct Tape {
     /// Full path of a loaded WAV file, if any.
     path: String,
     gain_db: f32,
-    route: [bool; 5],
+    route: [bool; audio::MAX_BUSES],
     /// RecordMode Loop: restart at the end instead of stopping.
     loop_playback: bool,
     /// <RecordParam> values, read with FUN_0052cd90's acceptance rules.
@@ -816,7 +818,7 @@ impl Tape {
             demo: None,
             path: String::new(),
             gain_db: 0.0,
-            route: [true, false, false, false, false],
+            route: [true, false, false, false, false, false],
             loop_playback: false,
             rec_file_type: REC_FILE_TYPE,
             rec_bit_depth: REC_BIT_DEPTH,
@@ -932,9 +934,9 @@ struct MixerApp {
     /// FUN_0052ab70 stores `<InputDev type>` / `<OutputDev type>` at record
     /// +0x284: 1 MME, 4 (default WDM), 8 KS, 0x100 ASIO.
     input_types: [i32; 3],
-    output_types: [i32; 5],
+    output_types: [i32; audio::MAX_BUSES],
     /// `<OutputDev pOut1..pOut8>` for an unassigned output (name "-").
-    output_patch: [[i32; 8]; 5],
+    output_patch: [[i32; 8]; audio::MAX_BUSES],
     engine_mode: usize,
     limit_remote: bool,
     monitor_on_sel: bool,
@@ -1439,7 +1441,7 @@ impl MixerApp {
             strip_bank: 0,
             pending_late_virtual_adds: 0,
             pending_auto_assign: Vec::new(),
-            buses: (0..5).map(Bus::new).collect(),
+            buses: (0..audio::MAX_BUSES).map(Bus::new).collect(),
             captures,
             tape: Tape::new(),
             audio,
@@ -1453,8 +1455,8 @@ impl MixerApp {
             dev_srasio: false,
             bus_latency_ms: [0.0; 3],
             input_types: [DEVICE_TYPE_WDM; 3],
-            output_types: [DEVICE_TYPE_WDM; 5],
-            output_patch: [[0; 8]; 5],
+            output_types: [DEVICE_TYPE_WDM; audio::MAX_BUSES],
+            output_patch: [[0; 8]; audio::MAX_BUSES],
             engine_mode: 0,
             limit_remote: false,
             monitor_on_sel: false,
@@ -1581,7 +1583,7 @@ impl MixerApp {
         // Diagnostic: play the demo into both virtual buses so the cable
         // capture endpoints can be measured from another process.
         if std::env::args().any(|a| a == "--bus-demo") {
-            app.tape.route = [false, false, false, true, true];
+            app.tape.route = [false, false, false, true, true, false];
             app.select_demo(DemoKind::Track1);
             app.on_transport(Transport::Play);
         }
@@ -2118,9 +2120,18 @@ impl MixerApp {
         let a1 = self.buses[0].device.clone();
         let a2 = self.buses[1].device.clone();
         let a3 = self.buses[2].device.clone();
+        // B3 is a plain bus: it only plays to the device chosen for it.
+        let b3 = self.buses[5].device.clone();
         self.audio.set_bus_outputs_with(
             &self.last_outputs,
-            [a1.as_str(), a2.as_str(), a3.as_str(), b1.as_str(), b2.as_str()],
+            [
+                a1.as_str(),
+                a2.as_str(),
+                a3.as_str(),
+                b1.as_str(),
+                b2.as_str(),
+                b3.as_str(),
+            ],
         );
         self.audio.set_vban_tx(self.vban.tx_targets());
     }
@@ -2532,7 +2543,7 @@ impl MixerApp {
                 xml_escape(name)
             ));
         }
-        for i in 0..5 {
+        for i in 0..audio::MAX_BUSES {
             let name = xml_escape(&self.buses[i].device);
             if self.buses[i].device.trim().is_empty() {
                 let mut patches = String::new();
@@ -2624,11 +2635,14 @@ impl MixerApp {
             if s.route[4] {
                 flags |= 0x20000;
             }
+            if s.route[5] {
+                flags |= 0x40000;
+            }
             if s.kind == StripKind::Virtual {
                 flags |= 0x4000_0000;
             }
             text.push_str(&format!(
-                "\t<Strip index='{}' mute='{}' vaio='{}' solo='{}' mono='{}' muc='{}' prg_c='{}' prg_g='{}' busa='{}' busa2='{}' busa3='{}' busb='{}' busb2='{}' karaoke='{}' dblevel='{:.2}' dblimit='{:.2}' />\n",
+                "\t<Strip index='{}' mute='{}' vaio='{}' solo='{}' mono='{}' muc='{}' prg_c='{}' prg_g='{}' busa='{}' busa2='{}' busa3='{}' busb='{}' busb2='{}' busb3='{}' karaoke='{}' dblevel='{:.2}' dblimit='{:.2}' />\n",
                 i + 1,
                 flags & 1,
                 (flags >> 30) & 1,
@@ -2642,6 +2656,7 @@ impl MixerApp {
                 (flags >> 14) & 1,
                 (flags >> 16) & 1,
                 (flags >> 17) & 1,
+                (flags >> 18) & 1,
                 s.karaoke,
                 s.gain_db,
                 s.limit
@@ -3218,7 +3233,7 @@ impl MixerApp {
                     }
                 }
                 if std::env::args().any(|arg| arg == "--bus-demo") {
-                    self.tape.route = [false, false, false, true, true];
+                    self.tape.route = [false, false, false, true, true, false];
                     self.select_demo(DemoKind::Track1);
                     self.on_transport(Transport::Play);
                 }
@@ -3259,7 +3274,7 @@ impl MixerApp {
                 && !name.eq_ignore_ascii_case("No input device found")
                 && !name.eq_ignore_ascii_case("No device");
             if !has_device {
-                self.strips[i].route = [false; 5];
+                self.strips[i].route = [false; audio::MAX_BUSES];
             }
         }
     }
@@ -3521,7 +3536,10 @@ impl MixerApp {
             if let Some(v) = bool_attr(attrs, "prg_g") {
                 s.gate_prg = v;
             }
-            for (n, name) in ["busa", "busa2", "busa3", "busb", "busb2"].iter().enumerate() {
+            for (n, name) in ["busa", "busa2", "busa3", "busb", "busb2", "busb3"]
+                .iter()
+                .enumerate()
+            {
                 if let Some(v) = bool_attr(attrs, name) {
                     s.route[n] = v;
                 }
@@ -3598,7 +3616,7 @@ impl MixerApp {
             let Some(idx) = xml_attr(attrs, "index").and_then(|v| v.parse::<usize>().ok()) else {
                 continue;
             };
-            if !(1..=5).contains(&idx) {
+            if !(1..=audio::MAX_BUSES).contains(&idx) {
                 continue;
             }
             let i = idx - 1;
@@ -3636,7 +3654,7 @@ impl MixerApp {
             let Some(idx) = xml_attr(attrs, "index").and_then(|v| v.parse::<usize>().ok()) else {
                 continue;
             };
-            if !(1..=5).contains(&idx) {
+            if !(1..=audio::MAX_BUSES).contains(&idx) {
                 continue;
             }
             let b = &mut self.buses[idx - 1];
@@ -3846,7 +3864,7 @@ impl MixerApp {
         }
         for (attrs, _body) in xml_elements(text, "OutputDev") {
             if let Some(idx) = xml_attr(attrs, "index").and_then(|v| v.parse::<usize>().ok()) {
-                if (1..=5).contains(&idx) {
+                if (1..=audio::MAX_BUSES).contains(&idx) {
                     if let Some(name) = xml_attr(attrs, "name") {
                         let name = xml_unescape(&name);
                         if name == "-" {
@@ -3997,7 +4015,7 @@ impl MixerApp {
         strip.kind = StripKind::Virtual;
         strip.name = format!("VIRTUAL {}", idx - 2);
         strip.device = "No input".to_string();
-        strip.route = [true, false, false, false, false];
+        strip.route = std::array::from_fn(|bus| bus == 0);
         strip.tape_feed = false;
         self.strips[idx] = strip;
         self.captures[idx] = None;
@@ -4331,10 +4349,11 @@ impl MixerApp {
                         };
                     }
                     "route" => {
-                        let vals: Vec<u8> = value.split(',').filter_map(|p| p.parse().ok()).collect();
-                        if vals.len() == 5 {
-                            for j in 0..5 {
-                                s.route[j] = vals[j] == 1;
+                        let vals: Vec<u8> =
+                            value.split(',').filter_map(|p| p.parse().ok()).collect();
+                        if vals.len() == 5 || vals.len() == audio::MAX_BUSES {
+                            for j in 0..audio::MAX_BUSES {
+                                s.route[j] = vals.get(j).copied().unwrap_or(0) == 1;
                             }
                         }
                     }
@@ -4397,7 +4416,7 @@ impl MixerApp {
             self.audio.detach_input(i);
         }
         self.audio.set_strip_count(BASE_STRIPS);
-        self.buses = (0..5).map(Bus::new).collect();
+        self.buses = (0..audio::MAX_BUSES).map(Bus::new).collect();
         self.audio.unload();
         self.tape = Tape::new();
         self.tape_error = None;
@@ -5515,8 +5534,9 @@ impl MixerApp {
                 self.announce_route(idx, i, next);
             }
         }
-        let bw2 = (w - g) / 2.0;
-        for i in 3..5 {
+        let virtual_buses = (audio::MAX_BUSES - 3) as f32;
+        let bw2 = (w - g * (virtual_buses - 1.0)) / virtual_buses;
+        for i in 3..audio::MAX_BUSES {
             let r = Rect::from_min_size(
                 Pos2::new(inner.left() + (i - 3) as f32 * (bw2 + g), y + 18.0),
                 Vec2::new(bw2, 16.0),
@@ -5746,7 +5766,7 @@ impl MixerApp {
                 ui.painter(),
                 &if !self.buses[idx].device.trim().is_empty() {
                     self.buses[idx].device.clone()
-                } else if idx >= 3 {
+                } else if idx == 3 || idx == 4 {
                     // Unset B1/B2 keep their automatic wiring; say which cable
                     // that is so the empty state is not read as "off".
                     if self.driver_mode {
@@ -5771,7 +5791,7 @@ impl MixerApp {
             self.bus_rename_text = self.buses[idx].name.clone();
             self.bus_rename_focus = true;
         }
-        let _ = hresp.on_hover_text(if idx >= 3 {
+        let _ = hresp.on_hover_text(if idx == 3 || idx == 4 {
             "Click to choose the output device for this bus; leave it unset to use the \
              automatic virtual cable. Double-click the title to rename the bus."
         } else {
@@ -6923,7 +6943,7 @@ impl MixerApp {
                         self.captures[strip] = None;
                         self.audio.detach_input(strip);
                         self.strips[strip].device = "No input".to_string();
-                        self.strips[strip].route = [false; 5];
+                        self.strips[strip].route = [false; audio::MAX_BUSES];
                     }
 
                     ui.separator();
@@ -6937,7 +6957,7 @@ impl MixerApp {
                         .size(9.0)
                         .color(FAINT),
                     );
-                    let bus_labels = ["A1", "A2", "A3", "B1", "B2"];
+                    let bus_labels = ["A1", "A2", "A3", "B1", "B2", "B3"];
                     let mut remove = None;
                     for (index, out) in self.vban_out.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
@@ -7944,7 +7964,7 @@ impl MixerApp {
                                         self.strips[i].device = "No input".to_string();
                                         self.strips[i].meter = 0.0;
                                         self.strips[i].peak = 0.0;
-                                        self.strips[i].route = [false; 5];
+                                        self.strips[i].route = [false; audio::MAX_BUSES];
                                         self.strips[i].tape_feed = false;
                                         self.toast("Input closed - meter stays at silence");
                                     } else if i >= 3
@@ -8002,7 +8022,7 @@ impl MixerApp {
                                             self.strips[i].device = d.clone();
                                             self.strips[i].meter = 0.0;
                                             self.strips[i].peak = 0.0;
-                                            self.strips[i].route = [false; 5];
+                                            self.strips[i].route = [false; audio::MAX_BUSES];
                                             self.strips[i].tape_feed = false;
                                             self.toast_for(
                                                 format!("Could not open {d}: {reason}"),
@@ -8661,7 +8681,8 @@ impl eframe::App for MixerApp {
                 self.strip_bank = self.strip_bank.min(last_bank);
 
                 let total_w = rect.width() - pad * 2.0 - gap * 9.0 - gap_mid;
-                let card_w = (total_w / 10.0).floor().max(60.0);
+                let card_w =
+                    (total_w / (10.0 + (audio::MAX_BUSES - 5) as f32)).floor().max(60.0);
                 let top = bank_top + bank_h + 4.0;
                 let h = rect.bottom() - top - 5.0;
                 let start = Self::bank_start(self.strip_bank);
@@ -8703,7 +8724,7 @@ impl eframe::App for MixerApp {
                     x += card_w + gap;
                 }
                 x += gap_mid - gap;
-                for i in 0..5 {
+                for i in 0..audio::MAX_BUSES {
                     let card = Rect::from_min_size(Pos2::new(x, top), Vec2::new(card_w, h));
                     self.draw_bus_card(ui, card, i);
                     x += card_w + gap;

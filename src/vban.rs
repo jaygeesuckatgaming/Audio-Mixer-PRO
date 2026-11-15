@@ -566,7 +566,7 @@ impl VbanSender {
             })
             .map_err(|err| format!("could not start VBAN sender: {err}"))?;
         Ok(Self {
-            bus: config.bus.min(4),
+            bus: config.bus.min(5),
             local_port,
             tx,
             stop,

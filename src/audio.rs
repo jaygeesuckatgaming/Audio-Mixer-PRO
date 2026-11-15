@@ -527,11 +527,15 @@ impl Source {
 /// Strip routing bits from FUN_0052b490: busa -> 0x1000, busa2 -> 0x2000,
 /// busa3 -> 0x4000, busb -> 0x10000, busb2 -> 0x20000. The button handler
 /// FUN_0053e7b0 toggles the same bits (masks at 0x584e78 and 0x584e98).
+/// A1-A3, B1-B3. Every bus has its own fader, EQ and output device.
+pub const MAX_BUSES: usize = 6;
+
 pub const STRIP_ROUTE_A1: u32 = 4096; // 0x1000
 pub const STRIP_ROUTE_A2: u32 = 8192; // 0x2000
 pub const STRIP_ROUTE_A3: u32 = 16384; // 0x4000
 pub const STRIP_ROUTE_B1: u32 = 65536; // 0x10000
 pub const STRIP_ROUTE_B2: u32 = 131072; // 0x20000
+pub const STRIP_ROUTE_B3: u32 = 262144; // 0x40000
 
 fn strip_route_mask(index: usize) -> u32 {
     match index {
@@ -539,7 +543,8 @@ fn strip_route_mask(index: usize) -> u32 {
         1 => STRIP_ROUTE_A2,
         2 => STRIP_ROUTE_A3,
         3 => STRIP_ROUTE_B1,
-        _ => STRIP_ROUTE_B2,
+        4 => STRIP_ROUTE_B2,
+        _ => STRIP_ROUTE_B3,
     }
 }
 
@@ -587,18 +592,18 @@ struct Shared {
     loop_playback: AtomicBool,
     finished: AtomicBool,
     sample_rate: AtomicU32,
-    bus_gain_db: [AtomicU32; 5],
-    bus_mute: [AtomicBool; 5],
-    bus_mono: [AtomicU8; 5],
-    bus_eq_on: [AtomicBool; 5],
-    bus_eq_gain: [[AtomicU32; 6]; 5],
+    bus_gain_db: [AtomicU32; MAX_BUSES],
+    bus_mute: [AtomicBool; MAX_BUSES],
+    bus_mono: [AtomicU8; MAX_BUSES],
+    bus_eq_on: [AtomicBool; MAX_BUSES],
+    bus_eq_gain: [[AtomicU32; 6]; MAX_BUSES],
     /// B1 and B2 feed the capture endpoint of two USB cables. The console
     /// binds cables 1 and 2 when the virtual-cable server is running.
     virtual_outputs: Mutex<[Option<Arc<Device>>; 2]>,
     /// A1/A2/A3 output rings. The internal mixer writes each bus mix here and
     /// the per-bus output streams replay it on their own devices.
-    bus_out_rings: [Mutex<VecDeque<(f32, f32)>>; 5],
-    bus_out_active: [AtomicBool; 5],
+    bus_out_rings: [Mutex<VecDeque<(f32, f32)>>; MAX_BUSES],
+    bus_out_active: [AtomicBool; MAX_BUSES],
     /// Frames rendered per mixer callback.
     mixer_block: AtomicU32,
     /// Outgoing VBAN streams: (bus index, sender ring).
@@ -623,7 +628,7 @@ struct Shared {
     peak: AtomicU32,
     /// Post-fader peak of each bus, before the A1 device and after B1/B2 are
     /// injected into their cables.
-    bus_peak: [AtomicU32; 5],
+    bus_peak: [AtomicU32; MAX_BUSES],
     /// Last A1 callback size and fraction of its period spent in the callback.
     callback_frames: AtomicUsize,
     callback_load: AtomicU32,
@@ -807,12 +812,12 @@ impl Biquad {
 }
 
 struct Dsp {
-    eq_l: [[Biquad; 6]; 5],
-    eq_r: [[Biquad; 6]; 5],
-    eq_on: [bool; 5],
-    eq_gain: [[f32; 6]; 5],
-    eq_ready: [bool; 5],
-    gain: [f32; 5],
+    eq_l: [[Biquad; 6]; MAX_BUSES],
+    eq_r: [[Biquad; 6]; MAX_BUSES],
+    eq_on: [bool; MAX_BUSES],
+    eq_gain: [[f32; 6]; MAX_BUSES],
+    eq_ready: [bool; MAX_BUSES],
+    gain: [f32; MAX_BUSES],
     readers: [InputReader; MAX_STRIPS],
     // Each input strip is read as a block so its own VST insert can process it
     // before the mix. The per-strip buffers keep their capacity across
@@ -824,8 +829,8 @@ struct Dsp {
     vst_ready: [bool; MAX_STRIPS],
     // B1/B2 are rendered alongside A1 and handed to their virtual cable's
     // capture endpoint as PCM, so other applications can record them.
-    out_bus_l: [Vec<f32>; 5],
-    out_bus_r: [Vec<f32>; 5],
+    out_bus_l: [Vec<f32>; MAX_BUSES],
+    out_bus_r: [Vec<f32>; MAX_BUSES],
     pcm: Vec<u8>,
     /// Ducking detector envelope (linear, smoothed) and current gain (linear).
     duck_env: f32,
@@ -849,10 +854,10 @@ impl Dsp {
         Self {
             eq_l: std::array::from_fn(|_| [Biquad::identity(); 6]),
             eq_r: std::array::from_fn(|_| [Biquad::identity(); 6]),
-            eq_on: [false; 5],
-            eq_gain: [[0.0; 6]; 5],
-            eq_ready: [false; 5],
-            gain: [0.0; 5],
+            eq_on: [false; MAX_BUSES],
+            eq_gain: [[0.0; 6]; MAX_BUSES],
+            eq_ready: [false; MAX_BUSES],
+            gain: [0.0; MAX_BUSES],
             readers: std::array::from_fn(|_| InputReader::new()),
             // Allocate each strip's insert scratchpads once, before the audio
             // thread starts. The callback may shrink and regrow them up to
@@ -882,7 +887,7 @@ impl Dsp {
     }
 
     fn update_eq(&mut self, shared: &Shared, sample_rate: f32) {
-        for bus in 0..5 {
+        for bus in 0..MAX_BUSES {
             let on = shared.bus_eq_on[bus].load(Ordering::Relaxed);
             let mut gains = [0.0f32; 6];
             for (i, g) in gains.iter_mut().enumerate() {
@@ -949,11 +954,11 @@ impl Dsp {
 
         let mut active = shared.playing.load(Ordering::Relaxed);
         let tape_route = shared.route.load(Ordering::Relaxed);
-        let mut bus_target = [0.0f32; 5];
-        let mut bus_mute = [false; 5];
-        let mut bus_mono = [0u8; 5];
-        let mut bus_eq_on = [false; 5];
-        for b in 0..5 {
+        let mut bus_target = [0.0f32; MAX_BUSES];
+        let mut bus_mute = [false; MAX_BUSES];
+        let mut bus_mono = [0u8; MAX_BUSES];
+        let mut bus_eq_on = [false; MAX_BUSES];
+        for b in 0..MAX_BUSES {
             bus_mute[b] = shared.bus_mute[b].load(Ordering::Relaxed);
             bus_target[b] = if bus_mute[b] {
                 0.0
@@ -977,7 +982,7 @@ impl Dsp {
         let mut peak = 0.0f32;
         let mut source_peak = 0.0f32;
         let mut strip_peak = [0.0f32; MAX_STRIPS];
-        let mut bus_peak = [0.0f32; 5];
+        let mut bus_peak = [0.0f32; MAX_BUSES];
 
         // Snapshot the routing/gain settings once per callback. The UI writes
         // them at frame rate; reading them here keeps the mix in step.
@@ -1006,7 +1011,8 @@ impl Dsp {
                     | STRIP_ROUTE_A2
                     | STRIP_ROUTE_A3
                     | STRIP_ROUTE_B1
-                    | STRIP_ROUTE_B2)
+                    | STRIP_ROUTE_B2
+                    | STRIP_ROUTE_B3)
                 != 0;
             let muted = (strip_flags[i] & 1) != 0;
             let solo = (strip_flags[i] & 2) != 0;
@@ -1112,14 +1118,14 @@ impl Dsp {
         {
             let source_guard = lock_source(&shared.source);
             let source = source_guard.as_ref();
-            for bus in 0..5 {
+            for bus in 0..MAX_BUSES {
                 self.out_bus_l[bus].resize(frames, 0.0);
                 self.out_bus_r[bus].resize(frames, 0.0);
             }
 
             for (frame_no, frame) in data.chunks_mut(channels.max(1)).enumerate() {
-                let mut bus_l = [0.0f32; 5];
-                let mut bus_r = [0.0f32; 5];
+                let mut bus_l = [0.0f32; MAX_BUSES];
+                let mut bus_r = [0.0f32; MAX_BUSES];
 
                 // Tape deck -> its own routing row. The source peak is measured
                 // whenever the deck plays, so the virtual input strip can meter
@@ -1346,10 +1352,14 @@ impl Dsp {
                         bus_l[4] += sl;
                         bus_r[4] += sr;
                     }
+                    if strip_route[i] & STRIP_ROUTE_B3 != 0 {
+                        bus_l[5] += sl;
+                        bus_r[5] += sr;
+                    }
                 }
 
                 // Each bus has its own EQ, fader, mute and mono stage.
-                for b in 0..5 {
+                for b in 0..MAX_BUSES {
                     let mut l = bus_l[b];
                     let mut r = bus_r[b];
                     if bus_eq_on[b] {
@@ -1396,7 +1406,7 @@ impl Dsp {
                     *out = T::from_sample(v);
                 }
 
-                for bus in 0..5 {
+                for bus in 0..MAX_BUSES {
                     self.out_bus_l[bus][frame_no] = bus_l[bus];
                     self.out_bus_r[bus][frame_no] = bus_r[bus];
                 }
@@ -1423,7 +1433,7 @@ impl Dsp {
         // Publish the A2/A3 bus mixes for their output streams. The rings are
         // bounded: if a secondary device runs slower, its oldest frames are
         // dropped instead of letting latency grow.
-        for b in 0..5 {
+        for b in 0..MAX_BUSES {
             if !shared.bus_out_active[b].load(Ordering::Relaxed) {
                 continue;
             }
@@ -1475,7 +1485,7 @@ impl Dsp {
         for i in 0..strip_count {
             shared.strip_peak[i].store(strip_peak[i].to_bits(), Ordering::Relaxed);
         }
-        for b in 0..5 {
+        for b in 0..MAX_BUSES {
             shared.bus_peak[b].store(bus_peak[b].to_bits(), Ordering::Relaxed);
         }
         self.write_virtual_outputs(shared, frames);
@@ -1595,10 +1605,10 @@ pub struct AudioEngine {
     mixer_block: usize,
     /// Output streams for A1, A2, A3 and (in driver mode) B1, B2. Each
     /// consumes its own bus ring.
-    bus_streams: [Option<cpal::Stream>; 5],
-    bus_device_names: [String; 5],
-    bus_retry_at: [Option<std::time::Instant>; 5],
-    bus_last_request: [String; 5],
+    bus_streams: [Option<cpal::Stream>; MAX_BUSES],
+    bus_device_names: [String; MAX_BUSES],
+    bus_retry_at: [Option<std::time::Instant>; MAX_BUSES],
+    bus_last_request: [String; MAX_BUSES],
 }
 
 impl AudioEngine {
@@ -1712,7 +1722,7 @@ impl AudioEngine {
     pub fn stop_stream(&mut self) {
         self.stop_mixer();
         self.pending_start = None;
-        for b in 0..5 {
+        for b in 0..MAX_BUSES {
             self.bus_streams[b] = None;
             self.bus_device_names[b].clear();
             self.bus_retry_at[b] = None;
@@ -1856,7 +1866,7 @@ impl AudioEngine {
             .store(loop_playback, Ordering::Relaxed);
     }
 
-    pub fn set_tape(&self, gain_db: f32, route: [bool; 5]) {
+    pub fn set_tape(&self, gain_db: f32, route: [bool; MAX_BUSES]) {
         self.shared
             .gain_db
             .store(gain_db.to_bits(), Ordering::Relaxed);
@@ -1961,7 +1971,7 @@ impl AudioEngine {
     /// each bus ring; these streams replay it on the selected devices. Cheap to
     /// call every frame: it only acts when a device name changed or a previous
     /// attempt is ready to retry.
-    pub fn set_bus_outputs(&mut self, names_in: [&str; 5]) {
+    pub fn set_bus_outputs(&mut self, names_in: [&str; MAX_BUSES]) {
         if !self.available || self.sample_rate == 0 {
             return;
         }
@@ -1973,20 +1983,20 @@ impl AudioEngine {
         self.set_bus_outputs_with(&probed, names_in);
     }
 
-    pub fn set_bus_outputs_with(&mut self, available: &[String], names_in: [&str; 5]) {
+    pub fn set_bus_outputs_with(&mut self, available: &[String], names_in: [&str; MAX_BUSES]) {
         if !self.available || self.sample_rate == 0 {
             return;
         }
         let requested = names_in;
         let now = std::time::Instant::now();
-        let same_request = (0..5).all(|b| {
+        let same_request = (0..MAX_BUSES).all(|b| {
             self.bus_last_request[b].eq_ignore_ascii_case(requested[b])
         });
         if same_request {
             // A bus that never opened must keep being retried: its name may
             // only appear once Windows finishes enumerating the device, and a
             // bus that never opened has no retry deadline yet.
-            let retry_due = (0..5).any(|b| {
+            let retry_due = (0..MAX_BUSES).any(|b| {
                 self.bus_streams[b].is_none()
                     && !requested[b].is_empty()
                     && (self.bus_device_names[b].is_empty()
@@ -1999,7 +2009,7 @@ impl AudioEngine {
                 return;
             }
         }
-        for b in 0..5 {
+        for b in 0..MAX_BUSES {
             self.bus_last_request[b] = requested[b].to_string();
         }
 
@@ -2030,7 +2040,7 @@ impl AudioEngine {
         };
         let wanted = requested.map(resolve);
 
-        for b in 0..5 {
+        for b in 0..MAX_BUSES {
             let desired = wanted[b].clone();
             if self.bus_streams[b].is_some() {
                 if desired.as_deref() == Some(self.bus_device_names[b].as_str()) {
@@ -2182,7 +2192,7 @@ impl AudioEngine {
         mute: bool,
         solo: bool,
         mono: bool,
-        route: [bool; 5],
+        route: [bool; MAX_BUSES],
         any_solo: bool,
     ) {
         if index >= MAX_STRIPS {
@@ -3682,7 +3692,7 @@ pub fn selftest() {
         println!("demo {} peak={peak:.3} rms={rms:.3}", kind.file_name());
     }
     engine.load_demo(DemoKind::Track1);
-    engine.set_tape(-18.0, [true, false, false, false, false]);
+    engine.set_tape(-18.0, [true, false, false, false, false, false]);
     engine.set_bus(0, 0.0, false, 0, true, [0.0; 6]);
     engine.play();
     std::thread::sleep(std::time::Duration::from_millis(1600));
@@ -3766,7 +3776,7 @@ pub fn wav_selftest() {
                 info.duration,
                 info.detail()
             );
-            engine.set_tape(-6.0, [true, false, false, false, false]);
+            engine.set_tape(-6.0, [true, false, false, false, false, false]);
             engine.set_bus(0, 0.0, false, 0, true, [0.0; 6]);
             engine.play();
             std::thread::sleep(std::time::Duration::from_millis(1200));
