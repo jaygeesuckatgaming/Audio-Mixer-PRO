@@ -6518,15 +6518,6 @@ impl MixerApp {
                             self.show_vban = true;
                             close = true;
                         }
-                        if menu_item(right, "VBAN Chat Room...", "Ctrl+2", true) {
-                            self.show_info = Some((
-                                "VBAN Chat Room".to_string(),
-                                "VBAN networking is not part of this control-surface \
-                                 rebuild."
-                                    .to_string(),
-                            ));
-                            close = true;
-                        }
                         if menu_item(right, "Check Driver Installation...", "", true) {
                             self.show_info = Some((
                                 "Check Driver Installation".to_string(),
