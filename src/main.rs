@@ -956,6 +956,9 @@ struct MixerApp {
     bus_rename: Option<usize>,
     bus_rename_text: String,
     bus_rename_focus: bool,
+    /// Last inner size in points while the window is not maximized, saved so
+    /// the console reopens at the size it was left at.
+    window_size: Option<[f32; 2]>,
     show_vban: bool,
     vban: vban::VbanHub,
     vban_enabled: bool,
@@ -1348,6 +1351,8 @@ impl MixerApp {
         shot_path: Option<PathBuf>,
         startup_demo: Option<usize>,
     ) -> Self {
+        cc.egui_ctx
+            .options_mut(|options| options.zoom_with_keyboard = true);
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BG;
         visuals.window_fill = PANEL;
@@ -1468,6 +1473,7 @@ impl MixerApp {
             bus_rename: None,
             bus_rename_text: String::new(),
             bus_rename_focus: false,
+            window_size: None,
             show_vban: false,
             vban: vban::VbanHub::new(),
             vban_enabled: false,
@@ -2758,6 +2764,13 @@ impl MixerApp {
                 b.eq[5].gain
             ));
         }
+        if let Some([w, h]) = self.window_size {
+            text.push_str(&format!(
+                "\t<Window width='{:.1}' height='{:.1}' />\n",
+                w.clamp(800.0, 5000.0),
+                h.clamp(500.0, 4000.0)
+            ));
+        }
         text.push_str("</AudioMixerProParameters>\n");
         text.push_str("<AudioMixerProRecorder>\n");
         // The tape deck's end-of-file action is the recorder Loop flag
@@ -3461,6 +3474,17 @@ impl MixerApp {
             if let Some(name) = label {
                 if !name.is_empty() {
                     b.name = name;
+                }
+            }
+        }
+
+        // Window size written by this rebuild; the original ignores it.
+        if let Some((attrs, _)) = xml_elements(text, "Window").first() {
+            let width = xml_attr(attrs, "width").and_then(|v| v.parse::<f32>().ok());
+            let height = xml_attr(attrs, "height").and_then(|v| v.parse::<f32>().ok());
+            if let (Some(width), Some(height)) = (width, height) {
+                if (400.0..=8000.0).contains(&width) && (300.0..=8000.0).contains(&height) {
+                    self.window_size = Some([width, height]);
                 }
             }
         }
@@ -4422,6 +4446,8 @@ impl MixerApp {
         bx -= 28.0;
         let min_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
         bx -= 28.0;
+        let max_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
+        bx -= 28.0;
         let help_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
         bx -= 28.0;
         let lock_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
@@ -4440,8 +4466,8 @@ impl MixerApp {
             Vec2::new(76.0, 24.0),
         );
         let button_hits = [
-            menu_hit, vban_hit, cables_hit, ducking_hit, close_hit, min_hit, help_hit, lock_hit,
-            r_hit, a_hit,
+            menu_hit, vban_hit, cables_hit, ducking_hit, close_hit, min_hit, max_hit, help_hit,
+            lock_hit, r_hit, a_hit,
         ];
         let drag_strip = Rect::from_min_max(
             rect.min,
@@ -4522,6 +4548,12 @@ impl MixerApp {
         let min = Rect::from_min_size(Pos2::new(x - 24.0, rect.top() + 7.0), Vec2::new(24.0, 24.0));
         if top_button(ui, min, "_", false, BLUE) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        x -= 28.0;
+        let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+        if top_icon_button(ui, max_hit, maximized) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
         }
         x -= 28.0;
         let help = Rect::from_min_size(Pos2::new(x - 24.0, rect.top() + 7.0), Vec2::new(24.0, 24.0));
@@ -6298,6 +6330,40 @@ impl MixerApp {
     // -----------------------------------------------------------------------
     // Menu popup
     // -----------------------------------------------------------------------
+
+    /// Bottom-right resize grip. The window is undecorated, so the OS has no
+    /// border to grab; this asks winit to start an interactive resize instead.
+    fn draw_resize_grip(&mut self, ctx: &egui::Context) {
+        let corner = ctx.screen_rect().right_bottom();
+        let size = 18.0;
+        egui::Area::new(egui::Id::new("resize_grip"))
+            .fixed_pos(egui::pos2(corner.x - size, corner.y - size))
+            .order(egui::Order::Tooltip)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::drag());
+                if response.hovered() || response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                }
+                if response.drag_started() {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                            egui::ResizeDirection::SouthEast,
+                        ));
+                }
+                let painter = ui.painter();
+                for i in 0..3 {
+                    let offset = 5.0 + i as f32 * 4.0;
+                    painter.line_segment(
+                        [
+                            Pos2::new(rect.right() - offset, rect.bottom() - 3.0),
+                            Pos2::new(rect.right() - 3.0, rect.bottom() - offset),
+                        ],
+                        Stroke::new(1.0, FAINT),
+                    );
+                }
+            });
+    }
 
     fn draw_menu(&mut self, ctx: &egui::Context) {
         if !self.menu_open {
@@ -8387,6 +8453,18 @@ impl eframe::App for MixerApp {
         }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         self.time += dt as f64;
+
+        // Remember the window size for the next run. Maximized sizes are
+        // ignored so Restore returns to the last manual size.
+        let viewport = ctx.input(|i| i.viewport().clone());
+        if viewport.maximized != Some(true) {
+            if let Some(inner) = viewport.inner_rect {
+                let (w, h) = (inner.width(), inner.height());
+                if w >= 400.0 && h >= 300.0 {
+                    self.window_size = Some([w, h]);
+                }
+            }
+        }
         self.advance_startup(dt as f64);
         self.poll_vst_scan();
         // Keep every open plug-in window alive (resize requests and its close
@@ -8615,6 +8693,7 @@ impl eframe::App for MixerApp {
         self.draw_menu(ctx);
         self.draw_dialogs(ctx);
         self.sync_audio_controls();
+        self.draw_resize_grip(ctx);
         self.handle_shot(ctx);
 
         // 60 fps so the smoothed meters move continuously; the original's
@@ -8626,6 +8705,36 @@ impl eframe::App for MixerApp {
 // ---------------------------------------------------------------------------
 // Widgets
 // ---------------------------------------------------------------------------
+
+/// Square-outline icon button used for maximize/restore in the title bar.
+fn top_icon_button(ui: &egui::Ui, rect: Rect, maximized: bool) -> bool {
+    let resp = ui.interact(rect, Id::new("topbtn_max"), Sense::click());
+    let fill = if resp.hovered() {
+        PANEL_HI
+    } else {
+        Color32::from_rgb(27, 31, 38)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, fill);
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0, LINE));
+    let center = rect.center();
+    if maximized {
+        // Restore: two overlapping squares.
+        let back = Rect::from_center_size(center + Vec2::new(1.5, -1.5), Vec2::splat(8.0));
+        painter.rect_stroke(back, 1.0, Stroke::new(1.0, TEXT));
+        let front = Rect::from_center_size(center + Vec2::new(-1.5, 1.5), Vec2::splat(8.0));
+        painter.rect_filled(front, 1.0, fill);
+        painter.rect_stroke(front, 1.0, Stroke::new(1.0, TEXT));
+    } else {
+        painter.rect_stroke(
+            Rect::from_center_size(center, Vec2::splat(9.0)),
+            1.0,
+            Stroke::new(1.0, TEXT),
+        );
+    }
+    resp.on_hover_text(if maximized { "Restore" } else { "Maximize" })
+        .clicked()
+}
 
 fn top_button(ui: &egui::Ui, rect: Rect, label: &str, active: bool, accent: Color32) -> bool {
     let resp = ui.interact(rect, Id::new(("topbtn", label)), Sense::click());
@@ -9590,6 +9699,20 @@ fn window_icon() -> Option<egui::IconData> {
 
 /// Sidecar diagnostics. The console is a GUI-subsystem binary, so a panic or a
 /// hang would otherwise leave no trace at all.
+/// Window size stored by the previous run, if any. Read before the viewport is
+/// built so the console opens at the size it was left at.
+fn load_saved_window_size() -> Option<[f32; 2]> {
+    let text = std::fs::read_to_string(settings_canonical_path()).ok()?;
+    let (attrs, _) = xml_elements(&text, "Window").into_iter().next()?;
+    let width = xml_attr(&attrs, "width")?.parse::<f32>().ok()?;
+    let height = xml_attr(&attrs, "height")?.parse::<f32>().ok()?;
+    if (400.0..=8000.0).contains(&width) && (300.0..=8000.0).contains(&height) {
+        Some([width, height])
+    } else {
+        None
+    }
+}
+
 fn diag_path(name: &str) -> PathBuf {
     settings_canonical_path().with_file_name(name)
 }
@@ -9897,19 +10020,25 @@ fn main() -> eframe::Result<()> {
         .unwrap_or(1.0);
     diag_log(format!("main: ui zoom {zoom}"));
 
+    // Reopen at the size the user left, when a previous run saved one.
+    let saved_size = load_saved_window_size();
+    let min_size = [860.0 * zoom, 540.0 * zoom];
+    let initial_size = saved_size
+        .map(|[w, h]| [w.max(min_size[0]), h.max(min_size[1])])
+        .unwrap_or([1024.0 * zoom, 620.0 * zoom]);
+
     let mut viewport = egui::ViewportBuilder::default()
-        // The console is a fixed-size window: zooming the UI without growing
-        // the window would clip the extra content, so both scale together.
-        .with_inner_size([1024.0 * zoom, 620.0 * zoom])
+        .with_inner_size(initial_size)
+        .with_min_inner_size(min_size)
         // An undecorated window can come up minimized or off-screen when the
         // desktop size changed (for example after a VM display resize), so pin
         // a visible spot and ask for focus.
         .with_position(egui::pos2(40.0, 40.0))
         .with_visible(true)
         .with_active(true)
-        // The original is a fixed-size borderless popup (style 0x82020000,
-        // no WS_THICKFRAME), so the console cannot be resized.
-        .with_resizable(false)
+        // Borderless, but resizable from the corner grip (and the top-bar
+        // maximize button); the layout reflows with the window.
+        .with_resizable(true)
         .with_decorations(false)
         .with_transparent(false)
         .with_title("Audio Mixer Pro");
