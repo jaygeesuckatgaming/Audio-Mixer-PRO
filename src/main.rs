@@ -2429,8 +2429,8 @@ impl MixerApp {
         // real level that the routed strips (and the tape deck) would send
         // through their own fader, so a strip's A2/A3/B1/B2 button visibly
         // does something even though only A1 is opened.
-        let mut bus_source = [0.0f32; 5];
-        for bi in 1..5 {
+        let mut bus_source = [0.0f32; audio::MAX_BUSES];
+        for bi in 1..audio::MAX_BUSES {
             let mut sum = 0.0f32;
             for (si, s) in self.strips.iter().take(self.active_strips).enumerate() {
                 if !s.route[bi] || s.mute || (any_solo && !s.solo) {
@@ -2449,13 +2449,8 @@ impl MixerApp {
             }
             bus_source[bi] = sum;
         }
-        let bus_peaks = [
-            self.audio.bus_peak(0),
-            self.audio.bus_peak(1),
-            self.audio.bus_peak(2),
-            self.audio.bus_peak(3),
-            self.audio.bus_peak(4),
-        ];
+        let bus_peaks: [f32; audio::MAX_BUSES] =
+            std::array::from_fn(|bus| self.audio.bus_peak(bus));
         for (bi, b) in self.buses.iter_mut().enumerate() {
             let mut target = if bi == 0 {
                 // The A1 meter is the level measured at the real output, so it
@@ -6132,8 +6127,8 @@ impl MixerApp {
 
         // tape routing
         let mut rx = inner.left() + 495.0;
-        for i in 0..5 {
-            let r = Rect::from_min_size(Pos2::new(rx, by), Vec2::new(25.0, 20.0));
+        for i in 0..audio::MAX_BUSES {
+            let r = Rect::from_min_size(Pos2::new(rx, by), Vec2::new(22.0, 20.0));
             let label = format!("{}{}", if i < 3 { "A" } else { "B" }, if i < 3 { i + 1 } else { i - 2 });
             let route = self.tape.route[i];
             let (clicked, _) = chip(
@@ -6149,7 +6144,7 @@ impl MixerApp {
             if clicked {
                 self.tape.route[i] = !route;
             }
-            rx += 28.0;
+            rx += 24.0;
         }
 
         // tape gain
