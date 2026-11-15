@@ -1967,9 +1967,10 @@ impl AudioEngine {
         }
         // Called from the UI thread: use the device list the probe thread
         // already produced instead of enumerating here, because enumeration
-        // blocks while the cables are being re-enumerated.
-        let available = AudioEngine::output_devices();
-        self.set_bus_outputs_with(&available, names_in);
+        // blocks while the cables are being re-enumerated. An empty list means
+        // the probe has not run yet, and then enumerating is the only option.
+        let probed = AudioEngine::output_devices();
+        self.set_bus_outputs_with(&probed, names_in);
     }
 
     pub fn set_bus_outputs_with(&mut self, available: &[String], names_in: [&str; 5]) {
@@ -1982,13 +1983,17 @@ impl AudioEngine {
             self.bus_last_request[b].eq_ignore_ascii_case(requested[b])
         });
         if same_request {
+            // A bus that never opened must keep being retried: its name may
+            // only appear once Windows finishes enumerating the device, and a
+            // bus that never opened has no retry deadline yet.
             let retry_due = (0..5).any(|b| {
                 self.bus_streams[b].is_none()
-                    && !self.bus_device_names[b].is_empty()
-                    && self
-                        .bus_retry_at[b]
-                        .map(|at| now >= at)
-                        .unwrap_or(true)
+                    && !requested[b].is_empty()
+                    && (self.bus_device_names[b].is_empty()
+                        || self
+                            .bus_retry_at[b]
+                            .map(|at| now >= at)
+                            .unwrap_or(true))
             });
             if !retry_due {
                 return;
