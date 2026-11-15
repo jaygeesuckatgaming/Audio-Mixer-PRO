@@ -952,6 +952,10 @@ struct MixerApp {
     show_audio_stats: bool,
     duck: Ducking,
     show_ducking: bool,
+    /// Bus rename dialog: which bus is being edited and the draft name.
+    bus_rename: Option<usize>,
+    bus_rename_text: String,
+    bus_rename_focus: bool,
     show_vban: bool,
     vban: vban::VbanHub,
     vban_enabled: bool,
@@ -1461,6 +1465,9 @@ impl MixerApp {
             show_audio_stats: false,
             duck: Ducking::default(),
             show_ducking: false,
+            bus_rename: None,
+            bus_rename_text: String::new(),
+            bus_rename_focus: false,
             show_vban: false,
             vban: vban::VbanHub::new(),
             vban_enabled: false,
@@ -5719,10 +5726,16 @@ impl MixerApp {
         if hresp.clicked() && enabled {
             self.picker = Some(Picker::Bus(idx));
         }
+        if hresp.double_clicked() && enabled {
+            self.bus_rename = Some(idx);
+            self.bus_rename_text = self.buses[idx].name.clone();
+            self.bus_rename_focus = true;
+        }
         let _ = hresp.on_hover_text(if idx >= 3 {
-            "Click to choose the output device for this bus; leave it unset to use the automatic virtual cable"
+            "Click to choose the output device for this bus; leave it unset to use the \
+             automatic virtual cable. Double-click the title to rename the bus."
         } else {
-            "Click to choose the output device for this bus"
+            "Click to choose the output device for this bus. Double-click the title to rename it."
         });
         y += 29.0;
 
@@ -8273,6 +8286,50 @@ impl MixerApp {
                     }
                 });
             self.show_ducking = open;
+        }
+
+        if let Some(index) = self.bus_rename {
+            let mut open = true;
+            let mut close = false;
+            let current = self.buses[index].name.clone();
+            egui::Window::new("Rename bus")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(240.0)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("BUS {current}"))
+                            .size(10.0)
+                            .color(DIM),
+                    );
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.bus_rename_text)
+                            .desired_width(220.0)
+                            .char_limit(16),
+                    );
+                    if self.bus_rename_focus {
+                        edit.request_focus();
+                        self.bus_rename_focus = false;
+                    }
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.button("Rename").clicked() || enter {
+                            let name: String = self.bus_rename_text.trim().chars().take(16).collect();
+                            if !name.is_empty() {
+                                self.buses[index].name = name;
+                            }
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close || !open {
+                self.bus_rename = None;
+            }
         }
     }
 
