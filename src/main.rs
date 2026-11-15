@@ -9084,8 +9084,8 @@ fn duck_param_row(
     ui.label(egui::RichText::new(hint).size(9.0).color(DIM));
 }
 
-/// Horizontal level bar on a -60..0 dBFS scale with a draggable threshold
-/// marker. Returns true when the marker moved the threshold.
+/// Horizontal level bar on a -60..0 dBFS scale. The interactive variant owns
+/// the draggable threshold marker; the other one is a plain level display.
 fn duck_meter(
     ui: &mut egui::Ui,
     name: &str,
@@ -9126,12 +9126,16 @@ fn duck_meter(
         );
     }
 
-    let tick = ((*threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
-    let x = rect.left() + rect.width() * tick;
-    painter.line_segment(
-        [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-        Stroke::new(2.0, AMBER),
-    );
+    // Only the source meter carries the threshold marker. The target meter
+    // has none, so the two can never appear to move together.
+    if interactive {
+        let tick = ((*threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
+        let x = rect.left() + rect.width() * tick;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(2.0, AMBER),
+        );
+    }
     let _ = id_source;
 
     // Only the source meter owns the threshold marker; the target meter just
