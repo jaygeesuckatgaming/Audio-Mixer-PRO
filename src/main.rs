@@ -8188,24 +8188,38 @@ impl MixerApp {
                         .map(|i| self.audio.strip_peak(i))
                         .fold(0.0f32, f32::max);
                     let mut threshold = self.duck.threshold_db;
-                    let mut changed = duck_meter(
+                    let mut depth = self.duck.depth_db;
+                    let threshold_changed = duck_meter(
                         ui,
                         "Source Volume",
-                        "duck_source_meter",
                         source_level,
-                        &mut threshold,
-                        true,
+                        Some(DuckMarker {
+                            value: &mut threshold,
+                            bar_lo: -60.0,
+                            bar_hi: 0.0,
+                            clamp_lo: -60.0,
+                            clamp_hi: -6.0,
+                            hint: "Drag to set the threshold",
+                        }),
                     );
-                    changed |= duck_meter(
+                    let depth_changed = duck_meter(
                         ui,
                         "Target Volume",
-                        "duck_target_meter",
                         target_level,
-                        &mut threshold,
-                        false,
+                        Some(DuckMarker {
+                            value: &mut depth,
+                            bar_lo: -30.0,
+                            bar_hi: 0.0,
+                            clamp_lo: -30.0,
+                            clamp_hi: 0.0,
+                            hint: "Drag to set the depth",
+                        }),
                     );
-                    if changed {
+                    if threshold_changed {
                         self.duck.threshold_db = threshold;
+                    }
+                    if depth_changed {
+                        self.duck.depth_db = depth;
                     }
 
                     ui.separator();
@@ -9084,15 +9098,24 @@ fn duck_param_row(
     ui.label(egui::RichText::new(hint).size(9.0).color(DIM));
 }
 
-/// Horizontal level bar on a -60..0 dBFS scale. The interactive variant owns
-/// the draggable threshold marker; the other one is a plain level display.
+/// A draggable marker drawn on a level meter. `bar` is the value span the bar
+/// covers, `clamp` the range the marker may actually take.
+struct DuckMarker<'a> {
+    value: &'a mut f32,
+    bar_lo: f32,
+    bar_hi: f32,
+    clamp_lo: f32,
+    clamp_hi: f32,
+    hint: &'static str,
+}
+
+/// Horizontal level bar on a -60..0 dBFS scale with an optional draggable
+/// marker. Returns true when the marker moved its value.
 fn duck_meter(
     ui: &mut egui::Ui,
     name: &str,
-    id_source: &str,
     level: f32,
-    threshold_db: &mut f32,
-    interactive: bool,
+    marker: Option<DuckMarker<'_>>,
 ) -> bool {
     let level_db = lin_to_db(level).clamp(-60.0, 0.0);
     ui.horizontal(|ui| {
@@ -9104,7 +9127,7 @@ fn duck_meter(
         );
     });
 
-    let sense = if interactive {
+    let sense = if marker.is_some() {
         Sense::click_and_drag()
     } else {
         Sense::hover()
@@ -9126,31 +9149,28 @@ fn duck_meter(
         );
     }
 
-    // Only the source meter carries the threshold marker. The target meter
-    // has none, so the two can never appear to move together.
-    if interactive {
-        let tick = ((*threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
-        let x = rect.left() + rect.width() * tick;
-        painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(2.0, AMBER),
-        );
-    }
-    let _ = id_source;
+    let Some(marker) = marker else {
+        return false;
+    };
 
-    // Only the source meter owns the threshold marker; the target meter just
-    // shows where it is, so dragging there cannot move the source's marker.
+    let span = (marker.bar_hi - marker.bar_lo).abs().max(1.0);
+    let tick = ((*marker.value - marker.bar_lo) / span).clamp(0.0, 1.0);
+    let x = rect.left() + rect.width() * tick;
+    painter.line_segment(
+        [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+        Stroke::new(2.0, AMBER),
+    );
+
     let mut changed = false;
-    if interactive {
-        if response.dragged() || response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let t = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                *threshold_db = (-60.0 + t * 60.0).clamp(-60.0, -6.0);
-                changed = true;
-            }
+    if response.dragged() || response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let t = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+            let value = marker.bar_lo + t * span;
+            *marker.value = value.clamp(marker.clamp_lo, marker.clamp_hi);
+            changed = true;
         }
-        response.on_hover_text("Drag to set the threshold");
     }
+    response.on_hover_text(marker.hint);
     changed
 }
 
