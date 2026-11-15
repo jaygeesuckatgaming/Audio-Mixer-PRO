@@ -8141,18 +8141,62 @@ impl MixerApp {
                     ui.add(
                         egui::Slider::new(&mut self.duck.depth_db, -30.0..=0.0)
                             .text("Depth (dB)"),
+                    )
+                    .on_hover_text(
+                        "How far the targets are turned down while ducking is fully engaged.
+                         0 dB = no change, -6 dB = half as loud, -12 dB = a quarter as loud.",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Amount of gain reduction applied to the targets. 0 = off, -12 dB is a typical voice-over duck.",
+                        )
+                        .size(9.0)
+                        .color(DIM),
                     );
                     ui.add(
                         egui::Slider::new(&mut self.duck.threshold_db, -60.0..=-6.0)
                             .text("Threshold (dBFS)"),
+                    )
+                    .on_hover_text(
+                        "Source level that starts ducking. Below it the targets play untouched;
+                         above it they are pushed down. Lower values mean the source has to be louder.",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "How loud the source must be before it ducks anything. Quiet sources need a lower threshold.",
+                        )
+                        .size(9.0)
+                        .color(DIM),
                     );
                     ui.add(
                         egui::Slider::new(&mut self.duck.attack_ms, 1.0..=100.0)
                             .text("Attack (ms)"),
+                    )
+                    .on_hover_text(
+                        "Time to reach full reduction once the source crosses the threshold.
+                         Short = snappy but can click; long = smooth but lets the first syllables through.",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "How fast the targets drop. Short keeps speech intelligible, long sounds gentler.",
+                        )
+                        .size(9.0)
+                        .color(DIM),
                     );
                     ui.add(
                         egui::Slider::new(&mut self.duck.release_ms, 20.0..=1000.0)
                             .text("Release (ms)"),
+                    )
+                    .on_hover_text(
+                        "Time to return to normal level after the source falls below the threshold.
+                         Too short pumps on every pause; too long keeps music quiet between sentences.",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "How long the targets stay down after the source goes quiet. Short recovers fast, long holds through pauses.",
+                        )
+                        .size(9.0)
+                        .color(DIM),
                     );
                     ui.separator();
                     let reduction = self.audio.duck_gain_db();
