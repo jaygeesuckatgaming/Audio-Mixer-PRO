@@ -932,9 +932,9 @@ struct MixerApp {
     /// FUN_0052ab70 stores `<InputDev type>` / `<OutputDev type>` at record
     /// +0x284: 1 MME, 4 (default WDM), 8 KS, 0x100 ASIO.
     input_types: [i32; 3],
-    output_types: [i32; 3],
+    output_types: [i32; 5],
     /// `<OutputDev pOut1..pOut8>` for an unassigned output (name "-").
-    output_patch: [[i32; 8]; 3],
+    output_patch: [[i32; 8]; 5],
     engine_mode: usize,
     limit_remote: bool,
     monitor_on_sel: bool,
@@ -1444,8 +1444,8 @@ impl MixerApp {
             dev_srasio: false,
             bus_latency_ms: [0.0; 3],
             input_types: [DEVICE_TYPE_WDM; 3],
-            output_types: [DEVICE_TYPE_WDM; 3],
-            output_patch: [[0; 8]; 3],
+            output_types: [DEVICE_TYPE_WDM; 5],
+            output_patch: [[0; 8]; 5],
             engine_mode: 0,
             limit_remote: false,
             monitor_on_sel: false,
@@ -2071,22 +2071,40 @@ impl MixerApp {
             self.duck.attack_ms,
             self.duck.release_ms,
         );
-        // B1/B2 reach cables 1 and 2. With the kernel driver they are plain
-        // render endpoints fed by the internal mixer; otherwise the mix is
-        // written into the USB cable's capture endpoint.
-        self.audio
-            .set_virtual_outputs(self.vc.device(1), self.vc.device(2));
+        // B1/B2: an explicit device plays only to that device. Left unset they
+        // keep the automatic cable wiring - a render stream to the driver's
+        // Virtual Cable 01/02, or the direct injection into USB Cable 01/02
+        // when the kernel driver is not installed.
+        let auto_b1 = self.buses[3].device.trim().is_empty();
+        let auto_b2 = self.buses[4].device.trim().is_empty();
+        let b1 = if !auto_b1 {
+            self.buses[3].device.clone()
+        } else if self.driver_mode {
+            cable_render_device(&self.last_outputs, "Virtual Cable 01")
+        } else {
+            String::new()
+        };
+        let b2 = if !auto_b2 {
+            self.buses[4].device.clone()
+        } else if self.driver_mode {
+            cable_render_device(&self.last_outputs, "Virtual Cable 02")
+        } else {
+            String::new()
+        };
+        let usb1 = if auto_b1 && !self.driver_mode {
+            self.vc.device(1)
+        } else {
+            None
+        };
+        let usb2 = if auto_b2 && !self.driver_mode {
+            self.vc.device(2)
+        } else {
+            None
+        };
+        self.audio.set_virtual_outputs(usb1, usb2);
         let a1 = self.buses[0].device.clone();
         let a2 = self.buses[1].device.clone();
         let a3 = self.buses[2].device.clone();
-        let (b1, b2) = if self.driver_mode {
-            (
-                cable_render_device(&self.last_outputs, "Virtual Cable 01"),
-                cable_render_device(&self.last_outputs, "Virtual Cable 02"),
-            )
-        } else {
-            (String::new(), String::new())
-        };
         self.audio.set_bus_outputs_with(
             &self.last_outputs,
             [a1.as_str(), a2.as_str(), a3.as_str(), b1.as_str(), b2.as_str()],
@@ -2501,7 +2519,7 @@ impl MixerApp {
                 xml_escape(name)
             ));
         }
-        for i in 0..3 {
+        for i in 0..5 {
             let name = xml_escape(&self.buses[i].device);
             if self.buses[i].device.trim().is_empty() {
                 let mut patches = String::new();
@@ -3797,16 +3815,18 @@ impl MixerApp {
         }
         for (attrs, _body) in xml_elements(text, "OutputDev") {
             if let Some(idx) = xml_attr(attrs, "index").and_then(|v| v.parse::<usize>().ok()) {
-                if (1..=3).contains(&idx) {
+                if (1..=5).contains(&idx) {
                     if let Some(name) = xml_attr(attrs, "name") {
                         let name = xml_unescape(&name);
                         if name == "-" {
                             self.buses[idx - 1].device.clear();
-                            for n in 0..8 {
-                                if let Some(v) = xml_attr(attrs, &format!("pOut{}", n + 1))
-                                    .and_then(|v| v.trim().parse::<i32>().ok())
-                                {
-                                    self.output_patch[idx - 1][n] = v.clamp(0, OUT_PATCH_MAX);
+                            if idx <= 3 {
+                                for n in 0..8 {
+                                    if let Some(v) = xml_attr(attrs, &format!("pOut{}", n + 1))
+                                        .and_then(|v| v.trim().parse::<i32>().ok())
+                                    {
+                                        self.output_patch[idx - 1][n] = v.clamp(0, OUT_PATCH_MAX);
+                                    }
                                 }
                             }
                         } else {
@@ -5677,10 +5697,18 @@ impl MixerApp {
             Align2::LEFT_TOP,
             fit_text(
                 ui.painter(),
-                &if self.buses[idx].device.trim().is_empty() {
-                    "No device".to_string()
-                } else {
+                &if !self.buses[idx].device.trim().is_empty() {
                     self.buses[idx].device.clone()
+                } else if idx >= 3 {
+                    // Unset B1/B2 keep their automatic wiring; say which cable
+                    // that is so the empty state is not read as "off".
+                    if self.driver_mode {
+                        format!("Virtual Cable {:02} (auto)", idx - 2)
+                    } else {
+                        format!("USB Cable {:02} (auto)", idx - 2)
+                    }
+                } else {
+                    "No device".to_string()
                 },
                 7.3,
                 w + 2.0,
@@ -5689,19 +5717,10 @@ impl MixerApp {
             DIM,
         );
         if hresp.clicked() && enabled {
-            if idx >= 3 {
-                self.toast(format!(
-                    "BUS {} feeds Virtual Cable {:02} - select \"Microphone (Virtual Cable {:02})\" in the other app",
-                    self.buses[idx].name,
-                    idx - 2,
-                    idx - 2
-                ));
-            } else {
-                self.picker = Some(Picker::Bus(idx));
-            }
+            self.picker = Some(Picker::Bus(idx));
         }
         let _ = hresp.on_hover_text(if idx >= 3 {
-            "This bus is fed straight into its USB virtual cable; choose it as a microphone/input in the other app"
+            "Click to choose the output device for this bus; leave it unset to use the automatic virtual cable"
         } else {
             "Click to choose the output device for this bus"
         });
