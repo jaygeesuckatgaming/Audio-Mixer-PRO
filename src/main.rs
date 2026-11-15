@@ -8194,6 +8194,7 @@ impl MixerApp {
                         "duck_source_meter",
                         source_level,
                         &mut threshold,
+                        true,
                     );
                     changed |= duck_meter(
                         ui,
@@ -8201,6 +8202,7 @@ impl MixerApp {
                         "duck_target_meter",
                         target_level,
                         &mut threshold,
+                        false,
                     );
                     if changed {
                         self.duck.threshold_db = threshold;
@@ -9090,6 +9092,7 @@ fn duck_meter(
     id_source: &str,
     level: f32,
     threshold_db: &mut f32,
+    interactive: bool,
 ) -> bool {
     let level_db = lin_to_db(level).clamp(-60.0, 0.0);
     ui.horizontal(|ui| {
@@ -9101,10 +9104,12 @@ fn duck_meter(
         );
     });
 
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), 12.0),
-        Sense::click_and_drag(),
-    );
+    let sense = if interactive {
+        Sense::click_and_drag()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 12.0), sense);
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, TRACK);
     painter.rect_stroke(rect, 2.0, Stroke::new(1.0, LINE));
@@ -9129,15 +9134,19 @@ fn duck_meter(
     );
     let _ = id_source;
 
+    // Only the source meter owns the threshold marker; the target meter just
+    // shows where it is, so dragging there cannot move the source's marker.
     let mut changed = false;
-    if response.dragged() || response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let t = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-            *threshold_db = (-60.0 + t * 60.0).clamp(-60.0, -6.0);
-            changed = true;
+    if interactive {
+        if response.dragged() || response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let t = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                *threshold_db = (-60.0 + t * 60.0).clamp(-60.0, -6.0);
+                changed = true;
+            }
         }
+        response.on_hover_text("Drag to set the threshold");
     }
-    response.on_hover_text("Drag to set the threshold");
     changed
 }
 
