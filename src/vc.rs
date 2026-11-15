@@ -146,7 +146,9 @@ impl VirtualCables {
             if driver_mode {
                 ui.label(
                     egui::RichText::new(
-                        "KERNEL DRIVER ACTIVE: Virtual Cable 01..04 come from the installed                          audio driver. USB/IP is not used and the settings below are ignored.",
+                        "KERNEL DRIVER ACTIVE: Virtual Cable 01..04 come from the installed \
+                         audio driver. The USB/IP set is named USB Cable 01..04 and can run \
+                         at the same time.",
                     )
                     .size(9.0)
                     .color(GREEN),
@@ -168,12 +170,7 @@ impl VirtualCables {
                 .spacing([14.0, 6.0])
                 .show(ui, |ui| {
                     ui.label(egui::RichText::new("Enabled").color(TEXT));
-                    enabled_changed = ui
-                        .add_enabled(
-                            !driver_mode,
-                            egui::Checkbox::new(&mut cfg.enabled, ""),
-                        )
-                        .changed();
+                    enabled_changed = ui.checkbox(&mut cfg.enabled, "").changed();
                     ui.end_row();
 
                     ui.label(egui::RichText::new("Cables").color(TEXT));

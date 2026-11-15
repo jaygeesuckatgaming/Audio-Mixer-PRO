@@ -67,8 +67,8 @@ impl Descriptors {
             return Err("cable number must be 1..=255".to_string());
         }
         let max_rate = clamp_rate(max_rate);
-        let product = format!("Virtual Cable {cable_number:02}");
-        let serial = format!("VCABLE-{cable_number:03}");
+        let product = format!("USB Cable {cable_number:02}");
+        let serial = format!("USBCABLE-{cable_number:03}");
         let mut strings = HashMap::new();
         strings.insert(0, vec![4, DESC_STRING, 0x09, 0x04]);
         strings.insert(1, string_descriptor("Tarek Wasfy and AI"));

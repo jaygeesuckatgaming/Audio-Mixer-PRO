@@ -2074,12 +2074,8 @@ impl MixerApp {
         // B1/B2 reach cables 1 and 2. With the kernel driver they are plain
         // render endpoints fed by the internal mixer; otherwise the mix is
         // written into the USB cable's capture endpoint.
-        if self.driver_mode {
-            self.audio.set_virtual_outputs(None, None);
-        } else {
-            self.audio
-                .set_virtual_outputs(self.vc.device(1), self.vc.device(2));
-        }
+        self.audio
+            .set_virtual_outputs(self.vc.device(1), self.vc.device(2));
         let a1 = self.buses[0].device.clone();
         let a2 = self.buses[1].device.clone();
         let a3 = self.buses[2].device.clone();
@@ -3142,9 +3138,10 @@ impl MixerApp {
             StartupStep::Cables => {
                 self.driver_mode = driver_cables_present();
                 if self.driver_mode {
-                    diag_log("startup: virtual cable driver detected, USB/IP disabled");
-                } else if self.vc_cfg.enabled {
-                    diag_log("startup: starting virtual cables");
+                    diag_log("startup: kernel virtual cable driver detected");
+                }
+                if self.vc_cfg.enabled {
+                    diag_log("startup: starting USB virtual cables");
                     self.vc.apply(self.vc_cfg.clone());
                 }
                 self.startup_step = StartupStep::Devices;
@@ -3915,6 +3912,8 @@ impl MixerApp {
             let Some(rest) = lower
                 .strip_prefix("microphone array (virtual cable ")
                 .or_else(|| lower.strip_prefix("microphone (virtual cable "))
+                .or_else(|| lower.strip_prefix("microphone (usb cable "))
+                .or_else(|| lower.strip_prefix("microphone array (usb cable "))
             else {
                 continue;
             };
@@ -9248,13 +9247,22 @@ fn cable_render_device(devices: &[String], label: &str) -> String {
 
 fn cable_label(device: &str) -> Option<String> {
     let lower = device.to_ascii_lowercase();
-    let at = lower.find("virtual cable ")?;
-    let digits: String = lower[at + "virtual cable ".len()..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    let number: u32 = digits.parse().ok()?;
-    Some(format!("Virtual Cable {number:02}"))
+    for (prefix, display) in [
+        ("virtual cable ", "Virtual Cable "),
+        ("usb cable ", "USB Cable "),
+    ] {
+        let Some(at) = lower.find(prefix) else {
+            continue;
+        };
+        let digits: String = lower[at + prefix.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(number) = digits.parse::<u32>() {
+            return Some(format!("{display}{number:02}"));
+        }
+    }
+    None
 }
 
 fn clock(secs: f32) -> String {
