@@ -963,6 +963,11 @@ struct MixerApp {
     window_size: Option<[f32; 2]>,
     /// Last outer position in points, saved together with the size.
     window_pos: Option<[f32; 2]>,
+    /// Whether the window was maximized when it was closed.
+    window_maximized: bool,
+    /// Maximize once on the first frame: winit ignores with_maximized() for an
+    /// undecorated window, but the runtime command works.
+    pending_maximize: bool,
     show_vban: bool,
     vban: vban::VbanHub,
     vban_enabled: bool,
@@ -1479,6 +1484,8 @@ impl MixerApp {
             bus_rename_focus: false,
             window_size: None,
             window_pos: None,
+            window_maximized: false,
+            pending_maximize: false,
             show_vban: false,
             vban: vban::VbanHub::new(),
             vban_enabled: false,
@@ -2783,11 +2790,12 @@ impl MixerApp {
                 .map(|[x, y]| (x, y))
                 .unwrap_or((40.0, 40.0));
             text.push_str(&format!(
-                "\t<Window x='{:.1}' y='{:.1}' width='{:.1}' height='{:.1}' />\n",
+                "\t<Window x='{:.1}' y='{:.1}' width='{:.1}' height='{:.1}' maximized='{}' />\n",
                 x.clamp(-32000.0, 32000.0),
                 y.clamp(-32000.0, 32000.0),
                 w.clamp(800.0, 5000.0),
-                h.clamp(500.0, 4000.0)
+                h.clamp(500.0, 4000.0),
+                if self.window_maximized { 1 } else { 0 }
             ));
         }
         text.push_str("</AudioMixerProParameters>\n");
@@ -8524,12 +8532,20 @@ impl eframe::App for MixerApp {
                 ctx.request_repaint();
             }
         }
+        if self.pending_maximize {
+            self.pending_maximize = false;
+            if self.shot_path.is_none() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
+        }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         self.time += dt as f64;
 
         // Remember the window size and position for the next run. Maximized
-        // sizes are ignored so Restore returns to the last manual size.
+        // sizes are ignored so Restore returns to the last manual size, but
+        // the maximized state itself is saved.
         let viewport = ctx.input(|i| i.viewport().clone());
+        self.window_maximized = viewport.maximized.unwrap_or(false);
         if viewport.maximized != Some(true) {
             if let Some(inner) = viewport.inner_rect {
                 let (w, h) = (inner.width(), inner.height());
@@ -9776,12 +9792,12 @@ fn window_icon() -> Option<egui::IconData> {
 
 /// Window size and position stored by the previous run, if any. Read before
 /// the viewport is built so the console opens where the person left it.
-fn load_saved_window() -> (Option<[f32; 2]>, Option<[f32; 2]>) {
+fn load_saved_window() -> (Option<[f32; 2]>, Option<[f32; 2]>, bool) {
     let Some(text) = std::fs::read_to_string(settings_canonical_path()).ok() else {
-        return (None, None);
+        return (None, None, false);
     };
     let Some((attrs, _)) = xml_elements(&text, "Window").into_iter().next() else {
-        return (None, None);
+        return (None, None, false);
     };
 
     let width = xml_attr(&attrs, "width").and_then(|v| v.parse::<f32>().ok());
@@ -9804,7 +9820,11 @@ fn load_saved_window() -> (Option<[f32; 2]>, Option<[f32; 2]>) {
         _ => None,
     };
 
-    (size, pos)
+    let maximized = xml_attr(&attrs, "maximized")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    (size, pos, maximized)
 }
 
 /// Sidecar diagnostics. The console is a GUI-subsystem binary, so a panic or a
@@ -10118,15 +10138,15 @@ fn main() -> eframe::Result<()> {
 
     // Reopen at the size and position the user left, when a previous run
     // saved them.
-    let (saved_size, saved_pos) = load_saved_window();
+    let (saved_size, saved_pos, saved_maximized) = load_saved_window();
     let min_size = [860.0 * zoom, 540.0 * zoom];
     let initial_size = saved_size
         .map(|[w, h]| [w.max(min_size[0]), h.max(min_size[1])])
         .unwrap_or([1024.0 * zoom, 620.0 * zoom]);
     let initial_pos = saved_pos.unwrap_or([40.0, 40.0]);
     diag_log(format!(
-        "main: window {}x{} at {},{}",
-        initial_size[0], initial_size[1], initial_pos[0], initial_pos[1]
+        "main: window {}x{} at {},{} maximized={}",
+        initial_size[0], initial_size[1], initial_pos[0], initial_pos[1], saved_maximized
     ));
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -10160,11 +10180,9 @@ fn main() -> eframe::Result<()> {
             if (zoom - 1.0).abs() > f32::EPSILON {
                 cc.egui_ctx.set_zoom_factor(zoom);
             }
-            Ok(Box::new(MixerApp::new(
-                cc,
-                shot_path.clone(),
-                startup_demo,
-            )))
+            let mut app = MixerApp::new(cc, shot_path.clone(), startup_demo);
+            app.pending_maximize = saved_maximized;
+            Ok(Box::new(app))
         }),
     );
     if let Err(err) = &result {
