@@ -1909,7 +1909,7 @@ impl AudioEngine {
         eq_on: bool,
         eq_gain: [f32; 6],
     ) {
-        if index >= 5 {
+        if index >= MAX_BUSES {
             return;
         }
         self.shared.bus_gain_db[index].store(gain_db.to_bits(), Ordering::Relaxed);
@@ -2159,7 +2159,7 @@ impl AudioEngine {
     }
 
     pub fn bus_peak(&self, index: usize) -> f32 {
-        if index >= 5 {
+        if index >= MAX_BUSES {
             return 0.0;
         }
         load_f32(&self.shared.bus_peak[index])
@@ -3974,9 +3974,34 @@ pub fn routing_selftest() {
     dsp.render(&mut third, 2, &shared);
     let muted = third.iter().fold(0.0f32, |m, v| m.max(v.abs()));
 
+    // B3 alone: the stem must carry the input while A1 stays silent.
+    shared.strips[0].flags.store(0, Ordering::Relaxed);
+    shared.strips[0]
+        .route
+        .store(STRIP_ROUTE_B3, Ordering::Relaxed);
+    // The previous passes drained the input ring (unrouted strips are trimmed
+    // to a few milliseconds), so feed the same test signal again before the
+    // B3 pass or there is nothing left to route.
+    if let Some(input) = shared
+        .inputs
+        .lock()
+        .ok()
+        .and_then(|inputs| inputs[0].clone())
+    {
+        let mut ring = lock_source(&input.ring);
+        for i in 0..48_000 {
+            let v = (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5;
+            ring.push([v, v]);
+        }
+    }
+    let mut fourth = vec![0.0f32; 48_000 * 2];
+    dsp.render(&mut fourth, 2, &shared);
+    let b3_stem = load_f32(&shared.bus_peak[MAX_BUSES - 1]);
+    let a1_while_b3 = fourth.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+
     println!(
-        "routing: a1_on={on:.4} a1_off={off:.6} muted={muted:.6} pass={}",
-        on > 0.1 && off < 0.001 && muted < 0.001
+        "routing: a1_on={on:.4} a1_off={off:.6} muted={muted:.6} b3_stem={b3_stem:.4} a1_while_b3={a1_while_b3:.6} pass={}",
+        on > 0.1 && off < 0.001 && muted < 0.001 && b3_stem > 0.1 && a1_while_b3 < 0.001
     );
 }
 

@@ -1920,7 +1920,7 @@ impl MixerApp {
     /// Say out loud what a routing button just did, because a route that is
     /// lit but has no device behind it is the one case that looks like a bug.
     fn announce_route(&mut self, strip: usize, bus: usize, on: bool) {
-        let bus_name = ["A1", "A2", "A3", "B1", "B2"][bus.min(4)];
+        let bus_name = ["A1", "A2", "A3", "B1", "B2", "B3"][bus.min(audio::MAX_BUSES - 1)];
         let name = self.strips[strip].name.clone();
         if !on {
             self.toast(format!("{name} is no longer routed to {bus_name}"));
@@ -3908,7 +3908,7 @@ impl MixerApp {
                 self.tape.gain_db = v;
             }
             if let Some(route) = xml_attr(attrs, "route") {
-                for (n, c) in route.chars().take(5).enumerate() {
+                for (n, c) in route.chars().take(audio::MAX_BUSES).enumerate() {
                     self.tape.route[n] = c == '1';
                 }
             }
@@ -4367,7 +4367,7 @@ impl MixerApp {
                 let Ok(idx) = idx_s.parse::<usize>() else {
                     continue;
                 };
-                if idx >= 5 {
+                if idx >= audio::MAX_BUSES {
                     continue;
                 }
                 let b = &mut self.buses[idx];
