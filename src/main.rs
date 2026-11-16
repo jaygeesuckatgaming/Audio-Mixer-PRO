@@ -961,6 +961,8 @@ struct MixerApp {
     /// Last inner size in points while the window is not maximized, saved so
     /// the console reopens at the size it was left at.
     window_size: Option<[f32; 2]>,
+    /// Last outer position in points, saved together with the size.
+    window_pos: Option<[f32; 2]>,
     show_vban: bool,
     vban: vban::VbanHub,
     vban_enabled: bool,
@@ -1476,6 +1478,7 @@ impl MixerApp {
             bus_rename_text: String::new(),
             bus_rename_focus: false,
             window_size: None,
+            window_pos: None,
             show_vban: false,
             vban: vban::VbanHub::new(),
             vban_enabled: false,
@@ -2775,8 +2778,14 @@ impl MixerApp {
             ));
         }
         if let Some([w, h]) = self.window_size {
+            let (x, y) = self
+                .window_pos
+                .map(|[x, y]| (x, y))
+                .unwrap_or((40.0, 40.0));
             text.push_str(&format!(
-                "\t<Window width='{:.1}' height='{:.1}' />\n",
+                "\t<Window x='{:.1}' y='{:.1}' width='{:.1}' height='{:.1}' />\n",
+                x.clamp(-32000.0, 32000.0),
+                y.clamp(-32000.0, 32000.0),
                 w.clamp(800.0, 5000.0),
                 h.clamp(500.0, 4000.0)
             ));
@@ -8518,8 +8527,8 @@ impl eframe::App for MixerApp {
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         self.time += dt as f64;
 
-        // Remember the window size for the next run. Maximized sizes are
-        // ignored so Restore returns to the last manual size.
+        // Remember the window size and position for the next run. Maximized
+        // sizes are ignored so Restore returns to the last manual size.
         let viewport = ctx.input(|i| i.viewport().clone());
         if viewport.maximized != Some(true) {
             if let Some(inner) = viewport.inner_rect {
@@ -8527,6 +8536,9 @@ impl eframe::App for MixerApp {
                 if w >= 400.0 && h >= 300.0 {
                     self.window_size = Some([w, h]);
                 }
+            }
+            if let Some(outer) = viewport.outer_rect {
+                self.window_pos = Some([outer.min.x, outer.min.y]);
             }
         }
         self.advance_startup(dt as f64);
@@ -9762,22 +9774,41 @@ fn window_icon() -> Option<egui::IconData> {
     })
 }
 
-/// Sidecar diagnostics. The console is a GUI-subsystem binary, so a panic or a
-/// hang would otherwise leave no trace at all.
-/// Window size stored by the previous run, if any. Read before the viewport is
-/// built so the console opens at the size it was left at.
-fn load_saved_window_size() -> Option<[f32; 2]> {
-    let text = std::fs::read_to_string(settings_canonical_path()).ok()?;
-    let (attrs, _) = xml_elements(&text, "Window").into_iter().next()?;
-    let width = xml_attr(&attrs, "width")?.parse::<f32>().ok()?;
-    let height = xml_attr(&attrs, "height")?.parse::<f32>().ok()?;
-    if (400.0..=8000.0).contains(&width) && (300.0..=8000.0).contains(&height) {
-        Some([width, height])
-    } else {
-        None
-    }
+/// Window size and position stored by the previous run, if any. Read before
+/// the viewport is built so the console opens where the person left it.
+fn load_saved_window() -> (Option<[f32; 2]>, Option<[f32; 2]>) {
+    let Some(text) = std::fs::read_to_string(settings_canonical_path()).ok() else {
+        return (None, None);
+    };
+    let Some((attrs, _)) = xml_elements(&text, "Window").into_iter().next() else {
+        return (None, None);
+    };
+
+    let width = xml_attr(&attrs, "width").and_then(|v| v.parse::<f32>().ok());
+    let height = xml_attr(&attrs, "height").and_then(|v| v.parse::<f32>().ok());
+    let size = match (width, height) {
+        (Some(w), Some(h)) if (400.0..=8000.0).contains(&w) && (300.0..=8000.0).contains(&h) => {
+            Some([w, h])
+        }
+        _ => None,
+    };
+
+    let x = xml_attr(&attrs, "x").and_then(|v| v.parse::<f32>().ok());
+    let y = xml_attr(&attrs, "y").and_then(|v| v.parse::<f32>().ok());
+    let pos = match (x, y) {
+        (Some(x), Some(y))
+            if (-32000.0..=32000.0).contains(&x) && (-32000.0..=32000.0).contains(&y) =>
+        {
+            Some([x, y])
+        }
+        _ => None,
+    };
+
+    (size, pos)
 }
 
+/// Sidecar diagnostics. The console is a GUI-subsystem binary, so a panic or a
+/// hang would otherwise leave no trace at all.
 fn diag_path(name: &str) -> PathBuf {
     settings_canonical_path().with_file_name(name)
 }
@@ -10085,20 +10116,25 @@ fn main() -> eframe::Result<()> {
         .unwrap_or(1.0);
     diag_log(format!("main: ui zoom {zoom}"));
 
-    // Reopen at the size the user left, when a previous run saved one.
-    let saved_size = load_saved_window_size();
+    // Reopen at the size and position the user left, when a previous run
+    // saved them.
+    let (saved_size, saved_pos) = load_saved_window();
     let min_size = [860.0 * zoom, 540.0 * zoom];
     let initial_size = saved_size
         .map(|[w, h]| [w.max(min_size[0]), h.max(min_size[1])])
         .unwrap_or([1024.0 * zoom, 620.0 * zoom]);
+    let initial_pos = saved_pos.unwrap_or([40.0, 40.0]);
+    diag_log(format!(
+        "main: window {}x{} at {},{}",
+        initial_size[0], initial_size[1], initial_pos[0], initial_pos[1]
+    ));
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(initial_size)
         .with_min_inner_size(min_size)
-        // An undecorated window can come up minimized or off-screen when the
-        // desktop size changed (for example after a VM display resize), so pin
-        // a visible spot and ask for focus.
-        .with_position(egui::pos2(40.0, 40.0))
+        // An undecorated window can come up minimized when the desktop size
+        // changed; ask for focus and open where it was last left.
+        .with_position(egui::pos2(initial_pos[0], initial_pos[1]))
         .with_visible(true)
         .with_active(true)
         // Borderless, but resizable from the corner grip (and the top-bar
