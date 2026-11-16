@@ -679,7 +679,9 @@ impl Shared {
             bus_eq_on: std::array::from_fn(|_| AtomicBool::new(false)),
             bus_eq_gain: std::array::from_fn(|_| std::array::from_fn(|_| f32_atomic(0.0))),
             virtual_outputs: Mutex::new([None, None]),
-            bus_out_rings: std::array::from_fn(|_| Mutex::new(VecDeque::with_capacity(BUS_RING_FRAMES))),
+            bus_out_rings: std::array::from_fn(|_| {
+                Mutex::new(VecDeque::with_capacity(BUS_RING_FRAMES))
+            }),
             bus_out_active: std::array::from_fn(|_| AtomicBool::new(false)),
             mixer_block: AtomicU32::new(512),
             vban_tx: Mutex::new(Vec::new()),
@@ -1612,8 +1614,7 @@ fn push_pcm(out: &mut Vec<u8>, value: f32, bytes: usize) {
 pub struct AudioEngine {
     shared: Arc<Shared>,
     /// Result of a non-blocking start, polled by `poll_start`.
-    pub pending_start:
-        Option<std::sync::mpsc::Receiver<Result<(String, u32, u16), String>>>,
+    pub pending_start: Option<std::sync::mpsc::Receiver<Result<(String, u32, u16), String>>>,
     pub device: String,
     pub sample_rate: u32,
     pub channels: u16,
@@ -1740,6 +1741,21 @@ impl AudioEngine {
             .is_ok()
     }
 
+    /// Drop every bus output stream so the next sync re-resolves the device
+    /// list and reopens them. The bus cards call this from their REF button to
+    /// pick up a device that was connected after the list was probed (Bluetooth
+    /// headphones, a USB interface that just finished enumerating, ...).
+    pub fn refresh_bus_outputs(&mut self) {
+        for b in 0..MAX_BUSES {
+            self.bus_streams[b] = None;
+            self.bus_device_names[b].clear();
+            self.bus_retry_at[b] = None;
+            self.bus_last_request[b].clear();
+            self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
+            lock_source(&self.shared.bus_out_rings[b]).clear();
+        }
+    }
+
     pub fn stop_stream(&mut self) {
         self.stop_mixer();
         self.pending_start = None;
@@ -1760,7 +1776,9 @@ impl AudioEngine {
         }
         self.stop_mixer();
         self.shared.sample_rate.store(rate, Ordering::Relaxed);
-        self.shared.mixer_block.store(block as u32, Ordering::Relaxed);
+        self.shared
+            .mixer_block
+            .store(block as u32, Ordering::Relaxed);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let shared = self.shared.clone();
@@ -1976,10 +1994,9 @@ impl AudioEngine {
         shared
             .duck_depth_db
             .store(depth_db.clamp(-60.0, 0.0).to_bits(), Ordering::Relaxed);
-        shared.duck_threshold_db.store(
-            threshold_db.clamp(-60.0, 0.0).to_bits(),
-            Ordering::Relaxed,
-        );
+        shared
+            .duck_threshold_db
+            .store(threshold_db.clamp(-60.0, 0.0).to_bits(), Ordering::Relaxed);
         shared
             .duck_attack_ms
             .store(attack_ms.clamp(1.0, 200.0).to_bits(), Ordering::Relaxed);
@@ -2010,9 +2027,8 @@ impl AudioEngine {
         }
         let requested = names_in;
         let now = std::time::Instant::now();
-        let same_request = (0..MAX_BUSES).all(|b| {
-            self.bus_last_request[b].eq_ignore_ascii_case(requested[b])
-        });
+        let same_request =
+            (0..MAX_BUSES).all(|b| self.bus_last_request[b].eq_ignore_ascii_case(requested[b]));
         if same_request {
             // A bus that never opened must keep being retried: its name may
             // only appear once Windows finishes enumerating the device, and a
@@ -2021,10 +2037,7 @@ impl AudioEngine {
                 self.bus_streams[b].is_none()
                     && !requested[b].is_empty()
                     && (self.bus_device_names[b].is_empty()
-                        || self
-                            .bus_retry_at[b]
-                            .map(|at| now >= at)
-                            .unwrap_or(true))
+                        || self.bus_retry_at[b].map(|at| now >= at).unwrap_or(true))
             });
             if !retry_due {
                 return;
@@ -2078,8 +2091,7 @@ impl AudioEngine {
                 continue;
             };
             if self.bus_device_names[b].eq_ignore_ascii_case(&name) {
-                if self
-                    .bus_retry_at[b]
+                if self.bus_retry_at[b]
                     .map(|at| std::time::Instant::now() < at)
                     .unwrap_or(false)
                 {
@@ -2107,9 +2119,8 @@ impl AudioEngine {
                     ));
                 }
                 Err(err) => {
-                    self.bus_retry_at[b] = Some(
-                        std::time::Instant::now() + std::time::Duration::from_secs(3),
-                    );
+                    self.bus_retry_at[b] =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                     crate::diag_log(format!(
                         "audio: bus {} output '{}' failed: {err}",
                         Self::bus_label(b),
@@ -2195,10 +2206,8 @@ impl AudioEngine {
             return;
         }
         for band in 0..3 {
-            self.shared.strips[index].eq[band].store(
-                eq[band].clamp(-12.0, 12.0).to_bits(),
-                Ordering::Relaxed,
-            );
+            self.shared.strips[index].eq[band]
+                .store(eq[band].clamp(-12.0, 12.0).to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -2222,8 +2231,10 @@ impl AudioEngine {
         let s = &self.shared.strips[index];
         s.gain_db.store(gain_db.to_bits(), Ordering::Relaxed);
         s.pan.store(pan.to_bits(), Ordering::Relaxed);
-        s.comp.store(comp.clamp(0.0, 10.0).to_bits(), Ordering::Relaxed);
-        s.gate.store(gate.clamp(0.0, 10.0).to_bits(), Ordering::Relaxed);
+        s.comp
+            .store(comp.clamp(0.0, 10.0).to_bits(), Ordering::Relaxed);
+        s.gate
+            .store(gate.clamp(0.0, 10.0).to_bits(), Ordering::Relaxed);
         let mut flags = 0u32;
         if mute {
             flags |= 1;
@@ -3049,9 +3060,8 @@ impl Drop for MixerTimer {
 fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u32) {
     let mut dsp = Dsp::new();
     let mut buffer = vec![0.0f32; block.max(1) * 2];
-    let period = std::time::Duration::from_nanos(
-        ((block.max(1) as f64 / rate.max(1) as f64) * 1e9) as u64,
-    );
+    let period =
+        std::time::Duration::from_nanos(((block.max(1) as f64 / rate.max(1) as f64) * 1e9) as u64);
 
     #[cfg(windows)]
     unsafe {
@@ -3202,8 +3212,7 @@ where
                 }
             },
             move |err| {
-                *lock_source(&error_shared.error) =
-                    Some(format!("A2/A3 output error: {err}"));
+                *lock_source(&error_shared.error) = Some(format!("A2/A3 output error: {err}"));
             },
             None,
         )
@@ -4126,7 +4135,9 @@ pub fn ducking_selftest(report_path: &Path) {
     shared.active_strips.store(5, Ordering::Relaxed);
     // Source strip 0 is a key only; target strip 1 is what reaches A1.
     shared.strips[0].route.store(0, Ordering::Relaxed);
-    shared.strips[1].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
+    shared.strips[1]
+        .route
+        .store(STRIP_ROUTE_A1, Ordering::Relaxed);
 
     let key = Arc::new(InputShared::new());
     let target = Arc::new(InputShared::new());
@@ -4214,8 +4225,10 @@ pub fn ducking_selftest(report_path: &Path) {
     let pass_disabled = (ratio(disabled) - 1.0).abs() < 0.1;
     let pass_under = (ratio(under) - 1.0).abs() < 0.1;
 
-    report.push_str(&format!("reference peak {reference:.4}
-"));
+    report.push_str(&format!(
+        "reference peak {reference:.4}
+"
+    ));
     report.push_str(&format!(
         "keyed peak {ducked:.4}  reduction {drop_db:.2} dB  pass {pass_duck}
 "
@@ -4228,8 +4241,10 @@ pub fn ducking_selftest(report_path: &Path) {
         "disabled peak {disabled:.4}  pass {pass_disabled}
 "
     ));
-    report.push_str(&format!("under-threshold peak {under:.4}  pass {pass_under}
-"));
+    report.push_str(&format!(
+        "under-threshold peak {under:.4}  pass {pass_under}
+"
+    ));
     report.push_str(&format!(
         "PASS {}
 ",
@@ -4245,8 +4260,12 @@ pub fn dynamics_selftest(report_path: &Path) {
     let shared = Arc::new(Shared::new());
     shared.sample_rate.store(48_000, Ordering::Relaxed);
     shared.active_strips.store(5, Ordering::Relaxed);
-    shared.strips[0].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
-    shared.strips[3].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
+    shared.strips[0]
+        .route
+        .store(STRIP_ROUTE_A1, Ordering::Relaxed);
+    shared.strips[3]
+        .route
+        .store(STRIP_ROUTE_A1, Ordering::Relaxed);
 
     let hardware = Arc::new(InputShared::new());
     let virtuals = Arc::new(InputShared::new());
@@ -4359,8 +4378,12 @@ pub fn strip_eq_selftest(report_path: &Path) {
     let shared = Arc::new(Shared::new());
     shared.sample_rate.store(48_000, Ordering::Relaxed);
     shared.active_strips.store(5, Ordering::Relaxed);
-    shared.strips[0].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
-    shared.strips[3].route.store(STRIP_ROUTE_A1, Ordering::Relaxed);
+    shared.strips[0]
+        .route
+        .store(STRIP_ROUTE_A1, Ordering::Relaxed);
+    shared.strips[3]
+        .route
+        .store(STRIP_ROUTE_A1, Ordering::Relaxed);
 
     let virtuals = Arc::new(InputShared::new());
     let hardware = Arc::new(InputShared::new());
@@ -4373,47 +4396,42 @@ pub fn strip_eq_selftest(report_path: &Path) {
     }
 
     let mut dsp = Dsp::new();
-    let mut run = |ring: &Arc<InputShared>,
-                   strip: usize,
-                   eq: [f32; 3],
-                   freq: f32,
-                   frames: usize|
-     -> f32 {
-        for band in 0..3 {
-            shared.strips[strip].eq[band]
-                .store(eq[band].to_bits(), Ordering::Relaxed);
-        }
-        dsp.readers[strip] = InputReader::new();
-        *lock_source(&ring.ring) = SampleRing::new();
+    let mut run =
+        |ring: &Arc<InputShared>, strip: usize, eq: [f32; 3], freq: f32, frames: usize| -> f32 {
+            for band in 0..3 {
+                shared.strips[strip].eq[band].store(eq[band].to_bits(), Ordering::Relaxed);
+            }
+            dsp.readers[strip] = InputReader::new();
+            *lock_source(&ring.ring) = SampleRing::new();
 
-        let block = 512usize;
-        let mut buffer = vec![0.0f32; block * 2];
-        let mut phase = 0.0f32;
-        let step = 2.0 * std::f32::consts::PI * freq / 48_000.0;
-        let mut peak = 0.0f32;
-        let mut done = 0usize;
-        while done < frames {
-            {
-                let mut samples = lock_source(&ring.ring);
-                for _ in 0..block {
-                    let v = 0.3 * phase.sin();
-                    phase += step;
-                    if phase > 2.0 * std::f32::consts::PI {
-                        phase -= 2.0 * std::f32::consts::PI;
+            let block = 512usize;
+            let mut buffer = vec![0.0f32; block * 2];
+            let mut phase = 0.0f32;
+            let step = 2.0 * std::f32::consts::PI * freq / 48_000.0;
+            let mut peak = 0.0f32;
+            let mut done = 0usize;
+            while done < frames {
+                {
+                    let mut samples = lock_source(&ring.ring);
+                    for _ in 0..block {
+                        let v = 0.3 * phase.sin();
+                        phase += step;
+                        if phase > 2.0 * std::f32::consts::PI {
+                            phase -= 2.0 * std::f32::consts::PI;
+                        }
+                        samples.push([v, v]);
                     }
-                    samples.push([v, v]);
                 }
-            }
-            dsp.render(&mut buffer, 2, &shared);
-            if done + block > frames / 2 {
-                for v in &buffer {
-                    peak = peak.max(v.abs());
+                dsp.render(&mut buffer, 2, &shared);
+                if done + block > frames / 2 {
+                    for v in &buffer {
+                        peak = peak.max(v.abs());
+                    }
                 }
+                done += block;
             }
-            done += block;
-        }
-        peak
-    };
+            peak
+        };
 
     let flat = run(&virtuals, 3, [0.0, 0.0, 0.0], 1000.0, 24_000);
     let mid_boost = run(&virtuals, 3, [0.0, 12.0, 0.0], 1000.0, 24_000);
@@ -4453,12 +4471,7 @@ pub fn strip_eq_selftest(report_path: &Path) {
     report.push_str(&format!("flat pass {pass_flat}\n"));
     report.push_str(&format!(
         "PASS {}\n",
-        pass_flat
-            && pass_mid_boost
-            && pass_mid_cut
-            && pass_low
-            && pass_high
-            && pass_hardware
+        pass_flat && pass_mid_boost && pass_mid_cut && pass_low && pass_high && pass_hardware
     ));
     let _ = std::fs::write(report_path, report);
 }

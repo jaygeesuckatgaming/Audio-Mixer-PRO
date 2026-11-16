@@ -5806,7 +5806,49 @@ impl MixerApp {
             FontId::proportional(7.3),
             DIM,
         );
-        if hresp.clicked() && enabled {
+        // Small REF chip in the header's right corner: re-scan the device list
+        // and reopen this bus, so a device connected after the last probe
+        // (Bluetooth headphones, a USB interface still enumerating) shows up
+        // without switching the bus to another device and back.
+        let refresh_rect = Rect::from_min_size(
+            Pos2::new(card.right() - 30.0, card.top() + 3.0),
+            Vec2::new(26.0, 13.0),
+        );
+        let rresp = ui.interact(
+            refresh_rect,
+            Id::new(("bus_refresh", idx)),
+            Sense::click(),
+        );
+        let rhover = rresp.hovered();
+        ui.painter()
+            .rect_filled(refresh_rect, 3.0, if rhover { PANEL_HI } else { TRACK });
+        ui.painter()
+            .rect_stroke(refresh_rect, 3.0, Stroke::new(1.0, LINE));
+        ui.painter().text(
+            refresh_rect.center(),
+            Align2::CENTER_CENTER,
+            "REF",
+            FontId::proportional(7.0),
+            if rhover { TEXT } else { DIM },
+        );
+        let refresh_clicked = rresp.clicked();
+        let _ = rresp.on_hover_text("Re-scan audio devices for this bus");
+        if refresh_clicked && enabled {
+            self.audio.refresh_bus_outputs();
+            // Trigger the device probe on the next poll instead of waiting for
+            // the one-second timer.
+            self.poll_clock = 1.0;
+            self.toast(format!(
+                "BUS {}: re-scanning audio devices",
+                self.buses[idx].name
+            ));
+        }
+
+        let over_refresh = ui
+            .input(|i| i.pointer.interact_pos())
+            .map(|pos| refresh_rect.contains(pos))
+            .unwrap_or(false);
+        if hresp.clicked() && enabled && !over_refresh {
             self.picker = Some(Picker::Bus(idx));
         }
         if hresp.double_clicked() && enabled {
