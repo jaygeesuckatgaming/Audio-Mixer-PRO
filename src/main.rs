@@ -965,6 +965,9 @@ struct MixerApp {
     window_pos: Option<[f32; 2]>,
     /// Whether the window was maximized when it was closed.
     window_maximized: bool,
+    /// Effective egui zoom factor (Ctrl+scroll / Ctrl +/-), saved with the
+    /// window so the UI reopens at the same scale.
+    ui_zoom: f32,
     /// Maximize once on the first frame: winit ignores with_maximized() for an
     /// undecorated window, but the runtime command works.
     pending_maximize: bool,
@@ -1485,6 +1488,7 @@ impl MixerApp {
             window_size: None,
             window_pos: None,
             window_maximized: false,
+            ui_zoom: 1.0,
             pending_maximize: false,
             show_vban: false,
             vban: vban::VbanHub::new(),
@@ -2790,12 +2794,13 @@ impl MixerApp {
                 .map(|[x, y]| (x, y))
                 .unwrap_or((40.0, 40.0));
             text.push_str(&format!(
-                "\t<Window x='{:.1}' y='{:.1}' width='{:.1}' height='{:.1}' maximized='{}' />\n",
+                "\t<Window x='{:.1}' y='{:.1}' width='{:.1}' height='{:.1}' maximized='{}' zoom='{:.2}' />\n",
                 x.clamp(-32000.0, 32000.0),
                 y.clamp(-32000.0, 32000.0),
                 w.clamp(800.0, 5000.0),
                 h.clamp(500.0, 4000.0),
-                if self.window_maximized { 1 } else { 0 }
+                if self.window_maximized { 1 } else { 0 },
+                self.ui_zoom.clamp(0.5, 3.0)
             ));
         }
         text.push_str("</AudioMixerProParameters>\n");
@@ -8546,6 +8551,7 @@ impl eframe::App for MixerApp {
         // the maximized state itself is saved.
         let viewport = ctx.input(|i| i.viewport().clone());
         self.window_maximized = viewport.maximized.unwrap_or(false);
+        self.ui_zoom = ctx.zoom_factor();
         if viewport.maximized != Some(true) {
             if let Some(inner) = viewport.inner_rect {
                 let (w, h) = (inner.width(), inner.height());
@@ -9792,12 +9798,12 @@ fn window_icon() -> Option<egui::IconData> {
 
 /// Window size and position stored by the previous run, if any. Read before
 /// the viewport is built so the console opens where the person left it.
-fn load_saved_window() -> (Option<[f32; 2]>, Option<[f32; 2]>, bool) {
+fn load_saved_window() -> (Option<[f32; 2]>, Option<[f32; 2]>, bool, Option<f32>) {
     let Some(text) = std::fs::read_to_string(settings_canonical_path()).ok() else {
-        return (None, None, false);
+        return (None, None, false, None);
     };
     let Some((attrs, _)) = xml_elements(&text, "Window").into_iter().next() else {
-        return (None, None, false);
+        return (None, None, false, None);
     };
 
     let width = xml_attr(&attrs, "width").and_then(|v| v.parse::<f32>().ok());
@@ -9824,7 +9830,11 @@ fn load_saved_window() -> (Option<[f32; 2]>, Option<[f32; 2]>, bool) {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    (size, pos, maximized)
+    let zoom = xml_attr(&attrs, "zoom")
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|factor| (0.5..=3.0).contains(factor));
+
+    (size, pos, maximized, zoom)
 }
 
 /// Sidecar diagnostics. The console is a GUI-subsystem binary, so a panic or a
@@ -10122,7 +10132,7 @@ fn main() -> eframe::Result<()> {
 
     // UI zoom. The console is a fixed-size window, so on a small or scaled
     // display the only practical knob is the zoom factor.
-    let zoom = raw_args
+    let arg_zoom = raw_args
         .iter()
         .position(|arg| arg == "--zoom")
         .and_then(|index| raw_args.get(index + 1))
@@ -10132,13 +10142,13 @@ fn main() -> eframe::Result<()> {
                 .ok()
                 .and_then(|value| value.parse::<f32>().ok())
         })
-        .filter(|factor| (0.5..=3.0).contains(factor))
-        .unwrap_or(1.0);
-    diag_log(format!("main: ui zoom {zoom}"));
+        .filter(|factor| (0.5..=3.0).contains(factor));
 
-    // Reopen at the size and position the user left, when a previous run
-    // saved them.
-    let (saved_size, saved_pos, saved_maximized) = load_saved_window();
+    // Reopen at the size, position and zoom the user left, when a previous
+    // run saved them. An explicit --zoom still wins.
+    let (saved_size, saved_pos, saved_maximized, saved_zoom) = load_saved_window();
+    let zoom = arg_zoom.or(saved_zoom).unwrap_or(1.0);
+    diag_log(format!("main: ui zoom {zoom}"));
     let min_size = [860.0 * zoom, 540.0 * zoom];
     let initial_size = saved_size
         .map(|[w, h]| [w.max(min_size[0]), h.max(min_size[1])])
