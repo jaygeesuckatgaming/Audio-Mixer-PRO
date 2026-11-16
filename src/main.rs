@@ -7,6 +7,7 @@ mod vc;
 mod vst;
 
 use audio::{AudioEngine, DemoKind, InputCapture, BASE_STRIPS, MAX_STRIPS};
+use raw_window_handle::HasWindowHandle;
 use eframe::egui::{
     self, Align2, Color32, FontId, Id, Pos2, Rect, Response, Sense, Stroke, Vec2,
 };
@@ -971,6 +972,9 @@ struct MixerApp {
     /// Maximize once on the first frame: winit ignores with_maximized() for an
     /// undecorated window, but the runtime command works.
     pending_maximize: bool,
+    /// Native handle of the mixer window (0 until the first frame). Plug-in
+    /// editor windows are placed relative to it.
+    mixer_hwnd: isize,
     show_vban: bool,
     vban: vban::VbanHub,
     vban_enabled: bool,
@@ -1490,6 +1494,7 @@ impl MixerApp {
             window_maximized: false,
             ui_zoom: 1.0,
             pending_maximize: false,
+            mixer_hwnd: 0,
             show_vban: false,
             vban: vban::VbanHub::new(),
             vban_enabled: false,
@@ -1875,7 +1880,7 @@ impl MixerApp {
             return;
         }
         let label = self.strip_label(slot);
-        match self.vsts[slot].chain.open_editor() {
+        match self.vsts[slot].chain.open_editor(self.mixer_hwnd) {
             Ok(()) => {
                 if let Some(info) = &self.vsts[slot].info {
                     self.toast(format!("Opened {label} plug-in window: {}", info.name));
@@ -8572,11 +8577,19 @@ impl eframe::App for MixerApp {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if self.first_frame {
             self.first_frame = false;
             if self.shot_path.is_some() {
                 ctx.request_repaint();
+            }
+        }
+        if self.mixer_hwnd == 0 {
+            if let Ok(handle) = frame.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(window) = handle.as_raw() {
+                    self.mixer_hwnd = window.hwnd.get() as isize;
+                    diag_log(format!("main: mixer hwnd {:#x}", self.mixer_hwnd));
+                }
             }
         }
         if self.pending_maximize {
