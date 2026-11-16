@@ -969,6 +969,10 @@ struct MixerApp {
     /// Effective egui zoom factor (Ctrl+scroll / Ctrl +/-), saved with the
     /// window so the UI reopens at the same scale.
     ui_zoom: f32,
+    /// Streamer mode: a running light chases across every fader.
+    streamer_mode: bool,
+    /// Chase speed in faders per second.
+    streamer_speed: f32,
     /// Maximize once on the first frame: winit ignores with_maximized() for an
     /// undecorated window, but the runtime command works.
     pending_maximize: bool,
@@ -1493,6 +1497,8 @@ impl MixerApp {
             window_pos: None,
             window_maximized: false,
             ui_zoom: 1.0,
+            streamer_mode: false,
+            streamer_speed: 7.0,
             pending_maximize: false,
             mixer_hwnd: 0,
             show_vban: false,
@@ -2955,6 +2961,11 @@ impl MixerApp {
                 vst.bypass as u8
             ));
         }
+        text.push_str(&format!(
+            "<Streamer enabled='{}' speed='{:.1}' />\n",
+            if self.streamer_mode { 1 } else { 0 },
+            self.streamer_speed.clamp(1.0, 30.0)
+        ));
         text.push_str("</AudioMixerProSettings>\n");
         text
     }
@@ -3370,6 +3381,13 @@ impl MixerApp {
             }
             if let Some(value) = bool_attr(attrs, "bypass") {
                 self.vsts[slot].bypass = value;
+            }
+        }
+
+        if let Some((attrs, _)) = xml_elements(text, "Streamer").first() {
+            self.streamer_mode = bool_attr(attrs, "enabled").unwrap_or(self.streamer_mode);
+            if let Some(speed) = f32_attr(attrs, "speed") {
+                self.streamer_speed = speed.clamp(1.0, 30.0);
             }
         }
 
@@ -3968,7 +3986,27 @@ impl MixerApp {
         self.tape_recent = recent.into_iter().map(|(_, p)| p).take(6).collect();
     }
 
-    /// Bank 0 is the original five strips; later banks hold five additional
+    /// 1.0 for the fader under the running light, fading for the two behind
+    /// it, 0.0 when streamer mode is off. Strips come first, then buses.
+    fn streamer_brightness(&self, index: usize) -> f32 {
+        if !self.streamer_mode {
+            return 0.0;
+        }
+        let total = self.active_strips + audio::MAX_BUSES;
+        if total == 0 {
+            return 0.0;
+        }
+        let head = ((self.time * self.streamer_speed as f64) as usize) % total;
+        match (head + total - index % total) % total {
+            0 => 1.0,
+            1 => 0.45,
+            2 => 0.18,
+            _ => 0.0,
+        }
+    }
+
+    /// The strip cards fill `start..start+5`. A bank with fewer strips than
+    /// that shows empty slots
     /// virtual inputs each.
     fn bank_for_strip(index: usize) -> usize {
         if index < BASE_STRIPS {
@@ -5736,6 +5774,7 @@ impl MixerApp {
             enabled,
             true,
             max_db,
+            self.streamer_brightness(idx),
             "Strip gain: drag, wheel steps 3 dB, double click for 0 dB",
         );
         meter_widget(
@@ -6043,6 +6082,7 @@ impl MixerApp {
             enabled,
             false,
             max_db,
+            self.streamer_brightness(self.active_strips + idx),
             "Bus gain: drag, wheel steps 3 dB, double click for 0 dB",
         );
         meter_widget(
@@ -8773,6 +8813,80 @@ impl eframe::App for MixerApp {
                     bx += 56.0 + 4.0;
                 }
 
+                // STREAMER MODE: a running light across every fader. It sits
+                // left of the ADD button; right click sets the chase speed.
+                let streamer_rect = Rect::from_min_size(
+                    Pos2::new(rect.right() - pad - 132.0 - 8.0 - 112.0, bank_top),
+                    Vec2::new(112.0, bank_h),
+                );
+                let streamer_sense = if self.lock_gui {
+                    Sense::hover()
+                } else {
+                    Sense::click()
+                };
+                let streamer_resp = ui.interact(
+                    streamer_rect,
+                    Id::new("streamer_mode"),
+                    streamer_sense,
+                );
+                let streamer_on = self.streamer_mode;
+                ui.painter().rect_filled(
+                    streamer_rect,
+                    3.0,
+                    if streamer_on {
+                        GREEN.gamma_multiply(0.22)
+                    } else if streamer_resp.hovered() {
+                        PANEL_HI
+                    } else {
+                        Color32::from_rgb(27, 31, 38)
+                    },
+                );
+                ui.painter().rect_stroke(
+                    streamer_rect,
+                    3.0,
+                    Stroke::new(1.0, if streamer_on { GREEN } else { LINE }),
+                );
+                ui.painter().text(
+                    streamer_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "STREAMER MODE",
+                    FontId::proportional(8.0),
+                    if streamer_on { GREEN } else { TEXT },
+                );
+                let mut streamer_toggled = false;
+                if streamer_resp.clicked() {
+                    self.streamer_mode = !self.streamer_mode;
+                    streamer_toggled = true;
+                }
+                let streamer_resp = streamer_resp.on_hover_text(format!(
+                    "Running light across every fader ({:.0}/s). Right click for speed.",
+                    self.streamer_speed
+                ));
+                streamer_resp.context_menu(|ui| {
+                    ui.label("Chase speed");
+                    for (label, speed) in [
+                        ("Slow (4/s)", 4.0f32),
+                        ("Normal (7/s)", 7.0),
+                        ("Fast (11/s)", 11.0),
+                        ("Very fast (16/s)", 16.0),
+                    ] {
+                        if ui
+                            .selectable_label((self.streamer_speed - speed).abs() < 0.1, label)
+                            .clicked()
+                        {
+                            self.streamer_speed = speed;
+                            ui.close_menu();
+                        }
+                    }
+                });
+                if streamer_toggled {
+                    self.toast(if self.streamer_mode {
+                        format!("Streamer mode on ({:.0}/s)", self.streamer_speed)
+                    } else {
+                        "Streamer mode off".to_string()
+                    });
+                }
+
                 let can_add = self.active_strips < MAX_STRIPS;
                 let add_rect = Rect::from_min_size(
                     Pos2::new(rect.right() - pad - 132.0, bank_top),
@@ -9285,6 +9399,7 @@ fn fader(
     enabled: bool,
     is_strip: bool,
     max_db: f32,
+    streamer: f32,
     tip: &str,
 ) {
     let sense = if enabled { Sense::click_and_drag() } else { Sense::hover() };
@@ -9387,6 +9502,27 @@ fn fader(
     );
     if resp.hovered() {
         p.rect_stroke(track, 2.0, Stroke::new(1.0, accent.gamma_multiply(0.6)));
+    }
+    if streamer > 0.0 {
+        // Streamer mode: a halo plus a stronger outline, and a brighter knob
+        // line, so the chase reads like a running light.
+        p.rect_filled(
+            track.expand(2.0),
+            3.0,
+            accent.gamma_multiply(0.18 * streamer),
+        );
+        p.rect_stroke(
+            track,
+            2.0,
+            Stroke::new(1.5, accent.gamma_multiply(0.9 * streamer)),
+        );
+        p.line_segment(
+            [
+                Pos2::new(handle.left() + 3.0, handle.center().y),
+                Pos2::new(handle.right() - 3.0, handle.center().y),
+            ],
+            Stroke::new(2.0, accent.gamma_multiply(0.5 + 0.5 * streamer)),
+        );
     }
     if !enabled {
         p.rect_filled(track, 2.0, TRACK.gamma_multiply(0.7));
