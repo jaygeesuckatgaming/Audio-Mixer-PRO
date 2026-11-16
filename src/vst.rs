@@ -71,6 +71,80 @@ struct Inner {
     failed: bool,
 }
 
+/// The vst3-host window procedure ignores `WM_SIZE`, so dragging the frame
+/// edge would grow an empty border around an editor that keeps its original
+/// size. Ask the plug-in to adopt the new client size instead, and shrink the
+/// frame back when the plug-in clamps it.
+#[cfg(windows)]
+mod plugin_window {
+    use super::*;
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetClientRect, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOZORDER,
+    };
+
+    fn editor_hwnd() -> Option<HWND> {
+        let class: Vec<u16> = "VST3PluginWindow\0".encode_utf16().collect();
+        let hwnd = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
+        if hwnd.is_null() {
+            None
+        } else {
+            Some(hwnd)
+        }
+    }
+
+    pub fn sync(plugin: &Arc<Mutex<Plugin>>) {
+        let Some(hwnd) = editor_hwnd() else {
+            return;
+        };
+
+        let mut client = RECT::default();
+        if unsafe { GetClientRect(hwnd, &mut client) } == 0 {
+            return;
+        }
+        let (width, height) = (client.right - client.left, client.bottom - client.top);
+        if width <= 0 || height <= 0 {
+            return;
+        }
+
+        let Ok(mut plugin) = plugin.lock() else {
+            return;
+        };
+        if !plugin.editor_can_resize() {
+            return;
+        }
+        if matches!(plugin.attached_editor_size(), Ok(Some(size)) if size == (width, height)) {
+            return;
+        }
+        let Ok((accepted_w, accepted_h)) = plugin.resize_editor(width, height) else {
+            return;
+        };
+        if (accepted_w, accepted_h) == (width, height) {
+            return;
+        }
+
+        // The plug-in kept its own size: shrink the frame so no empty border
+        // is left around the editor.
+        let mut window = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut window) } != 0 {
+            let frame_w = (window.right - window.left) - width;
+            let frame_h = (window.bottom - window.top) - height;
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    accepted_w + frame_w,
+                    accepted_h + frame_h,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+}
+
 /// The native editor window holds a raw window handle, which the compiler
 /// cannot prove is `Send`. Every editor operation (`open_editor`,
 /// `service_editor`, `close_editor`) is called from the UI thread only; the
@@ -270,6 +344,12 @@ impl VstChain {
         };
         if let Some(window) = inner.editor.as_ref() {
             let _ = window.0.service_platform_events();
+            #[cfg(windows)]
+            if window.0.is_open() {
+                if let Some(loaded) = inner.loaded.as_ref() {
+                    plugin_window::sync(&loaded.plugin);
+                }
+            }
         }
         let closed = inner.editor.as_ref().map_or(false, |window| {
             window.0.closed_by_user() || !window.0.is_open()
