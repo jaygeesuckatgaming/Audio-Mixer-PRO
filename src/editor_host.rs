@@ -24,14 +24,23 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetWindowLongPtrW, PeekMessageW, RegisterClassExW, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOW, WM_ACTIVATE, WM_CLOSE, WM_KILLFOCUS, WM_SETFOCUS, WNDCLASSEXW, WS_MAXIMIZEBOX,
+    SW_SHOW, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE, WM_ENTERMENULOOP, WM_EXITMENULOOP,
+    WM_KILLFOCUS, WM_NCRBUTTONDOWN, WM_SETFOCUS, WM_SYSCOMMAND, WNDCLASSEXW, WS_MAXIMIZEBOX,
     WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 
 const CLASS_NAME: &str = "MusicRemoverEditorHost";
 
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if msg == WM_ACTIVATE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS {
+    if msg == WM_ACTIVATE
+        || msg == WM_SETFOCUS
+        || msg == WM_KILLFOCUS
+        || msg == WM_SYSCOMMAND
+        || msg == WM_ENTERMENULOOP
+        || msg == WM_EXITMENULOOP
+        || msg == WM_NCRBUTTONDOWN
+        || msg == WM_ACTIVATEAPP
+    {
         crate::diag_log(format!("editor: host msg {msg:#06x} wparam {wp} (hwnd {hwnd:p})"));
     }
     if msg == WM_CLOSE {
@@ -96,6 +105,8 @@ pub struct EditorHost {
     title: Vec<u16>,
     size: (i32, i32),
     plugin: Arc<std::sync::Mutex<Plugin>>,
+    /// Frame counter for the periodic state dump.
+    ticks: u32,
     /// Last focus state handed to the view. VST 3 requires the host to call
     /// `IPlugView::onFocus`, and plug-ins run or park their meter timers on it.
     focused: bool,
@@ -211,6 +222,7 @@ impl EditorHost {
             title,
             size: (width, height),
             plugin: shared,
+            ticks: 0,
             focused,
         })
     }
@@ -226,6 +238,8 @@ impl EditorHost {
             return false;
         }
         self.report_focus();
+        self.ensure_child_focus();
+        self.log_state();
         let Some(editor) = self.editor.as_ref() else {
             return false;
         };
@@ -264,6 +278,49 @@ impl EditorHost {
     /// Tell the view whether its window is focused, once per UI frame. The
     /// audio thread holds the plug-in lock per block, so a `try_lock` that
     /// loses is simply retried next frame.
+    /// Keep keyboard focus on the plug-in's child window. It starts on our host
+    /// window, and VSTGUI/other editors only run their idle timers when their
+    /// own window has focus — which is why a right-click on the title bar used
+    /// to bring the meters to life.
+    fn ensure_child_focus(&mut self) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        if !self.focused {
+            return;
+        }
+        let focus = unsafe { GetFocus() } as isize;
+        // Only step in when nobody holds focus (or our host does); a child that
+        // the plug-in focused itself (a text field, say) is left alone.
+        if focus != 0 && focus != self.hwnd {
+            return;
+        }
+        if let Some(child) = first_child(self.hwnd as HWND) {
+            unsafe { SetFocus(child) };
+        }
+    }
+
+    /// Dump the activation chain every couple of seconds while an editor is
+    /// open so a plug-in that only starts on a real window activation can be
+    /// compared before and after the person clicks something.
+    fn log_state(&mut self) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, GetFocus};
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        self.ticks += 1;
+        if self.ticks % 4 != 0 {
+            return;
+        }
+        let child = first_child(self.hwnd as HWND).unwrap_or(std::ptr::null_mut());
+        unsafe {
+            crate::diag_log(format!(
+                "editor: state fg={:#x} active={:#x} focus={:#x} host={:#x} child={:#x}",
+                GetForegroundWindow() as isize,
+                GetActiveWindow() as isize,
+                GetFocus() as isize,
+                self.hwnd,
+                child as isize
+            ));
+        }
+    }
+
     fn report_focus(&mut self) {
         use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
         let foreground = unsafe { GetForegroundWindow() as isize };
