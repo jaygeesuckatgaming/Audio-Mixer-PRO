@@ -31,15 +31,23 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const CLASS_NAME: &str = "MusicRemoverEditorHost";
 
+/// Tracing is opt-in (`--vst-log`); the mixer should not write a line per
+/// frame during normal use.
+fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::args().any(|a| a == "--vst-log"))
+}
+
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if msg == WM_ACTIVATE
+    if tracing()
+        && (msg == WM_ACTIVATE
         || msg == WM_SETFOCUS
         || msg == WM_KILLFOCUS
         || msg == WM_SYSCOMMAND
         || msg == WM_ENTERMENULOOP
         || msg == WM_EXITMENULOOP
         || msg == WM_NCRBUTTONDOWN
-        || msg == WM_ACTIVATEAPP
+        || msg == WM_ACTIVATEAPP)
     {
         crate::diag_log(format!("editor: host msg {msg:#06x} wparam {wp} (hwnd {hwnd:p})"));
     }
@@ -195,14 +203,8 @@ impl EditorHost {
         };
 
         unsafe {
-            // Force a full deactivate/reactivate cycle. Plug-in editors that
-            // only start their idle timer on a real activation never got one
-            // here, and used to need the person to open the system menu on the
-            // title bar before the meters came to life.
-            ShowWindow(hwnd, SW_HIDE);
             ShowWindow(hwnd, SW_SHOW);
             windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow(hwnd);
             // Hand keyboard focus to the plug-in's own child window. Without
             // this the top-level window keeps focus and plug-ins that run their
             // meters only while focused never start.
@@ -310,8 +312,11 @@ impl EditorHost {
     fn log_state(&mut self) {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, GetFocus};
         use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        if !tracing() {
+            return;
+        }
         self.ticks += 1;
-        if self.ticks % 4 != 0 {
+        if self.ticks % 30 != 0 {
             return;
         }
         let child = first_child(self.hwnd as HWND).unwrap_or(std::ptr::null_mut());
