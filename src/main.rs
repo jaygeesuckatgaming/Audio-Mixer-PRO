@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod editor_host;
 mod sessions;
 mod vban;
 mod vc;

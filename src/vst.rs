@@ -11,7 +11,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
 use vst3_host::audio::BusAudioBuffers;
-use vst3_host::window::PluginWindow;
 use vst3_host::Plugin;
 
 /// Maximum frames a callback may hand to the plug-in. The main output buffer
@@ -185,7 +184,7 @@ unsafe fn shape_editor_window(hwnd: isize, mixer: isize) {
 /// `service_editor`, `close_editor`) is called from the UI thread only; the
 /// audio thread never touches this field. The assertion keeps the rest of the
 /// chain shareable with the audio callback.
-struct EditorSlot(PluginWindow);
+struct EditorSlot(crate::editor_host::EditorHost);
 unsafe impl Send for EditorSlot {}
 
 pub struct VstChain {
@@ -359,7 +358,7 @@ impl VstChain {
     /// "Open VST" action beside the slot button: the mixer never draws the
     /// plug-in's settings itself.
     pub fn open_editor(&self, mixer_hwnd: isize) -> Result<(), String> {
-        let plugin = {
+        let (plugin, name) = {
             let inner = self
                 .inner
                 .lock()
@@ -380,33 +379,18 @@ impl VstChain {
             {
                 return Ok(());
             }
-            loaded.plugin.clone()
+            (loaded.plugin.clone(), loaded.info.name.clone())
         };
-        // Build the native window without holding the slot lock: audio keeps
-        // flowing while the plug-in creates its own screen.
-        let mut window = PluginWindow::new(plugin);
+        // The window is ours and the plug-in's editor is embedded in it as a
+        // child, which is the arrangement plug-in GUIs are written against.
+        // Building it happens without the slot lock so audio keeps flowing.
         #[cfg(windows)]
-        let before = editor_windows();
-        window
-            .open()
-            .map_err(|err| format!("Could not open the plug-in's own screen: {err}"))?;
+        let mut host = crate::editor_host::EditorHost::open(plugin, &name)?;
+        #[cfg(not(windows))]
+        let mut host = return Err("Plug-in editors are only hosted on Windows".to_string());
         #[cfg(windows)]
-        {
-            let after = editor_windows();
-            let created = after.iter().copied().find(|hwnd| !before.contains(hwnd));
-            if let Some(hwnd) = created {
-                unsafe { shape_editor_window(hwnd, mixer_hwnd) };
-                crate::diag_log(format!(
-                    "vst: editor window {:#x} shaped for mixer {:#x}",
-                    hwnd, mixer_hwnd
-                ));
-            } else {
-                crate::diag_log("vst: new editor window not found in the class list");
-            }
-        }
-        // The plug-in's editor is a native top-level window, so its title bar
-        // follows the OS light/dark setting rather than the mixer's palette.
-        darken_plugin_windows();
+        host.place_beside(mixer_hwnd);
+        crate::vst::darken_plugin_windows();
         let mut inner = self
             .inner
             .lock()
@@ -414,7 +398,7 @@ impl VstChain {
         if let Some(mut old) = inner.editor.take() {
             old.0.close();
         }
-        inner.editor = Some(EditorSlot(window));
+        inner.editor = Some(EditorSlot(host));
         inner.error = None;
         Ok(())
     }
@@ -426,13 +410,11 @@ impl VstChain {
             Ok(inner) => inner,
             Err(_) => return,
         };
-        if let Some(window) = inner.editor.as_ref() {
-            let _ = window.0.service_platform_events();
-        }
-        let closed = inner.editor.as_ref().map_or(false, |window| {
-            window.0.closed_by_user() || !window.0.is_open()
-        });
-        if closed {
+        let still_open = match inner.editor.as_mut() {
+            Some(window) => window.0.service(),
+            None => false,
+        };
+        if !still_open {
             if let Some(mut window) = inner.editor.take() {
                 window.0.close();
             }
