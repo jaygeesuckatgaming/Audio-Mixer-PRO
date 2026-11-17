@@ -5287,13 +5287,6 @@ impl MixerApp {
             ui.painter().rect_filled(insert, 3.0, TRACK);
             ui.painter().rect_stroke(insert, 3.0, Stroke::new(1.0, border));
 
-            ui.painter().text(
-                Pos2::new(insert.left() + 5.0, insert.top() + 3.0),
-                Align2::LEFT_TOP,
-                "INSERT",
-                FontId::proportional(6.3),
-                FAINT,
-            );
             let (state, state_color) = if error.is_some() {
                 ("ERROR", RED)
             } else if !loaded {
@@ -5304,7 +5297,7 @@ impl MixerApp {
                 ("ACTIVE", TEAL)
             };
             ui.painter().text(
-                Pos2::new(insert.right() - 5.0, insert.top() + 3.0),
+                Pos2::new(insert.right() - 5.0, insert.bottom() - 14.0),
                 Align2::RIGHT_TOP,
                 state,
                 FontId::proportional(6.3),
@@ -5330,14 +5323,14 @@ impl MixerApp {
                 Some(info) => {
                     let vendor = format!("{} {}", info.vendor, info.version);
                     ui.painter().text(
-                        Pos2::new(insert.left() + 5.0, insert.top() + 14.0),
+                        Pos2::new(insert.left() + 5.0, insert.top() + 6.0),
                         Align2::LEFT_TOP,
                         fit_text(ui.painter(), &info.name, 7.8, insert.width() - 10.0),
                         FontId::proportional(7.8),
                         TEXT,
                     );
                     ui.painter().text(
-                        Pos2::new(insert.left() + 5.0, insert.top() + 25.0),
+                        Pos2::new(insert.left() + 5.0, insert.top() + 18.0),
                         Align2::LEFT_TOP,
                         fit_text(ui.painter(), &vendor, 6.4, insert.width() - 10.0),
                         FontId::proportional(6.4),
@@ -5345,7 +5338,7 @@ impl MixerApp {
                     );
                     if !latency.is_empty() {
                         ui.painter().text(
-                            Pos2::new(insert.left() + 5.0, insert.top() + 34.0),
+                            Pos2::new(insert.left() + 5.0, insert.top() + 28.0),
                             Align2::LEFT_TOP,
                             &latency,
                             FontId::proportional(6.4),
@@ -5355,14 +5348,14 @@ impl MixerApp {
                 }
                 None => {
                     ui.painter().text(
-                        Pos2::new(insert.left() + 5.0, insert.top() + 14.0),
+                        Pos2::new(insert.left() + 5.0, insert.top() + 6.0),
                         Align2::LEFT_TOP,
                         "No plug-in",
                         FontId::proportional(7.8),
                         FAINT,
                     );
                     ui.painter().text(
-                        Pos2::new(insert.left() + 5.0, insert.top() + 25.0),
+                        Pos2::new(insert.left() + 5.0, insert.top() + 18.0),
                         Align2::LEFT_TOP,
                         fit_text(
                             ui.painter(),
@@ -5377,7 +5370,7 @@ impl MixerApp {
             }
             if let Some(err) = error.as_ref() {
                 ui.painter().text(
-                    Pos2::new(insert.left() + 5.0, insert.top() + 47.0),
+                    Pos2::new(insert.left() + 5.0, insert.top() + 41.0),
                     Align2::LEFT_TOP,
                     fit_text(ui.painter(), err, 6.2, insert.width() - 10.0),
                     FontId::proportional(6.2),
@@ -5421,15 +5414,11 @@ impl MixerApp {
                 self.vsts[idx].chain.set_bypass(bypass);
             }
 
-            let hint = if loaded {
-                "Click: open  ·  Right click: bypass"
-            } else {
-                "Click to choose a plug-in"
-            };
+            let hint = if loaded { "Open" } else { "Choose" };
             ui.painter().text(
                 Pos2::new(insert.left() + 5.0, insert.bottom() - 14.0),
                 Align2::LEFT_TOP,
-                fit_text(ui.painter(), hint, 6.0, insert.width() - 10.0),
+                fit_text(ui.painter(), hint, 6.0, insert.width() - 44.0),
                 FontId::proportional(6.0),
                 FAINT,
             );
