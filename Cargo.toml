@@ -48,3 +48,7 @@ embed-resource = "3"
 
 [profile.release]
 opt-level = 2
+
+[patch.crates-io]
+# VST 3 requires the host to send IPlugView::onFocus; upstream never does.
+vst3-host = { path = "vendor/vst3-host" }

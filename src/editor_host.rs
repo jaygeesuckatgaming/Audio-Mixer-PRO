@@ -72,6 +72,10 @@ pub struct EditorHost {
     closed: Arc<AtomicBool>,
     title: Vec<u16>,
     size: (i32, i32),
+    plugin: Arc<std::sync::Mutex<Plugin>>,
+    /// Last focus state handed to the view. VST 3 requires the host to call
+    /// `IPlugView::onFocus`, and plug-ins run or park their meter timers on it.
+    focused: bool,
 }
 
 unsafe impl Send for EditorHost {}
@@ -138,6 +142,7 @@ impl EditorHost {
         };
         let handle = RawWindowHandle::Win32(Win32WindowHandle::new(raw_hwnd));
 
+        let shared = plugin.clone();
         let editor = match EmbeddedEditor::embed(
             plugin,
             handle,
@@ -155,7 +160,12 @@ impl EditorHost {
             }
         };
 
-        unsafe { ShowWindow(hwnd, SW_SHOW) };
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            // Bring the editor forward so the plug-in is told it has focus
+            // straight away; meters stay parked until `onFocus(true)` arrives.
+            windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        }
 
         Ok(Self {
             hwnd: hwnd as isize,
@@ -163,6 +173,8 @@ impl EditorHost {
             closed,
             title,
             size: (width, height),
+            plugin: shared,
+            focused: false,
         })
     }
 
@@ -176,6 +188,7 @@ impl EditorHost {
         if self.closed.load(Ordering::Relaxed) {
             return false;
         }
+        self.report_focus();
         let Some(editor) = self.editor.as_ref() else {
             return false;
         };
@@ -209,6 +222,22 @@ impl EditorHost {
             self.size = (w, h);
         }
         true
+    }
+
+    /// Tell the view whether its window is focused, once per UI frame. The
+    /// audio thread holds the plug-in lock per block, so a `try_lock` that
+    /// loses is simply retried next frame.
+    fn report_focus(&mut self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let focused = unsafe { GetForegroundWindow() as isize } == self.hwnd;
+        if focused == self.focused {
+            return;
+        }
+        if let Ok(mut plugin) = self.plugin.try_lock() {
+            if plugin.set_editor_focus(focused).is_ok() {
+                self.focused = focused;
+            }
+        }
     }
 
     pub fn size(&self) -> (i32, i32) {
