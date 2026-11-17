@@ -519,9 +519,14 @@ impl EditorHost {
         }
     }
 
-    /// Pump this thread's message queue. The mixer's own event loop usually
-    /// does this, but plug-in editors that open their own modal dialogs need
-    /// the pump to run while they are up.
+    /// Drain this thread's message queue.
+    ///
+    /// VSTGUI editors drive their meters from `WM_TIMER`, and Windows only
+    /// hands a timer message out when the queue is otherwise empty. Our own
+    /// event loop keeps the queue busy, so editors sat there with dead meters
+    /// until something forced a modal loop (right-clicking the title bar).
+    /// The caller must not hold the VST slot lock: draining the queue pumps
+    /// audio-thread work through this thread.
     pub fn pump_messages() {
         let mut msg: MSG = unsafe { std::mem::zeroed() };
         unsafe {

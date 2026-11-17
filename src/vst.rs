@@ -193,6 +193,9 @@ pub struct VstChain {
     bypass: AtomicBool,
     /// Output peak of the last processed block, linear.
     peak: AtomicU32,
+    /// Whether any slot currently has an editor window open, so the UI thread
+    /// knows to drain the message queue without taking the slot lock.
+    editor_open: AtomicBool,
     /// Blocks handed to the plug-in, and blocks that fell through as dry
     /// audio because the slot was bypassed, locked, or had failed.
     processed_blocks: AtomicU64,
@@ -213,6 +216,7 @@ impl VstChain {
             has_plugin: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
             peak: AtomicU32::new(0),
+            editor_open: AtomicBool::new(false),
             processed_blocks: AtomicU64::new(0),
             dry_blocks: AtomicU64::new(0),
             in_peak: AtomicU32::new(0),
@@ -400,12 +404,19 @@ impl VstChain {
         }
         inner.editor = Some(EditorSlot(host));
         inner.error = None;
+        self.editor_open.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     /// Keep the open editor alive: apply plug-in resize requests and notice
     /// the title-bar close button. Called once per UI frame.
     pub fn service_editor(&self) {
+        // Queue drain happens before the slot lock is taken: doing it while the
+        // lock is held starves the audio callback (measured ~3% of blocks
+        // passing through dry).
+        if self.editor_open.load(Ordering::Relaxed) {
+            crate::editor_host::EditorHost::pump_messages();
+        }
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(_) => return,
@@ -418,6 +429,7 @@ impl VstChain {
             if let Some(mut window) = inner.editor.take() {
                 window.0.close();
             }
+            self.editor_open.store(false, Ordering::Relaxed);
         }
     }
 
@@ -452,6 +464,7 @@ impl VstChain {
                 window.0.close();
             }
         }
+        self.editor_open.store(false, Ordering::Relaxed);
     }
 
     pub fn set_parameter(&self, id: u32, value: f64) -> Result<(), String> {
