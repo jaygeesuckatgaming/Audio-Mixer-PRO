@@ -6,7 +6,7 @@
 //! take the mixer down or silence the microphone.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -194,6 +194,12 @@ pub struct VstChain {
     bypass: AtomicBool,
     /// Output peak of the last processed block, linear.
     peak: AtomicU32,
+    /// Blocks handed to the plug-in, and blocks that fell through as dry
+    /// audio because the slot was bypassed, locked, or had failed.
+    processed_blocks: AtomicU64,
+    dry_blocks: AtomicU64,
+    /// Peak of the audio handed to the plug-in, linear.
+    in_peak: AtomicU32,
 }
 
 impl VstChain {
@@ -208,7 +214,34 @@ impl VstChain {
             has_plugin: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
             peak: AtomicU32::new(0),
+            processed_blocks: AtomicU64::new(0),
+            dry_blocks: AtomicU64::new(0),
+            in_peak: AtomicU32::new(0),
         })
+    }
+
+    /// One-line state for `--vst-log`, so a silent slot can be told apart from
+    /// a plug-in whose editor simply is not repainting.
+    pub fn diag(&self) -> String {
+        let (failed, error, editor) = match self.inner.lock() {
+            Ok(inner) => (
+                inner.failed,
+                inner.error.clone().unwrap_or_default(),
+                inner.editor.is_some(),
+            ),
+            Err(_) => (true, "lock poisoned".to_string(), false),
+        };
+        format!(
+            "processed={} dry={} in={:.5} out={:.5} bypass={} failed={} editor={} error='{}'",
+            self.processed_blocks.load(Ordering::Relaxed),
+            self.dry_blocks.load(Ordering::Relaxed),
+            f32::from_bits(self.in_peak.load(Ordering::Relaxed)),
+            f32::from_bits(self.peak.load(Ordering::Relaxed)),
+            self.bypass.load(Ordering::Relaxed),
+            failed,
+            editor,
+            error
+        )
     }
 
     pub fn has_plugin(&self) -> bool {
@@ -545,6 +578,7 @@ impl VstChain {
         out_r: &mut [f32],
     ) -> bool {
         if !self.has_plugin.load(Ordering::Relaxed) || self.bypass.load(Ordering::Relaxed) {
+            self.dry_blocks.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         let frames = in_l.len().min(in_r.len()).min(out_l.len()).min(out_r.len());
@@ -554,13 +588,20 @@ impl VstChain {
         // Never block the real-time callback behind the editor or a plug-in
         // load. A busy slot passes dry audio for this block.
         let Ok(mut inner) = self.inner.try_lock() else {
+            self.dry_blocks.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if inner.failed {
+            self.dry_blocks.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         // Keep the mutable borrow of the loaded slot inside this block so the
         // error can be recorded afterwards without borrowing `inner` twice.
+        let mut in_peak = 0.0f32;
+        for i in 0..frames {
+            in_peak = in_peak.max(in_l[i].abs()).max(in_r[i].abs());
+        }
+        self.in_peak.store(in_peak.to_bits(), Ordering::Relaxed);
         let outcome: Result<f32, String> = {
             let Some(loaded) = inner.loaded.as_mut() else {
                 return false;
@@ -647,9 +688,11 @@ impl VstChain {
         match outcome {
             Ok(peak) => {
                 self.peak.store(peak.to_bits(), Ordering::Relaxed);
+                self.processed_blocks.fetch_add(1, Ordering::Relaxed);
                 true
             }
             Err(err) => {
+                self.dry_blocks.fetch_add(1, Ordering::Relaxed);
                 inner.error = Some(err);
                 inner.failed = true;
                 false

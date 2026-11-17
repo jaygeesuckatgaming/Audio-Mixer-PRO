@@ -982,6 +982,10 @@ struct MixerApp {
     /// `--open-vst-editor <slot>`: open one strip's plug-in window shortly after
     /// start-up so the editor path can be reproduced without clicking.
     open_editor_once: Option<usize>,
+    /// `--vst-log`: write each loaded plug-in slot's processing counters to
+    /// startup.log once a second.
+    vst_log: bool,
+    vst_log_clock: f64,
     show_vban: bool,
     vban: vban::VbanHub,
     vban_enabled: bool,
@@ -1508,6 +1512,8 @@ impl MixerApp {
                 .position(|a| a == "--open-vst-editor")
                 .and_then(|pos| std::env::args().nth(pos + 1))
                 .and_then(|value| value.parse::<usize>().ok()),
+            vst_log: std::env::args().any(|a| a == "--vst-log"),
+            vst_log_clock: 0.0,
             show_vban: false,
             vban: vban::VbanHub::new(),
             vban_enabled: false,
@@ -8733,6 +8739,26 @@ impl eframe::App for MixerApp {
         // button), without ever drawing its settings inside the mixer.
         for slot in &mut self.vsts {
             slot.chain.service_editor();
+        }
+        if self.vst_log {
+            self.vst_log_clock += dt as f64;
+            if self.vst_log_clock >= 1.0 {
+                self.vst_log_clock = 0.0;
+                for (index, slot) in self.vsts.iter().enumerate() {
+                    if slot.chain.has_plugin() {
+                        let label = self.strip_label(index);
+                        let name = slot
+                            .info
+                            .as_ref()
+                            .map(|i| i.name.clone())
+                            .unwrap_or_default();
+                        diag_log(format!(
+                            "vst[{index}] '{label}' '{name}' {}",
+                            slot.chain.diag()
+                        ));
+                    }
+                }
+            }
         }
         if let Some(limit) = self.auto_exit {
             if self.time >= limit {
