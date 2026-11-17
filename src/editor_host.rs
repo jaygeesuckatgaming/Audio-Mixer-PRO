@@ -194,6 +194,16 @@ impl EditorHost {
             }
         }
 
+        // Tell the view it has focus right away. Plug-ins start their meter
+        // timers from `IPlugView::onFocus`, and waiting for a real foreground
+        // change never arrives here (Windows refuses our SetForegroundWindow),
+        // which left editors looking correct with permanently dead meters until
+        // the person right-clicked the title bar and activated the window.
+        let mut focused = false;
+        if let Ok(mut plugin) = shared.lock() {
+            focused = plugin.set_editor_focus(true).is_ok();
+        }
+
         Ok(Self {
             hwnd: hwnd as isize,
             editor: Some(editor),
@@ -201,7 +211,7 @@ impl EditorHost {
             title,
             size: (width, height),
             plugin: shared,
-            focused: false,
+            focused,
         })
     }
 
