@@ -1901,6 +1901,21 @@ impl MixerApp {
 
     /// Open (or bring back) one strip's plug-in's own window. The mixer itself
     /// never draws the plug-in's settings, so this is the only way to edit them.
+    /// Open the plug-in chooser for one strip. Used by the header chip and by
+    /// the insert panel when the strip has no plug-in yet.
+    fn open_vst_chooser(&mut self, slot: usize) {
+        if slot >= self.vsts.len() {
+            return;
+        }
+        self.vst_panel = Some(slot);
+        if self.vsts[slot].info.is_none() && self.vsts[slot].chain.has_plugin() {
+            self.vsts[slot].info = self.vsts[slot].chain.info();
+        }
+        if self.vst_scan_results.is_empty() && !self.vst_scanning {
+            self.start_vst_scan();
+        }
+    }
+
     fn open_vst_editor(&mut self, slot: usize) {
         if slot >= self.vsts.len() {
             return;
@@ -3324,6 +3339,10 @@ impl MixerApp {
                 } else if self.audio.available {
                     self.open_default_input();
                     self.apply_saved_inputs();
+                }
+                if self.audio.available {
+                    // Plug-ins do not touch the audio service, so they are
+                    // restored even when the device probe timed out.
                     let _ = self.apply_audio_format();
                     self.restore_vst(false);
                 } else {
@@ -3722,6 +3741,18 @@ impl MixerApp {
             if let Some(v) = f32_attr(attrs, "EQGain3") {
                 s.eq[2] = v.clamp(EQ_GAIN_MIN, EQ_GAIN_MAX);
             }
+            // The strip's built-in pan, compressor, gate and 3-band EQ are no
+            // longer on the panel: every channel runs a VST3 insert instead.
+            // Their saved values are deliberately dropped, otherwise a scene
+            // would keep processors running that cannot be seen or adjusted.
+            s.pan = 0.0;
+            s.comp = 0.0;
+            s.gate = 0.0;
+            s.eq = [0.0, 0.0, 0.0];
+            s.intelli = [0.0, 0.0];
+            s.panel_type = 0;
+            s.color_panel = [0.0, 0.0];
+            s.mod_panel = [0.0, 0.0];
         }
 
         // FUN_0052c030: bus elements. BusMode is stored as a nibble.
@@ -5044,25 +5075,15 @@ impl MixerApp {
         let hresp = ui.interact(header, Id::new(("strip_head", idx)), Sense::click());
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let vst_btn = Rect::from_min_size(
-            Pos2::new(header.right() - 25.0, header.top() + 1.0),
-            Vec2::new(24.0, 11.0),
-        );
-        let open_vst_btn = Rect::from_min_size(
-            Pos2::new(header.right() - 25.0, header.top() + 13.5),
+            Pos2::new(header.right() - 25.0, header.top() + 7.5),
             Vec2::new(24.0, 11.0),
         );
         let mut over_vst = false;
         {
-            // Every input strip has its own VST3 insert. This is a rebuild
-            // extension: the original console has no plug-in slot. Two
-            // separate actions, exactly as the person asked: VST chooses the
-            // plug-in, OPEN VST shows that strip's plug-in's own screen.
+            // Every input strip has its own VST3 insert. This chip chooses the
+            // plug-in; the INSERT panel below opens its own screen.
             let vst_resp = ui.interact(vst_btn, Id::new(("vst_slot", idx)), Sense::click());
-            let open_resp =
-                ui.interact(open_vst_btn, Id::new(("vst_open", idx)), Sense::click());
-            over_vst = pointer.map_or(false, |p| {
-                vst_btn.contains(p) || open_vst_btn.contains(p)
-            });
+            over_vst = pointer.map_or(false, |p| vst_btn.contains(p));
             let loaded = self.vsts[idx].loaded();
             let fill = if loaded {
                 if self.vsts[idx].bypass {
@@ -5086,55 +5107,19 @@ impl MixerApp {
                 FontId::proportional(6.3),
                 if loaded { TEXT } else { DIM },
             );
-            let open_enabled = loaded
-                && self.vsts[idx]
-                    .info
-                    .as_ref()
-                    .map_or(false, |i| i.has_gui);
-            let open_fill = if open_enabled {
-                Color32::from_rgb(38, 74, 98)
-            } else {
-                TRACK
-            };
-            ui.painter().rect_filled(open_vst_btn, 2.0, open_fill);
-            ui.painter().rect_stroke(
-                open_vst_btn,
-                2.0,
-                Stroke::new(1.0, if open_enabled { TEAL } else { LINE }),
-            );
-            ui.painter().text(
-                open_vst_btn.center(),
-                Align2::CENTER_CENTER,
-                "OPEN",
-                FontId::proportional(5.8),
-                if open_enabled { TEXT } else { FAINT },
-            );
-            let vst_clicked = vst_resp.clicked();
-            let open_clicked = open_resp.clicked();
+            let clicked = vst_resp.clicked();
             let _ = vst_resp.on_hover_text(format!(
                 "VST3 plug-in slot on {}: click to choose a plug-in",
                 self.strip_label(idx)
             ));
-            let _ = open_resp.on_hover_text(
-                "Open VST: show this channel's plug-in's own screen in its own window",
-            );
-            if vst_clicked && enabled {
-                self.vst_panel = Some(idx);
-                if self.vsts[idx].info.is_none() && self.vsts[idx].chain.has_plugin() {
-                    self.vsts[idx].info = self.vsts[idx].chain.info();
-                }
-                if self.vst_scan_results.is_empty() && !self.vst_scanning {
-                    self.start_vst_scan();
-                }
-            }
-            if open_clicked && enabled && open_enabled {
-                self.open_vst_editor(idx);
+            if clicked && enabled {
+                self.open_vst_chooser(idx);
             }
         }
         ui.painter().text(
             Pos2::new(header.left(), header.top() + 1.0),
             Align2::LEFT_TOP,
-            fit_text(ui.painter(), &self.strips[idx].name, 9.5, w),
+            fit_text(ui.painter(), &self.strips[idx].name, 9.5, w - 27.0),
             FontId::proportional(9.5),
             TEXT,
         );
@@ -5182,31 +5167,6 @@ impl MixerApp {
                     ui.close_menu();
                 }
                 ui.separator();
-                if self.strips[idx].kind == StripKind::Virtual {
-                    // Command 0x25b / 0x261.
-                    if ui.button("Reset EQUALIZER").clicked() {
-                        reset_eq = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("Reset Pan Pot").clicked() {
-                        reset_pan = true;
-                        ui.close_menu();
-                    }
-                } else {
-                    // Commands 0x259 / 0x25c / 0x25d.
-                    if ui.button("Reset INTELLIPAN").clicked() {
-                        reset_panel = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("Reset Compressor").clicked() {
-                        reset_comp = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("Reset Gate").clicked() {
-                        reset_gate = true;
-                        ui.close_menu();
-                    }
-                }
                 if self.strip_cable(idx).is_some() {
                     ui.separator();
                     let label = if self.apps_open[idx] {
@@ -5304,340 +5264,177 @@ impl MixerApp {
         }
         y += 29.0;
 
-        // Knob row. The original gives the three hardware inputs a PAN, COMP and
-        // GATE knob (accessibility names InComp1-3 / InGate1-3), while the two
-        // virtual inputs carry PAN plus the 3-band EQ (VIn1EQ*, VIn2EQ*).
-        let is_virtual = self.strips[idx].kind == StripKind::Virtual;
-        let cell = w / if is_virtual { 4.0 } else { 3.0 };
-        let r = 9.5;
-        let accent_knob = accent;
+        // Plug-in insert panel. The built-in pan/comp/gate/3-band EQ controls are
+        // gone: every strip runs a VST3 insert, so this space names the plug-in
+        // that is actually in the chain and opens its own screen.
+        let insert = Rect::from_min_size(Pos2::new(inner.left(), y + 2.0), Vec2::new(w, 92.0));
+        let insert_resp = ui.interact(insert, Id::new(("insert_panel", idx)), Sense::click());
         {
-            let st = &mut self.strips[idx];
-            let mut pan = st.pan;
-            draw_knob(
-                ui,
-                Pos2::new(inner.left() + cell * 0.5, y + 11.0),
-                r,
-                &mut pan,
-                PAN_MIN,
-                PAN_MAX,
-                0.0,
-                accent_knob,
-                Id::new(("pan", idx)),
-                enabled,
-                "L/R pan: drag up/down, double click to centre",
+            let loaded = self.vsts[idx].loaded();
+            let bypassed = self.vsts[idx].bypass;
+            let error = self.vsts[idx].error.clone();
+            let border = if error.is_some() {
+                RED
+            } else if loaded {
+                if bypassed {
+                    AMBER
+                } else {
+                    TEAL
+                }
+            } else {
+                LINE
+            };
+            ui.painter().rect_filled(insert, 3.0, TRACK);
+            ui.painter().rect_stroke(insert, 3.0, Stroke::new(1.0, border));
+
+            ui.painter().text(
+                Pos2::new(insert.left() + 5.0, insert.top() + 3.0),
+                Align2::LEFT_TOP,
+                "INSERT",
+                FontId::proportional(6.3),
+                FAINT,
             );
-            st.pan = pan;
-            // FUN_00541ce0 stores the panel x in the same +0x08 field as
-            // the L/R pan knob, so keep the two controls in step.
-            st.intelli[0] = pan;
-        }
-        if is_virtual {
-            let mut vals = self.strips[idx].eq;
-            for i in 0..3 {
-                let accent2 = match i {
-                    0 => Color32::from_rgb(120, 170, 220),
-                    1 => Color32::from_rgb(120, 200, 170),
-                    _ => Color32::from_rgb(220, 180, 120),
-                };
-                let tip = match i {
-                    0 => "Low shelf 120 Hz: drag up/down, double click for 0 dB (0 dB bypasses)",
-                    1 => "Mid bell 1 kHz: drag up/down, double click for 0 dB (0 dB bypasses)",
-                    _ => "High shelf 6 kHz: drag up/down, double click for 0 dB (0 dB bypasses)",
-                };
-                draw_knob(
-                    ui,
-                    Pos2::new(inner.left() + cell * (i as f32 + 1.5), y + 11.0),
-                    r,
-                    &mut vals[i],
-                    EQ_GAIN_MIN,
-                    EQ_GAIN_MAX,
-                    0.0,
-                    accent2,
-                    Id::new(("eq", idx, i)),
-                    enabled,
-                    tip,
-                );
-                if vals[i].abs() > 0.05 {
-                    let activity = (vals[i].abs() / 12.0).clamp(0.0, 1.0);
-                    ui.painter().circle_stroke(
-                        Pos2::new(inner.left() + cell * (i as f32 + 1.5), y + 11.0),
-                        r * 1.2,
-                        Stroke::new(1.5, accent2.gamma_multiply(0.25 + 0.75 * activity)),
+            let (state, state_color) = if error.is_some() {
+                ("ERROR", RED)
+            } else if !loaded {
+                ("EMPTY", FAINT)
+            } else if bypassed {
+                ("BYPASS", AMBER)
+            } else {
+                ("ACTIVE", TEAL)
+            };
+            ui.painter().text(
+                Pos2::new(insert.right() - 5.0, insert.top() + 3.0),
+                Align2::RIGHT_TOP,
+                state,
+                FontId::proportional(6.3),
+                state_color,
+            );
+
+            let latency = if loaded {
+                let (in_latency, out_latency) = self.vsts[idx].chain.latency();
+                let samples = in_latency.max(out_latency);
+                if samples > 0 {
+                    format!(
+                        "{:.1} ms latency",
+                        (samples as f32 / self.sample_rate.max(1) as f32) * 1000.0
+                    )
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            match self.vsts[idx].info.as_ref() {
+                Some(info) => {
+                    let vendor = format!("{} {}", info.vendor, info.version);
+                    ui.painter().text(
+                        Pos2::new(insert.left() + 5.0, insert.top() + 14.0),
+                        Align2::LEFT_TOP,
+                        fit_text(ui.painter(), &info.name, 7.8, insert.width() - 10.0),
+                        FontId::proportional(7.8),
+                        TEXT,
+                    );
+                    ui.painter().text(
+                        Pos2::new(insert.left() + 5.0, insert.top() + 25.0),
+                        Align2::LEFT_TOP,
+                        fit_text(ui.painter(), &vendor, 6.4, insert.width() - 10.0),
+                        FontId::proportional(6.4),
+                        DIM,
+                    );
+                    if !latency.is_empty() {
+                        ui.painter().text(
+                            Pos2::new(insert.left() + 5.0, insert.top() + 34.0),
+                            Align2::LEFT_TOP,
+                            &latency,
+                            FontId::proportional(6.4),
+                            FAINT,
+                        );
+                    }
+                }
+                None => {
+                    ui.painter().text(
+                        Pos2::new(insert.left() + 5.0, insert.top() + 14.0),
+                        Align2::LEFT_TOP,
+                        "No plug-in",
+                        FontId::proportional(7.8),
+                        FAINT,
+                    );
+                    ui.painter().text(
+                        Pos2::new(insert.left() + 5.0, insert.top() + 25.0),
+                        Align2::LEFT_TOP,
+                        fit_text(
+                            ui.painter(),
+                            "Click to choose one",
+                            6.4,
+                            insert.width() - 10.0,
+                        ),
+                        FontId::proportional(6.4),
+                        DIM,
                     );
                 }
             }
-            self.strips[idx].eq = vals;
-        } else {
-            let prev_comp = self.strips[idx].comp;
-            let prev_gate = self.strips[idx].gate;
-            let mut comp = self.strips[idx].comp;
-            let mut gate = self.strips[idx].gate;
-            draw_knob(
-                ui,
-                Pos2::new(inner.left() + cell * 1.5, y + 11.0),
-                r,
-                &mut comp,
-                AUDIBILITY_MIN,
-                AUDIBILITY_MAX,
-                0.0,
-                RED,
-                Id::new(("comp", idx)),
-                enabled,
-                "Compressor amount (audibility_c, strip +0x34): 0..10, 0 = bypass. \
-                 Threshold -24 dBFS, 6 dB soft knee, ratio 1:1..11:1, \
-                 attack 10 ms, release 150 ms, auto make-up. Double click resets.",
-            );
-            draw_knob(
-                ui,
-                Pos2::new(inner.left() + cell * 2.5, y + 11.0),
-                r,
-                &mut gate,
-                AUDIBILITY_MIN,
-                AUDIBILITY_MAX,
-                0.0,
-                PURPLE,
-                Id::new(("gate", idx)),
-                enabled,
-                "Gate amount (audibility_g, strip +0x38): 0..10, 0 = bypass. \
-                 Gentle expander: threshold -55..-20 dBFS, 6 dB hysteresis, \
-                 -60 dB range, 1 ms open, 120 ms hold, 250 ms release. \
-                 Double click resets.",
-            );
-            // Thin rings show the live gain movement without changing the
-            // layout: red while the compressor pulls down, purple while the
-            // expander is attenuating.
-            let comp_gr = self.audio.strip_comp_gr_db(idx);
-            if comp > 0.0 && comp_gr < -0.3 {
-                let activity = (-comp_gr / 12.0).clamp(0.0, 1.0);
-                ui.painter().circle_stroke(
-                    Pos2::new(inner.left() + cell * 1.5, y + 11.0),
-                    r * 1.2,
-                    Stroke::new(1.5, RED.gamma_multiply(0.25 + 0.75 * activity)),
-                );
-            }
-            let gate_att = self.audio.strip_gate_att_db(idx);
-            if gate > 0.0 && gate_att < -0.5 {
-                let activity = (-gate_att / 60.0).clamp(0.0, 1.0);
-                ui.painter().circle_stroke(
-                    Pos2::new(inner.left() + cell * 2.5, y + 11.0),
-                    r * 1.2,
-                    Stroke::new(1.5, PURPLE.gamma_multiply(0.25 + 0.75 * activity)),
-                );
-            }
-            self.strips[idx].comp = comp;
-            self.strips[idx].gate = gate;
-            // FUN_00528410 runs on every comp/gate change and clears the
-            // matching program-active flag before rewriting the dynamics.
-            if comp != prev_comp {
-                self.strips[idx].comp_prg = false;
-            }
-            if gate != prev_gate {
-                self.strips[idx].gate_prg = false;
-            }
-        }
-        let lab_y = y + 23.0;
-        let labels: [&str; 4] = if is_virtual {
-            ["PAN", "BASS", "MED", "TREB"]
-        } else {
-            ["PAN", "COMP", "GATE", ""]
-        };
-        for (i, label) in labels.iter().enumerate() {
-            if label.is_empty() {
-                continue;
-            }
-            ui.painter().text(
-                Pos2::new(inner.left() + cell * (i as f32 + 0.5), lab_y),
-                Align2::CENTER_TOP,
-                *label,
-                FontId::proportional(6.8),
-                FAINT,
-            );
-        }
-        // tiny value readouts for pan and, on hardware, the three knobs
-        let pan_txt = if self.strips[idx].pan.abs() < 0.02 {
-            "C".to_string()
-        } else if self.strips[idx].pan < 0.0 {
-            format!("L{}", (self.strips[idx].pan.abs() * 200.0).round() as i32)
-        } else {
-            format!("R{}", (self.strips[idx].pan * 200.0).round() as i32)
-        };
-        ui.painter().text(
-            Pos2::new(inner.left() + cell * 0.5, y + 31.0),
-            Align2::CENTER_TOP,
-            pan_txt,
-            FontId::proportional(6.5),
-            DIM,
-        );
-        if !is_virtual {
-            let comp_gr = self.audio.strip_comp_gr_db(idx);
-            let (comp_text, comp_color) = if comp_gr < -0.3 {
-                (format!("{comp_gr:.1}"), RED)
-            } else {
-                (format!("{:.1}", self.strips[idx].comp), DIM)
-            };
-            ui.painter().text(
-                Pos2::new(inner.left() + cell * 1.5, y + 31.0),
-                Align2::CENTER_TOP,
-                comp_text,
-                FontId::proportional(6.5),
-                comp_color,
-            );
-            let gate_att = self.audio.strip_gate_att_db(idx);
-            let (gate_text, gate_color) = if gate_att < -0.5 {
-                (format!("{gate_att:.0}"), PURPLE)
-            } else {
-                (format!("{:.1}", self.strips[idx].gate), DIM)
-            };
-            ui.painter().text(
-                Pos2::new(inner.left() + cell * 2.5, y + 31.0),
-                Align2::CENTER_TOP,
-                gate_text,
-                FontId::proportional(6.5),
-                gate_color,
-            );
-        } else {
-            let colors = [
-                Color32::from_rgb(120, 170, 220),
-                Color32::from_rgb(120, 200, 170),
-                Color32::from_rgb(220, 180, 120),
-            ];
-            for band in 0..3 {
-                let value = self.strips[idx].eq[band];
-                let shown = if value.abs() < 0.05 {
-                    "0.0".to_string()
-                } else {
-                    format!("{value:+.1}")
-                };
+            if let Some(err) = error.as_ref() {
                 ui.painter().text(
-                    Pos2::new(inner.left() + cell * (band as f32 + 1.5), y + 31.0),
-                    Align2::CENTER_TOP,
-                    shown,
-                    FontId::proportional(6.5),
-                    if value.abs() < 0.05 {
-                        DIM
-                    } else {
-                        colors[band]
-                    },
+                    Pos2::new(insert.left() + 5.0, insert.top() + 47.0),
+                    Align2::LEFT_TOP,
+                    fit_text(ui.painter(), err, 6.2, insert.width() - 10.0),
+                    FontId::proportional(6.2),
+                    RED,
                 );
             }
-        }
-        y += 44.0;
 
-        // The space under the knobs holds the INTELLIPAN pad on hardware
-        // inputs and a small 3-band EQ display on the virtual inputs.
-        if is_virtual {
-            let panel = Rect::from_min_size(
-                Pos2::new(inner.left() + 6.0, y + 1.0),
-                Vec2::new(w - 12.0, 36.0),
-            );
-            ui.painter().rect_filled(panel, 3.0, TRACK);
-            ui.painter().rect_stroke(panel, 3.0, Stroke::new(1.0, LINE));
-            let mid = panel.center().y;
-            ui.painter().line_segment(
-                [Pos2::new(panel.left() + 4.0, mid), Pos2::new(panel.right() - 4.0, mid)],
-                Stroke::new(1.0, LINE),
-            );
-            let bw = (panel.width() - 20.0) / 3.0;
-            for i in 0..3 {
-                let x = panel.left() + 8.0 + bw * (i as f32 + 0.5);
-                let gain = self.strips[idx].eq[i].clamp(-12.0, 12.0);
-                let hh = (gain / 12.0) * (panel.height() * 0.40);
-                ui.painter().line_segment(
-                    [Pos2::new(x, mid), Pos2::new(x, mid - hh)],
-                    Stroke::new(3.0, match i {
-                        0 => Color32::from_rgb(120, 170, 220),
-                        1 => Color32::from_rgb(120, 200, 170),
-                        _ => Color32::from_rgb(220, 180, 120),
-                    }),
-                );
-            }
-            ui.painter().text(
-                Pos2::new(panel.center().x, panel.bottom() + 1.0),
-                Align2::CENTER_TOP,
-                "3-BAND EQ",
-                FontId::proportional(6.6),
-                FAINT,
-            );
-        } else {
-            let pad = Rect::from_min_size(Pos2::new(inner.left() + 6.0, y + 1.0), Vec2::new(w - 12.0, 36.0));
-            // FUN_0052b490 paneltype selects which pair the 3D panel edits:
-            // +0x08/+0x0c Pan, +0x10/+0x14 Color, +0x18/+0x1c Mod/Fx.
-            let mode = self.strips[idx].panel_type;
-            let mut xy = match mode {
-                1 => self.strips[idx].color_panel,
-                2 => self.strips[idx].mod_panel,
-                _ => self.strips[idx].intelli,
+            let tip = match self.vsts[idx].info.as_ref() {
+                Some(info) => format!(
+                    "{}\n{} {}\n{}\n{} in / {} out{}\nClick: open its screen   Right click: {}",
+                    info.name,
+                    info.vendor,
+                    info.version,
+                    info.path.display(),
+                    info.audio_inputs,
+                    info.audio_outputs,
+                    if latency.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{latency}")
+                    },
+                    if bypassed { "enable" } else { "bypass" }
+                ),
+                None => format!(
+                    "No plug-in on {}\nClick to choose one",
+                    self.strip_label(idx)
+                ),
             };
-            if mode == 0 {
-                // The L/R pan knob and the Pan panel share +0x08.
-                xy[0] = self.strips[idx].pan;
-            }
-            let mode_accent = match mode {
-                1 => Color32::from_rgb(120, 170, 220),
-                2 => Color32::from_rgb(150, 190, 120),
-                _ => accent,
-            };
-            draw_xy_pad(
-                ui,
-                pad,
-                &mut xy,
-                mode_accent,
-                Id::new(("intelli", idx)),
-                enabled,
-            );
-            match mode {
-                1 => self.strips[idx].color_panel = xy,
-                2 => self.strips[idx].mod_panel = xy,
-                _ => {
-                    // Same +0x08 field as the L/R pan knob.
-                    self.strips[idx].intelli = xy;
-                    self.strips[idx].pan = xy[0];
+            let _ = insert_resp.clone().on_hover_text(tip);
+
+            if insert_resp.clicked() && enabled {
+                if loaded {
+                    self.open_vst_editor(idx);
+                } else {
+                    self.open_vst_chooser(idx);
                 }
             }
-            let mode_name = match mode {
-                1 => "COLOR",
-                2 => "MOD",
-                _ => "INTELLIPAN",
-            };
-            let lab = Rect::from_center_size(
-                Pos2::new(pad.center().x, pad.bottom() + 6.0),
-                Vec2::new(76.0, 11.0),
-            );
-            let lresp = ui.interact(
-                lab,
-                Id::new(("intelli_mode", idx)),
-                if enabled { Sense::click() } else { Sense::hover() },
-            );
-            if lresp.clicked() && enabled {
-                let next = (mode + 1) % 3;
-                self.strips[idx].panel_type = next;
-                self.toast(format!(
-                    "INTELLIPAN mode {} (paneltype {})",
-                    match next {
-                        1 => "COLOR",
-                        2 => "MOD",
-                        _ => "PAN",
-                    },
-                    next
-                ));
+            if insert_resp.secondary_clicked() && enabled && loaded {
+                let bypass = !bypassed;
+                self.vsts[idx].bypass = bypass;
+                self.vsts[idx].chain.set_bypass(bypass);
             }
+
+            let hint = if loaded {
+                "Click: open  ·  Right click: bypass"
+            } else {
+                "Click to choose a plug-in"
+            };
             ui.painter().text(
-                Pos2::new(pad.center().x, pad.bottom() + 1.0),
-                Align2::CENTER_TOP,
-                mode_name,
-                FontId::proportional(6.6),
-                if mode == 0 { FAINT } else { mode_accent },
-            );
-            // The original picks one of three 143 x 128 panel bitmaps by
-            // paneltype; the rebuild has no artwork, so it changes the label
-            // and accent instead. Clicking the label is a rebuild extension
-            // (the original only loads paneltype from the scene).
-            let _ = lresp.on_hover_text(
-                "INTELLIPAN mode (paneltype): click to cycle PAN / COLOR / MOD",
+                Pos2::new(insert.left() + 5.0, insert.bottom() - 14.0),
+                Align2::LEFT_TOP,
+                fit_text(ui.painter(), hint, 6.0, insert.width() - 10.0),
+                FontId::proportional(6.0),
+                FAINT,
             );
         }
-        y += 48.0;
+        y += 96.0;
 
         // Applications rendering into this strip's virtual cable. The block is
         // only there for virtual strips bound to a Virtual Cable endpoint.
@@ -5773,33 +5570,10 @@ impl MixerApp {
         }
         y += 38.0;
 
-        // dynamics / EQ summary line
-        let summary = if is_virtual {
-            format!(
-                "EQ {:+.1} {:+.1} {:+.1}   LIM {:+.0}",
-                self.strips[idx].eq[0],
-                self.strips[idx].eq[1],
-                self.strips[idx].eq[2],
-                self.strips[idx].limit
-            )
-        } else {
-            format!(
-                "COMP {:.1}   GATE {:.1}   LIM {:+.0}",
-                self.strips[idx].comp, self.strips[idx].gate, self.strips[idx].limit
-            )
-        };
         let ducked = self.duck.enabled
             && self.duck.source.is_some_and(|src| src < self.active_strips)
             && (self.duck.targets & (1u32 << idx)) != 0
             && self.audio.duck_gain_db() < -0.5;
-        let summary_w = if ducked { w - 26.0 } else { w };
-        ui.painter().text(
-            Pos2::new(inner.left() + summary_w * 0.5, y),
-            Align2::CENTER_TOP,
-            summary,
-            FontId::proportional(6.2),
-            FAINT,
-        );
         if ducked {
             let chip_rect =
                 Rect::from_min_size(Pos2::new(inner.right() - 25.0, y), Vec2::new(25.0, 8.0));
@@ -9452,60 +9226,6 @@ fn draw_knob(
     changed
 }
 
-fn draw_xy_pad(ui: &egui::Ui, rect: Rect, xy: &mut [f32; 2], accent: Color32, id: Id, enabled: bool) {
-    let sense = if enabled { Sense::click_and_drag() } else { Sense::hover() };
-    let resp = ui.interact(rect, id, sense);
-    // FUN_00541ce0 controls 0x114-0x116: the original panel is 143 x 128 px
-    // with a 14 px x inset and a 15 px bottom / 25 px top inset, so the live
-    // area is 115 x 88 px. This compact rebuild scales those insets with the
-    // widget and keeps the original proportion.
-    let sx = rect.width() / PANEL_W;
-    let sy = rect.height() / PANEL_H;
-    let inner = Rect::from_min_max(
-        Pos2::new(
-            rect.left() + PANEL_X_INSET * sx,
-            rect.top() + PANEL_Y_TOP_INSET * sy,
-        ),
-        Pos2::new(
-            rect.right() - PANEL_X_INSET * sx,
-            rect.bottom() - PANEL_Y_BOTTOM_INSET * sy,
-        ),
-    );
-    if enabled && resp.dragged() {
-        if let Some(pos) = ui.ctx().pointer_interact_pos() {
-            let nx = (pos.x - inner.left()) / inner.width() - 0.5;
-            let ny = (inner.bottom() - pos.y) / inner.height();
-            xy[0] = nx.clamp(PANEL_X_MIN, PANEL_X_MAX);
-            // Hardware 3D panel: Y is 0 at the bottom and 1 at the top.
-            xy[1] = ny.clamp(PANEL3D_Y_MIN, PANEL3D_Y_MAX);
-        }
-    }
-    if enabled && resp.double_clicked() {
-        // FUN_00541510 resets the active panel pair to (0,0): x centre,
-        // y bottom. It is not the middle of the panel.
-        *xy = [0.0, 0.0];
-    }
-    let p = ui.painter();
-    p.rect_filled(rect, 3.0, TRACK);
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0, LINE));
-    let cx = inner.center().x + xy[0] * inner.width();
-    let cy = inner.bottom() - xy[1] * inner.height();
-    p.line_segment(
-        [Pos2::new(cx, inner.top()), Pos2::new(cx, inner.bottom())],
-        Stroke::new(1.0, accent.gamma_multiply(0.35)),
-    );
-    p.line_segment(
-        [Pos2::new(inner.left(), cy), Pos2::new(inner.right(), cy)],
-        Stroke::new(1.0, accent.gamma_multiply(0.35)),
-    );
-    p.circle_filled(Pos2::new(cx, cy), 3.0, accent);
-    if resp.hovered() {
-        p.rect_stroke(rect, 3.0, Stroke::new(1.0, accent));
-    }
-    let _ = resp.on_hover_text(
-        "3D panel (x -0.5..+0.5, y 0..1): drag to position, double click resets this mode's pair",
-    );
-}
 
 fn fader(
     ui: &egui::Ui,
