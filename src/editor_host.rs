@@ -21,16 +21,19 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetWindowLongPtrW, MessageBoxW, PeekMessageW, RegisterClassExW,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    GetClientRect, GetWindowLongPtrW, PeekMessageW, RegisterClassExW, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOW, WM_ACTIVATE, WM_CLOSE, WM_KILLFOCUS, WM_SETFOCUS, WNDCLASSEXW, WS_MAXIMIZEBOX,
+    WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 
 const CLASS_NAME: &str = "MusicRemoverEditorHost";
 
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_ACTIVATE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS {
+        crate::diag_log(format!("editor: host msg {msg:#06x} wparam {wp} (hwnd {hwnd:p})"));
+    }
     if msg == WM_CLOSE {
         let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AtomicBool;
         if !raw.is_null() {
@@ -42,6 +45,26 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         return 0;
     }
     DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+fn first_child(parent: HWND) -> Option<HWND> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumChildWindows, IsWindowVisible};
+    unsafe extern "system" fn visit(hwnd: HWND, lp: LPARAM) -> i32 {
+        let out = &mut *(lp as *mut Option<HWND>);
+        if out.is_none() && unsafe { IsWindowVisible(hwnd) } != 0 {
+            *out = Some(hwnd);
+        }
+        1
+    }
+    let mut found: Option<HWND> = None;
+    unsafe {
+        EnumChildWindows(
+            parent,
+            Some(visit),
+            &mut found as *mut Option<HWND> as LPARAM,
+        )
+    };
+    found
 }
 
 fn ensure_class() {
@@ -162,9 +185,13 @@ impl EditorHost {
 
         unsafe {
             ShowWindow(hwnd, SW_SHOW);
-            // Bring the editor forward so the plug-in is told it has focus
-            // straight away; meters stay parked until `onFocus(true)` arrives.
             windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+            // Hand keyboard focus to the plug-in's own child window. Without
+            // this the top-level window keeps focus and plug-ins that run their
+            // meters only while focused never start.
+            if let Some(child) = first_child(hwnd) {
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(child);
+            }
         }
 
         Ok(Self {
@@ -229,14 +256,25 @@ impl EditorHost {
     /// loses is simply retried next frame.
     fn report_focus(&mut self) {
         use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-        let focused = unsafe { GetForegroundWindow() as isize } == self.hwnd;
-        if focused == self.focused {
+        let foreground = unsafe { GetForegroundWindow() as isize };
+        let focused = foreground == self.hwnd;
+        if focused == self.focused || !focused {
             return;
         }
-        if let Ok(mut plugin) = self.plugin.try_lock() {
-            if plugin.set_editor_focus(focused).is_ok() {
-                self.focused = focused;
-            }
+        match self.plugin.try_lock() {
+            Ok(mut plugin) => match plugin.set_editor_focus(focused) {
+                Ok(()) => {
+                    crate::diag_log(format!(
+                        "editor: onFocus({focused}) sent (foreground {foreground:#x}, host {:#x})",
+                        self.hwnd
+                    ));
+                    self.focused = focused;
+                }
+                Err(err) => {
+                    crate::diag_log(format!("editor: onFocus({focused}) rejected: {err}"));
+                }
+            },
+            Err(_) => {}
         }
     }
 
@@ -321,6 +359,86 @@ impl EditorHost {
             }
         }
         self.hwnd = 0;
+    }
+
+    /// Write the editor's client area to a BMP. Used by `--vst-shot` so the
+    /// meters can be inspected without another process stealing focus.
+    pub fn snapshot(&self, path: &str) -> Result<(), String> {
+        use windows_sys::Win32::Graphics::Gdi::{
+            BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
+            BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+        };
+        let mut client = windows_sys::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe { GetClientRect(self.hwnd as HWND, &mut client) };
+        let (w, h) = (client.right.max(1), client.bottom.max(1));
+
+        unsafe {
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            if dc.is_null() {
+                return Err("no memory DC".to_string());
+            }
+            let mut info: BITMAPINFO = std::mem::zeroed();
+            info.bmiHeader = BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..std::mem::zeroed()
+            };
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+            if dib.is_null() || bits.is_null() {
+                DeleteDC(dc);
+                return Err("no DIB".to_string());
+            }
+            let old = SelectObject(dc, dib);
+            // Ask the window to render itself into the DC; this is the same
+            // path a screenshot tool would use and does not need focus.
+            let ok = windows_sys::Win32::Storage::Xps::PrintWindow(self.hwnd as HWND, dc, 2);
+            if ok == 0 {
+                let _ = BitBlt(dc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+            }
+            let mut data = vec![0u8; (w * h * 4) as usize];
+            std::ptr::copy_nonoverlapping(bits as *const u8, data.as_mut_ptr(), data.len());
+            SelectObject(dc, old);
+            DeleteObject(dib);
+            DeleteDC(dc);
+
+            // 24-bit bottom-up BMP.
+            let row = (w * 3) as usize;
+            let pad = (4 - row % 4) % 4;
+            let mut out = Vec::with_capacity(54 + (row + pad) * h as usize);
+            out.extend_from_slice(b"BM");
+            let size = 54 + ((row + pad) * h as usize) as u32;
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            out.extend_from_slice(&54u32.to_le_bytes());
+            out.extend_from_slice(&40u32.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&24u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(((row + pad) * h as usize) as u32).to_le_bytes());
+            out.extend_from_slice(&[0u8; 16]);
+            for y in (0..h).rev() {
+                for x in 0..w {
+                    let i = ((y * w + x) * 4) as usize;
+                    out.push(data[i]);
+                    out.push(data[i + 1]);
+                    out.push(data[i + 2]);
+                }
+                out.extend(std::iter::repeat(0u8).take(pad));
+            }
+            std::fs::write(path, out).map_err(|e| e.to_string())
+        }
     }
 
     /// Pump this thread's message queue. The mixer's own event loop usually

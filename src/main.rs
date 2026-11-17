@@ -987,6 +987,9 @@ struct MixerApp {
     /// startup.log once a second.
     vst_log: bool,
     vst_log_clock: f64,
+    /// `--vst-shot <path>`: save the open editor's picture six seconds in,
+    /// from inside the app so nothing steals the editor's focus first.
+    vst_shot: Option<String>,
     show_vban: bool,
     vban: vban::VbanHub,
     vban_enabled: bool,
@@ -1515,6 +1518,9 @@ impl MixerApp {
                 .and_then(|value| value.parse::<usize>().ok()),
             vst_log: std::env::args().any(|a| a == "--vst-log"),
             vst_log_clock: 0.0,
+            vst_shot: std::env::args()
+                .position(|a| a == "--vst-shot")
+                .and_then(|pos| std::env::args().nth(pos + 1)),
             show_vban: false,
             vban: vban::VbanHub::new(),
             vban_enabled: false,
@@ -8740,6 +8746,24 @@ impl eframe::App for MixerApp {
         // button), without ever drawing its settings inside the mixer.
         for slot in &mut self.vsts {
             slot.chain.service_editor();
+        }
+        if let Some(path) = self.vst_shot.clone() {
+            // Wait for a loud moment: LoudMax's meters span -30..0 dBFS, so a
+            // quiet passage draws nothing even when the plug-in is fine.
+            let loud = self
+                .vsts
+                .iter()
+                .map(|slot| slot.chain.input_peak())
+                .fold(0.0f32, f32::max);
+            if self.time > 4.0 && loud > 0.12 {
+                self.vst_shot = None;
+                for slot in &self.vsts {
+                    if slot.chain.editor_is_open() {
+                        let outcome = slot.chain.snapshot_editor(&path);
+                        diag_log(format!("vst shot {path} at peak {loud:.3}: {outcome:?}"));
+                    }
+                }
+            }
         }
         if self.vst_log {
             self.vst_log_clock += dt as f64;

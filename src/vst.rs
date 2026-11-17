@@ -421,6 +421,23 @@ impl VstChain {
         }
     }
 
+    /// Peak of the audio last handed to the plug-in, linear.
+    pub fn input_peak(&self) -> f32 {
+        f32::from_bits(self.in_peak.load(Ordering::Relaxed))
+    }
+
+    /// Write the open editor's client area to a BMP (`--vst-shot`).
+    pub fn snapshot_editor(&self, path: &str) -> Result<(), String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "The VST slot is unavailable".to_string())?;
+        match inner.editor.as_ref() {
+            Some(window) => window.0.snapshot(path),
+            None => Err("no editor open".to_string()),
+        }
+    }
+
     pub fn editor_is_open(&self) -> bool {
         self.inner
             .lock()
