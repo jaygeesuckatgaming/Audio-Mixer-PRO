@@ -979,6 +979,9 @@ struct MixerApp {
     /// Native handle of the mixer window (0 until the first frame). Plug-in
     /// editor windows are placed relative to it.
     mixer_hwnd: isize,
+    /// `--open-vst-editor <slot>`: open one strip's plug-in window shortly after
+    /// start-up so the editor path can be reproduced without clicking.
+    open_editor_once: Option<usize>,
     show_vban: bool,
     vban: vban::VbanHub,
     vban_enabled: bool,
@@ -1501,6 +1504,10 @@ impl MixerApp {
             streamer_speed: 7.0,
             pending_maximize: false,
             mixer_hwnd: 0,
+            open_editor_once: std::env::args()
+                .position(|a| a == "--open-vst-editor")
+                .and_then(|pos| std::env::args().nth(pos + 1))
+                .and_then(|value| value.parse::<usize>().ok()),
             show_vban: false,
             vban: vban::VbanHub::new(),
             vban_enabled: false,
@@ -2230,6 +2237,24 @@ impl MixerApp {
         }
     }
 
+    /// Kick the device probe immediately if one is not already running. Used
+    /// by start-up, which must not wait a full watchdog tick for the list.
+    fn probe_devices_now(&mut self) {
+        if self.devices_probe.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("device-probe".to_string())
+            .spawn(move || {
+                let _ = sender.send(AudioEngine::output_devices());
+            })
+            .is_ok()
+        {
+            self.devices_probe = Some(receiver);
+        }
+    }
+
     /// One-second device watchdog, following FUN_0054b730: it returns early
     /// until 1000 ms have passed, compares the current device set with the
     /// previous one, and after five consecutive ticks with a bad or moved A1
@@ -2272,6 +2297,7 @@ impl MixerApp {
     /// React to a list that arrived from the probe thread.
     fn handle_device_list(&mut self, devices: Vec<String>) {
         let list_changed = !self.last_outputs.is_empty() && devices != self.last_outputs;
+        self.driver_mode = driver_cables_present_from(&devices);
         self.last_outputs = devices;
 
         if self.audio.available && !list_changed {
@@ -3220,13 +3246,25 @@ impl MixerApp {
                 }
             }
             StartupStep::Cables => {
-                self.driver_mode = driver_cables_present();
+                // Only the cached list here; the probe thread does the
+                // enumeration so a wedged endpoint cannot freeze the console.
+                if self.last_outputs.is_empty() {
+                    self.probe_devices_now();
+                    self.startup_wait += dt;
+                    if self.startup_wait < 3.0 {
+                        return;
+                    }
+                    diag_log("startup: device probe still pending, continuing");
+                }
+                self.driver_mode = driver_cables_present_from(&self.last_outputs);
+                diag_log(format!("startup: driver cables present = {}", self.driver_mode));
                 if self.driver_mode {
                     diag_log("startup: kernel virtual cable driver detected");
                 }
                 if self.vc_cfg.enabled {
                     diag_log("startup: starting USB virtual cables");
                     self.vc.apply(self.vc_cfg.clone());
+                    diag_log("startup: USB virtual cables applied");
                 }
                 self.startup_step = StartupStep::Devices;
                 self.startup_wait = 0.0;
@@ -8024,16 +8062,20 @@ impl MixerApp {
                 }
                 Picker::Bus(i) if i == 0 => {
                     // A1 is the card whose output is actually opened, so list
-                    // the Windows devices instead of the simulated names.
-                    let mut outputs = AudioEngine::output_devices();
+                    // the Windows devices instead of the simulated names. The
+                    // list comes from the probe thread; enumerating here would
+                    // freeze the console while a cable endpoint is wedged.
+                    self.probe_devices_now();
+                    let mut outputs = self.last_outputs.clone();
                     if outputs.is_empty() {
                         outputs.push("No audio output device".to_string());
                     }
                     outputs
                 }
                 Picker::Bus(_) => {
+                    self.probe_devices_now();
                     let mut outputs = vec!["No device".to_string()];
-                    outputs.extend(AudioEngine::output_devices());
+                    outputs.extend(self.last_outputs.iter().cloned());
                     if outputs.len() == 1 {
                         outputs.push("No audio output device".to_string());
                     }
@@ -8660,6 +8702,14 @@ impl eframe::App for MixerApp {
         }
         self.advance_startup(dt as f64);
         self.poll_vst_scan();
+        if let Some(slot) = self.open_editor_once {
+            if self.mixer_hwnd != 0 && self.time > 1.0 {
+                self.open_editor_once = None;
+                eprintln!("[repro] opening editor for slot {slot}");
+                self.open_vst_editor(slot);
+                eprintln!("[repro] open_vst_editor returned");
+            }
+        }
         // Keep every open plug-in window alive (resize requests and its close
         // button), without ever drawing its settings inside the mixer.
         for slot in &mut self.vsts {
@@ -9868,7 +9918,14 @@ fn transport_button(
 /// the USB/IP cables only exist while the mixer's own server runs, so seeing
 /// them before the server starts means the driver is installed.
 fn driver_cables_present() -> bool {
-    let devices = AudioEngine::output_devices();
+    driver_cables_present_from(&AudioEngine::output_devices())
+}
+
+/// Same test against a list that was produced by the background probe. The
+/// enumerated list must never be taken on the UI thread: when a cable endpoint
+/// is wedged `EnumAudioEndpoints` blocks for minutes and the whole mixer stops
+/// responding.
+fn driver_cables_present_from(devices: &[String]) -> bool {
     let mut labels: Vec<String> = devices
         .iter()
         .filter(|d| d.to_ascii_lowercase().starts_with("speakers"))

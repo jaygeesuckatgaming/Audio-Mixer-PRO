@@ -1078,6 +1078,90 @@ impl VstParam {
     }
 }
 
+/// Window/client/child geometry of an editor window, for diagnosing plug-ins
+/// whose controls are laid out outside the visible area.
+#[cfg(windows)]
+fn editor_geometry(hwnd: isize) -> String {
+    use windows_sys::Win32::Foundation::{HWND, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumChildWindows, GetClientRect, GetWindowRect,
+    };
+
+    let window = hwnd as HWND;
+    let mut out = String::new();
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe { GetWindowRect(window, &mut rect) };
+    out.push_str(&format!(
+        "window rect {}x{} at ({},{})
+",
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        rect.left,
+        rect.top
+    ));
+    let mut client = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe { GetClientRect(window, &mut client) };
+    out.push_str(&format!(
+        "client size {}x{}
+",
+        client.right - client.left,
+        client.bottom - client.top
+    ));
+
+    unsafe extern "system" fn visit(
+        hwnd: HWND,
+        lparam: windows_sys::Win32::Foundation::LPARAM,
+    ) -> i32 {
+        let acc = &mut *(lparam as *mut Vec<String>);
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe { GetWindowRect(hwnd, &mut r) };
+        let mut c = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe { GetClientRect(hwnd, &mut c) };
+        acc.push(format!(
+            "child {:#x} rect {}x{} client {}x{}",
+            hwnd as isize,
+            r.right - r.left,
+            r.bottom - r.top,
+            c.right - c.left,
+            c.bottom - c.top
+        ));
+        1
+    }
+    let mut children: Vec<String> = Vec::new();
+    unsafe {
+        EnumChildWindows(
+            window,
+            Some(visit),
+            &mut children as *mut Vec<String> as windows_sys::Win32::Foundation::LPARAM,
+        )
+    };
+    for line in children {
+        out.push_str(&line);
+        out.push_str("\n");
+    }
+    out
+}
+
 /// Check the "Open VST" path: load a real plug-in, open its own editor window,
 /// keep it serviced for a moment, then close it. The report is written to
 /// `report_path`. This is the same PluginWindow the Open VST buttons use.
@@ -1121,6 +1205,22 @@ pub fn editor_selftest(preferred: Option<&Path>, report_path: &Path) {
             for _ in 0..40 {
                 chain.service_editor();
                 std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            #[cfg(windows)]
+            {
+                let windows = editor_windows();
+                if let Some(hwnd) = windows.last().copied() {
+                    report.push_str(
+                        "geometry:
+",
+                    );
+                    report.push_str(&editor_geometry(hwnd));
+                } else {
+                    report.push_str(
+                        "geometry: editor window not found
+",
+                    );
+                }
             }
             let still_open = chain.editor_is_open();
             chain.close_editor();
