@@ -195,8 +195,14 @@ impl EditorHost {
         };
 
         unsafe {
+            // Force a full deactivate/reactivate cycle. Plug-in editors that
+            // only start their idle timer on a real activation never got one
+            // here, and used to need the person to open the system menu on the
+            // title bar before the meters came to life.
+            ShowWindow(hwnd, SW_HIDE);
             ShowWindow(hwnd, SW_SHOW);
             windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow(hwnd);
             // Hand keyboard focus to the plug-in's own child window. Without
             // this the top-level window keeps focus and plug-ins that run their
             // meters only while focused never start.
