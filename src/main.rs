@@ -2297,8 +2297,16 @@ impl MixerApp {
     /// React to a list that arrived from the probe thread.
     fn handle_device_list(&mut self, devices: Vec<String>) {
         let list_changed = !self.last_outputs.is_empty() && devices != self.last_outputs;
+        let recovered = self.last_outputs.is_empty() && !devices.is_empty();
         self.driver_mode = driver_cables_present_from(&devices);
         self.last_outputs = devices;
+        // Start-up skips captures while the audio service is not answering.
+        // The first list that arrives means it is back, so pick them up now.
+        if recovered && self.startup_step == StartupStep::Done && self.audio.available {
+            diag_log("startup: audio service recovered, opening capture devices");
+            self.open_default_input();
+            self.apply_saved_inputs();
+        }
 
         if self.audio.available && !list_changed {
             self.restart_ticks = 0;
@@ -3289,7 +3297,18 @@ impl MixerApp {
                 } else {
                     "startup: cable attach still pending, opening available devices"
                 });
-                if self.audio.available {
+                // An empty probe means the audio service never answered
+                // within the start-up window. Every capture call (listing or
+                // opening) goes through that same service and would block the
+                // UI thread for minutes, so leave captures closed and let the
+                // watchdog try again once the service recovers.
+                if self.audio.available && self.last_outputs.is_empty() {
+                    diag_log("startup: audio service not answering, capture devices left closed");
+                    self.toast_for(
+                        "Audio service is not responding - input devices left off",
+                        10.0,
+                    );
+                } else if self.audio.available {
                     self.open_default_input();
                     self.apply_saved_inputs();
                     let _ = self.apply_audio_format();
