@@ -849,6 +849,10 @@ struct VstSlot {
     bypass: bool,
     info: Option<vst::VstInfo>,
     error: Option<String>,
+    /// Plug-ins inside a chain wrapper (UhbikWrapper), refreshed slowly so the
+    /// strip can list them under the wrapper's name.
+    sub_plugins: Vec<String>,
+    sub_plugins_at: f64,
 }
 
 impl VstSlot {
@@ -859,6 +863,8 @@ impl VstSlot {
             bypass: false,
             info: None,
             error: None,
+            sub_plugins: Vec::new(),
+            sub_plugins_at: 0.0,
         }
     }
 
@@ -5329,21 +5335,59 @@ impl MixerApp {
                         FontId::proportional(7.8),
                         TEXT,
                     );
-                    ui.painter().text(
-                        Pos2::new(insert.left() + 5.0, insert.top() + 18.0),
-                        Align2::LEFT_TOP,
-                        fit_text(ui.painter(), &vendor, 6.4, insert.width() - 10.0),
-                        FontId::proportional(6.4),
-                        DIM,
-                    );
-                    if !latency.is_empty() {
+                    let sub = &self.vsts[idx].sub_plugins;
+                    if sub.is_empty() {
                         ui.painter().text(
-                            Pos2::new(insert.left() + 5.0, insert.top() + 28.0),
+                            Pos2::new(insert.left() + 5.0, insert.top() + 18.0),
                             Align2::LEFT_TOP,
-                            &latency,
+                            fit_text(ui.painter(), &vendor, 6.4, insert.width() - 10.0),
                             FontId::proportional(6.4),
-                            FAINT,
+                            DIM,
                         );
+                        if !latency.is_empty() {
+                            ui.painter().text(
+                                Pos2::new(insert.left() + 5.0, insert.top() + 28.0),
+                                Align2::LEFT_TOP,
+                                &latency,
+                                FontId::proportional(6.4),
+                                FAINT,
+                            );
+                        }
+                    } else {
+                        // Chain wrapper: list its plug-ins under the wrapper's
+                        // name, small enough that six fit. A leading '~' marks a
+                        // slot that is bypassed inside the wrapper.
+                        const LINES: usize = 6;
+                        let step = 8.8;
+                        let shown = sub.len().min(if sub.len() > LINES { LINES - 1 } else { LINES });
+                        for (line, entry) in sub.iter().take(shown).enumerate() {
+                            let bypassed = entry.starts_with('~');
+                            let name = entry.trim_start_matches('~');
+                            // A bypassed slot keeps the dash but is drawn dim,
+                            // with '~' in place of '-': one glyph, so the name
+                            // still fits the narrow strips.
+                            let text = format!(
+                                "{} {name}",
+                                if bypassed { "~" } else { "-" }
+                            );
+                            let y = insert.top() + 18.0 + step * line as f32;
+                            ui.painter().text(
+                                Pos2::new(insert.left() + 5.0, y),
+                                Align2::LEFT_TOP,
+                                fit_text(ui.painter(), &text, 6.1, insert.width() - 6.0),
+                                FontId::proportional(6.1),
+                                if bypassed { FAINT } else { DIM },
+                            );
+                        }
+                        if sub.len() > shown {
+                            ui.painter().text(
+                                Pos2::new(insert.left() + 5.0, insert.top() + 18.0 + step * shown as f32),
+                                Align2::LEFT_TOP,
+                                format!("+{} more", sub.len() - shown),
+                                FontId::proportional(6.1),
+                                FAINT,
+                            );
+                        }
                     }
                 }
                 None => {
@@ -5368,7 +5412,7 @@ impl MixerApp {
                     );
                 }
             }
-            if let Some(err) = error.as_ref() {
+            if let Some(err) = error.as_ref().filter(|_| self.vsts[idx].sub_plugins.is_empty()) {
                 ui.painter().text(
                     Pos2::new(insert.left() + 5.0, insert.top() + 41.0),
                     Align2::LEFT_TOP,
@@ -8509,6 +8553,24 @@ impl eframe::App for MixerApp {
         // button), without ever drawing its settings inside the mixer.
         for slot in &mut self.vsts {
             slot.chain.service_editor();
+        }
+        // The wrapper's chain is read twice a second: cheap (one parameter) and
+        // fast enough that adding a plug-in inside it shows up almost at once.
+        for slot in &mut self.vsts {
+            if !slot.chain.has_plugin() {
+                if !slot.sub_plugins.is_empty() {
+                    slot.sub_plugins.clear();
+                }
+                continue;
+            }
+            if self.time - slot.sub_plugins_at >= 0.5 {
+                slot.sub_plugins_at = self.time;
+                if let Some(list) = slot.chain.chain_summary() {
+                    if slot.sub_plugins != list {
+                        slot.sub_plugins = list;
+                    }
+                }
+            }
         }
         if let Some(path) = self.vst_shot.clone() {
             // Wait for a loud moment: LoudMax's meters span -30..0 dBFS, so a

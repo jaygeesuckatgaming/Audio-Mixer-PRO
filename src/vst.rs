@@ -433,6 +433,33 @@ impl VstChain {
         }
     }
 
+    /// Names of the plug-ins inside a chain wrapper, if the plug-in publishes
+    /// them. The wrapper (UhbikWrapper) exposes a read-only "Chain Summary"
+    /// parameter whose text is the slot names joined by '|', a leading '~'
+    /// marking a bypassed slot. Never blocks: returns None if the slot or the
+    /// plug-in lock is busy, and the caller keeps the previous list.
+    pub fn chain_summary(&self) -> Option<Vec<String>> {
+        let inner = self.inner.try_lock().ok()?;
+        let loaded = inner.loaded.as_ref()?;
+        let param = loaded
+            .params
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("Chain Summary"))?;
+        let (id, value) = (param.id, param.value);
+        let plugin = loaded.plugin.try_lock().ok()?;
+        let text = plugin.format_parameter(id, value).ok()?;
+        let names: Vec<String> = text
+            .split('|')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
+        if names.is_empty() {
+            None
+        } else {
+            Some(names)
+        }
+    }
+
     /// Peak of the audio last handed to the plug-in, linear.
     pub fn input_peak(&self) -> f32 {
         f32::from_bits(self.in_peak.load(Ordering::Relaxed))
