@@ -1086,6 +1086,14 @@ struct MixerApp {
     /// In-flight `output_devices()` probe. Enumeration blocks when the audio
     /// service is wedged, so it never runs on the UI thread.
     devices_probe: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    /// Same for capture devices: the auto-restart watchdog must never call
+    /// `InputCapture::devices()` on the UI thread.
+    inputs_probe: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    last_inputs: Vec<String>,
+    /// Per strip backoff for reopening a vanished capture device, so a dead
+    /// endpoint cannot be hammered once a second.
+    capture_retry_at: [f64; audio::MAX_STRIPS],
+    capture_backoff: [f64; audio::MAX_STRIPS],
     /// `--meter-log`: write each strip's capture peak to startup.log once a
     /// second. Used to tell "no signal in the capture" apart from "routing".
     meter_log: bool,
@@ -1599,6 +1607,10 @@ impl MixerApp {
             save_on_exit: true,
             poll_clock: 0.0,
             devices_probe: None,
+            inputs_probe: None,
+            last_inputs: Vec::new(),
+            capture_retry_at: [0.0; audio::MAX_STRIPS],
+            capture_backoff: [5.0; audio::MAX_STRIPS],
             meter_log: std::env::args().any(|arg| arg == "--meter-log"),
             meter_clock: 0.0,
             a1_reopen_tries: 0,
@@ -2285,6 +2297,23 @@ impl MixerApp {
         }
     }
 
+    /// Kick the capture-device probe (the UI thread must never enumerate).
+    fn probe_inputs_now(&mut self) {
+        if self.inputs_probe.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("input-probe".to_string())
+            .spawn(move || {
+                let _ = sender.send(crate::audio::InputCapture::devices());
+            })
+            .is_ok()
+        {
+            self.inputs_probe = Some(receiver);
+        }
+    }
+
     /// Kick the device probe immediately if one is not already running. Used
     /// by start-up, which must not wait a full watchdog tick for the list.
     fn probe_devices_now(&mut self) {
@@ -2300,6 +2329,30 @@ impl MixerApp {
             .is_ok()
         {
             self.devices_probe = Some(receiver);
+        }
+        if self.inputs_probe.is_none() {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            if std::thread::Builder::new()
+                .name("input-probe".to_string())
+                .spawn(move || {
+                    let _ = sender.send(crate::audio::InputCapture::devices());
+                })
+                .is_ok()
+            {
+                self.inputs_probe = Some(receiver);
+            }
+        }
+    }
+
+    /// Drain the capture-device probe. Never enumerates on the UI thread.
+    fn poll_input_devices(&mut self) {
+        let Some(probe) = self.inputs_probe.take() else {
+            return;
+        };
+        match probe.try_recv() {
+            Ok(list) => self.last_inputs = list,
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.inputs_probe = Some(probe),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
     }
 
@@ -2368,17 +2421,22 @@ impl MixerApp {
             }
         }
 
-        if self.auto_restart_all {
-            let inputs = InputCapture::devices();
-            for i in 0..self.active_strips {
+        if self.auto_restart_all && !self.last_inputs.is_empty() {
+            // Only act on a list that came from the probe thread. An empty list
+            // means the audio service is not answering, and every attempt to
+            // enumerate or open would block the UI thread behind it.
+            for i in 0..self.active_strips.min(self.captures.len()) {
                 let Some(cap) = self.captures[i].as_ref() else {
                     continue;
                 };
                 if matches!(cap, StripInput::Vban(_)) {
                     continue;
                 }
-                let gone = !inputs.iter().any(|d| d == cap.device());
+                let gone = !self.last_inputs.iter().any(|d| d == cap.device());
                 if !gone {
+                    continue;
+                }
+                if self.time < self.capture_retry_at[i] {
                     continue;
                 }
                 let name = cap.device().to_string();
@@ -2387,7 +2445,13 @@ impl MixerApp {
                     self.audio.attach_input(i, reopened.shared());
                     self.strips[i].device = reopened.device.clone();
                     self.captures[i] = Some(StripInput::Cpal(reopened));
+                    self.capture_backoff[i] = 5.0;
+                    self.capture_retry_at[i] = 0.0;
                     self.toast(format!("Input re-opened: {name}"));
+                } else {
+                    let backoff = self.capture_backoff[i].min(60.0);
+                    self.capture_retry_at[i] = self.time + backoff;
+                    self.capture_backoff[i] = (backoff * 2.0).min(60.0);
                 }
             }
         }
@@ -3304,8 +3368,9 @@ impl MixerApp {
             StartupStep::Cables => {
                 // Only the cached list here; the probe thread does the
                 // enumeration so a wedged endpoint cannot freeze the console.
-                if self.last_outputs.is_empty() {
+                if self.last_outputs.is_empty() || self.last_inputs.is_empty() {
                     self.probe_devices_now();
+                    self.probe_inputs_now();
                     self.startup_wait += dt;
                     if self.startup_wait < 3.0 {
                         return;
@@ -4312,7 +4377,15 @@ impl MixerApp {
     /// virtual cable reopens too. `VBAN:` devices are bindings rather than
     /// Windows endpoints and wait for their stream.
     fn apply_saved_inputs(&mut self) {
-        let available = InputCapture::devices();
+        // Never enumerate here: this runs on the UI thread during start-up, and
+        // enumeration blocks for minutes when a device endpoint is wedged. The
+        // probe thread owns that call; an empty list means "not answering", so
+        // leave the captures closed until it does.
+        if self.last_inputs.is_empty() {
+            diag_log("startup: capture devices unavailable, leaving inputs closed");
+            return;
+        }
+        let available = self.last_inputs.clone();
         for i in 0..self.active_strips {
             let name = self.strips[i].device.clone();
             self.strips[i].tape_feed = i == 3 && name == "Virtual 1 (VAIO)";
@@ -8725,6 +8798,7 @@ impl eframe::App for MixerApp {
             }
         }
         self.poll_audio_devices(dt as f64);
+        self.poll_input_devices();
         self.sync_app_targets();
 
         egui::TopBottomPanel::top("topbar")
