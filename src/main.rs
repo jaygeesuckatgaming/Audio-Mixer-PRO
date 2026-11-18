@@ -2,9 +2,11 @@
 
 mod audio;
 mod clap_host;
+mod clap_plugin;
 mod clap_slot;
 mod editor_host;
 mod host_window;
+mod plugin;
 mod sessions;
 mod vban;
 mod vc;
@@ -847,7 +849,7 @@ enum Picker {
 /// own loaded plug-in, its own bypass flag and its own state file, so two
 /// channels can run different plug-ins at the same time.
 struct VstSlot {
-    chain: std::sync::Arc<vst::VstChain>,
+    chain: std::sync::Arc<plugin::PlugIn>,
     path: String,
     bypass: bool,
     info: Option<vst::VstInfo>,
@@ -859,7 +861,7 @@ struct VstSlot {
 }
 
 impl VstSlot {
-    fn new(chain: std::sync::Arc<vst::VstChain>) -> Self {
+    fn new(chain: std::sync::Arc<plugin::PlugIn>) -> Self {
         VstSlot {
             chain,
             path: String::new(),
@@ -1841,6 +1843,11 @@ impl MixerApp {
                     "{} by {} - {} input, {} output",
                     info.name, info.vendor, info.audio_inputs, info.audio_outputs
                 );
+                diag_log(format!(
+                    "vst[{slot}] loaded '{}' ({})",
+                    info.name,
+                    info.format
+                ));
                 self.toast(format!("VST loaded on {label}: {}", info.name));
             }
             Err(err) => {
@@ -1873,11 +1880,14 @@ impl MixerApp {
                 continue;
             }
             let label = self.strip_label(slot);
+            // CLAP libraries can hold several plug-ins, so the stored path may
+            // carry a `#plugin-id` suffix; the file itself is what must exist.
+            let file_part = path_text.split('#').next().unwrap_or(&path_text).to_string();
             let path = PathBuf::from(&path_text);
-            if !path.exists() {
+            if !Path::new(&file_part).exists() {
                 self.vsts[slot].error = Some(format!(
                     "The selected plug-in is no longer at {}",
-                    path.display()
+                    file_part
                 ));
                 self.vsts[slot].info = None;
                 continue;
@@ -1938,6 +1948,7 @@ impl MixerApp {
                 self.vsts[slot].error = None;
             }
             Err(err) => {
+                diag_log(format!("vst[{slot}] load failed: {err}"));
                 self.vsts[slot].error = Some(err.clone());
                 self.toast(format!("VST on {label}: {err}"));
             }
@@ -5330,7 +5341,7 @@ impl MixerApp {
 
             match self.vsts[idx].info.as_ref() {
                 Some(info) => {
-                    let vendor = format!("{} {}", info.vendor, info.version);
+                    let vendor = format!("{} {} · {}", info.vendor, info.version, info.format);
                     ui.painter().text(
                         Pos2::new(insert.left() + 5.0, insert.top() + 6.0),
                         Align2::LEFT_TOP,
@@ -10069,6 +10080,7 @@ fn main() -> eframe::Result<()> {
     let mut vst_selftest: Option<Option<PathBuf>> = None;
     let mut clap_selftest: Option<Option<PathBuf>> = None;
     let mut clap_gui: Option<Option<PathBuf>> = None;
+    let mut plugin_selftest: Option<PathBuf> = None;
     let mut vst_mix_selftest: Option<Option<PathBuf>> = None;
     let mut vst_multi_selftest: Option<Option<PathBuf>> = None;
     let mut vst_editor_selftest: Option<Option<PathBuf>> = None;
@@ -10107,6 +10119,8 @@ fn main() -> eframe::Result<()> {
                 }
             });
             clap_selftest = Some(path);
+        } else if arg == "--plugin-selftest" {
+            plugin_selftest = args.next().map(PathBuf::from);
         } else if arg == "--clap-gui" {
             let next = args.next();
             let path = next.and_then(|value| {
@@ -10214,6 +10228,52 @@ fn main() -> eframe::Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("vst_selftest.txt");
         vst::selftest(path.as_deref(), &report);
+        return Ok(());
+    }
+    if let Some(path) = plugin_selftest {
+        let mut lines = Vec::new();
+        let slot = plugin::PlugIn::new();
+        match slot.load(&path, 48_000.0, vst::VST_MAX_BLOCK) {
+            Ok(info) => {
+                lines.push(format!("loaded: {} [{}]", info.name, info.format));
+                let frames = 512usize;
+                let mut in_l = vec![0.0f32; frames];
+                let mut in_r = vec![0.0f32; frames];
+                let mut out_l = vec![0.0f32; frames];
+                let mut out_r = vec![0.0f32; frames];
+                let (mut processed, mut peak, mut nonfinite) = (0usize, 0.0f32, 0usize);
+                for block in 0..96 {
+                    for i in 0..frames {
+                        let t = (block * frames + i) as f32 / 48_000.0;
+                        let v = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.2;
+                        in_l[i] = v;
+                        in_r[i] = v;
+                    }
+                    if slot.process(&in_l, &in_r, &mut out_l, &mut out_r) {
+                        processed += 1;
+                        for i in 0..frames {
+                            if !out_l[i].is_finite() || !out_r[i].is_finite() {
+                                nonfinite += 1;
+                            }
+                            peak = peak.max(out_l[i].abs()).max(out_r[i].abs());
+                        }
+                    }
+                }
+                lines.push(format!(
+                    "process: blocks={processed}/96 peak={peak:.6} nonfinite={nonfinite}"
+                ));
+                lines.push(format!("latency: {:?}", slot.latency()));
+                lines.push(format!("params: {}", slot.parameters().len()));
+                if let Some(err) = slot.error() {
+                    lines.push(format!("error: {err}"));
+                }
+            }
+            Err(err) => lines.push(format!("FAIL: {err}")),
+        }
+        let text = lines.join("
+") + "
+";
+        print!("{text}");
         return Ok(());
     }
     if let Some(path) = clap_gui {

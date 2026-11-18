@@ -635,7 +635,7 @@ struct Shared {
     /// One VST3 insert per input strip (up to MAX_STRIPS independent slots).
     /// This is a rebuild extension (the original console has no VST loader);
     /// see vst.rs.
-    pub vsts: [Arc<crate::vst::VstChain>; MAX_STRIPS],
+    pub vsts: [Arc<crate::plugin::PlugIn>; MAX_STRIPS],
     /// Ducking: when the source strip passes the threshold, the selected
     /// target strips are attenuated by `duck_depth_db` before they are summed
     /// into their buses. `duck_source` is `usize::MAX` when no source is set.
@@ -695,7 +695,7 @@ impl Shared {
             bus_peak: std::array::from_fn(|_| f32_atomic(0.0)),
             callback_frames: AtomicUsize::new(0),
             callback_load: f32_atomic(0.0),
-            vsts: std::array::from_fn(|_| crate::vst::VstChain::new()),
+            vsts: std::array::from_fn(|_| crate::plugin::PlugIn::new()),
             duck_enabled: AtomicBool::new(false),
             duck_source: AtomicUsize::new(usize::MAX),
             duck_targets: AtomicU32::new(0),
@@ -1635,12 +1635,12 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     /// One VST3 insert slot per input strip, shared with the output callback.
-    pub fn vst(&self, slot: usize) -> Arc<crate::vst::VstChain> {
+    pub fn vst(&self, slot: usize) -> Arc<crate::plugin::PlugIn> {
         self.shared.vsts[slot.min(MAX_STRIPS - 1)].clone()
     }
 
     /// All insert slots, in strip order.
-    pub fn vsts(&self) -> [Arc<crate::vst::VstChain>; MAX_STRIPS] {
+    pub fn vsts(&self) -> [Arc<crate::plugin::PlugIn>; MAX_STRIPS] {
         self.shared.vsts.clone()
     }
 

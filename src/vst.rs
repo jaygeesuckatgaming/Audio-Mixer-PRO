@@ -35,6 +35,8 @@ pub struct VstInfo {
     pub has_gui: bool,
     pub audio_inputs: u32,
     pub audio_outputs: u32,
+    /// "VST3" or "CLAP", shown in the plug-in list and the insert panel.
+    pub format: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -752,6 +754,7 @@ fn info_from_plugin(plugin: &Plugin, path: &Path) -> VstInfo {
         has_gui: info.has_gui,
         audio_inputs: info.audio_inputs,
         audio_outputs: info.audio_outputs,
+        format: "VST3".to_string(),
     }
 }
 
@@ -822,12 +825,30 @@ pub fn scan_plugins(extra: &[PathBuf]) -> ScanOutcome {
                 has_gui: info.has_gui,
                 audio_inputs: info.audio_inputs,
                 audio_outputs: info.audio_outputs,
+                format: "VST3".to_string(),
             }),
             Err(err) => errors.push(format!(
                 "{}: {err}",
                 bundle.file_name().unwrap_or_default().to_string_lossy()
             )),
         }
+    }
+    // CLAP libraries hold one or more plug-ins per file. Loading them runs their
+    // code, so it belongs here in the scanner child, never in the console.
+    for entry in crate::clap_slot::scan() {
+        let id = entry.id_text();
+        plugins.push(VstInfo {
+            name: entry.name.clone(),
+            vendor: entry.vendor.clone(),
+            version: entry.version.clone(),
+            category: entry.category(),
+            uid: id.clone(),
+            path: PathBuf::from(format!("{}#{id}", entry.path.display())),
+            has_gui: true,
+            audio_inputs: 2,
+            audio_outputs: 2,
+            format: "CLAP".to_string(),
+        });
     }
     plugins.sort_by(|a, b| {
         a.name
@@ -936,6 +957,7 @@ fn read_scan_report(path: &Path) -> Result<ScanOutcome, String> {
                 has_gui: item["has_gui"].as_bool().unwrap_or(false),
                 audio_inputs: item["audio_inputs"].as_u64().unwrap_or(0) as u32,
                 audio_outputs: item["audio_outputs"].as_u64().unwrap_or(0) as u32,
+                format: item["format"].as_str().unwrap_or("VST3").to_string(),
             });
         }
     }
@@ -1008,7 +1030,7 @@ pub fn pick_plugin_file() -> Option<PathBuf> {
         let filter = "VST3 Plug-in (*.vst3)\0*.vst3\0All files\0*.*\0\0"
             .encode_utf16()
             .collect::<Vec<u16>>();
-        let title = wide("Select VST3 Plug-in");
+        let title = wide("Select Plug-in");
         let mut file_buf = vec![0u16; 1000];
         let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
         ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
