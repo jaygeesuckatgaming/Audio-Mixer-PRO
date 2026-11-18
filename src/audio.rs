@@ -632,6 +632,9 @@ struct Shared {
     /// Last A1 callback size and fraction of its period spent in the callback.
     callback_frames: AtomicUsize,
     callback_load: AtomicU32,
+    /// Deepest capture backlog across the routed strips, in frames. This is the
+    /// part of the latency a CPU spike inflates.
+    strip_backlog: AtomicUsize,
     /// One VST3 insert per input strip (up to MAX_STRIPS independent slots).
     /// This is a rebuild extension (the original console has no VST loader);
     /// see vst.rs.
@@ -695,6 +698,7 @@ impl Shared {
             bus_peak: std::array::from_fn(|_| f32_atomic(0.0)),
             callback_frames: AtomicUsize::new(0),
             callback_load: f32_atomic(0.0),
+            strip_backlog: AtomicUsize::new(0),
             vsts: std::array::from_fn(|_| crate::plugin::PlugIn::new()),
             duck_enabled: AtomicBool::new(false),
             duck_source: AtomicUsize::new(usize::MAX),
@@ -1448,6 +1452,20 @@ impl Dsp {
             }
         }
 
+        // Deepest capture backlog across the strips that are actually playing.
+        // This is the part of the latency a CPU spike inflates, so the console
+        // reports it rather than only the configured target.
+        let mut deepest = 0usize;
+        for i in 0..strip_count {
+            if !strip_on[i] {
+                continue;
+            }
+            if let Some(ring) = rings[i].as_ref() {
+                deepest = deepest.max(ring.fill());
+            }
+        }
+        shared.strip_backlog.store(deepest, Ordering::Relaxed);
+
         // Publish the A2/A3 bus mixes for their output streams. The rings are
         // bounded: if a secondary device runs slower, its oldest frames are
         // dropped instead of letting latency grow.
@@ -1461,6 +1479,13 @@ impl Dsp {
                     ring.pop_front();
                 }
                 ring.push_back((self.out_bus_l[b][f], self.out_bus_r[b][f]));
+            }
+            // Bound the bus delay too: the ring holds up to 341 ms, and an
+            // output stream that stalls under load would otherwise sit that far
+            // behind for good. Keep at most ~60 ms of slack.
+            let limit = (sample_rate as f32 * 0.060) as usize;
+            while ring.len() > limit {
+                ring.pop_front();
             }
         }
 
@@ -1635,6 +1660,11 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     /// One VST3 insert slot per input strip, shared with the output callback.
+    /// Deepest capture backlog across routed strips, in frames.
+    pub fn strip_backlog_frames(&self) -> usize {
+        self.shared.strip_backlog.load(Ordering::Relaxed)
+    }
+
     pub fn vst(&self, slot: usize) -> Arc<crate::plugin::PlugIn> {
         self.shared.vsts[slot.min(MAX_STRIPS - 1)].clone()
     }
@@ -2360,7 +2390,7 @@ const INPUT_BUFFER_FRAMES: u32 = 512;
 /// Keep the live input near this much audio; a startup backlog is trimmed and
 /// slow clock drift is corrected toward it instead of growing toward the ring
 /// capacity.
-const INPUT_TARGET_MS: f32 = 25.0;
+pub const INPUT_TARGET_MS: f32 = 25.0;
 /// Extra fill tolerated before the drift controller starts dropping frames.
 const INPUT_TARGET_HYSTERESIS_MS: f32 = 15.0;
 
@@ -2537,15 +2567,19 @@ impl InputReader {
             self.phase -= 1.0;
         }
 
-        // Clock drift: drop one frame occasionally when the ring grows past
-        // the target window. The startup trim below handles big backlogs; this
-        // only keeps a slow drift from becoming permanent latency.
+        // Backlog control. A CPU spike (a build, a scan, a page fault storm)
+        // stops this reader for a while and the capture stream keeps filling
+        // the ring; playing that backlog out afterwards would leave the strip
+        // permanently behind by however long the spike lasted.
+        //
+        // Real drift is only a few frames, but backlogs are milliseconds to
+        // hundreds of milliseconds, so drop straight back to the target rather
+        // than slipping one frame per 128 calls (which would take minutes to
+        // converge). The jump is a single discontinuity, the same trade every
+        // low-latency engine makes.
         if ring.fill() > high {
-            self.drift_tick += 1;
-            if self.drift_tick >= 128 {
-                let _ = ring.pop();
-                self.drift_tick = 0;
-            }
+            ring.trim_to(target);
+            self.drift_tick = 0;
         } else {
             self.drift_tick = 0;
         }

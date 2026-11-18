@@ -1825,6 +1825,39 @@ impl MixerApp {
     }
 
     /// The strip's own label, used in the selector and in toasts.
+    /// Rough end-to-end latency of the insert path, plus the breakdown shown on
+    /// hover. The output figure is what was asked of the device; WASAPI shared
+    /// mode may round it up to its engine period.
+    fn latency_report(&self) -> (f64, String) {
+        let sr = self.sample_rate.max(1) as f64;
+        // Measured backlog when a strip is live; the configured target only
+        // stands in when nothing is routed.
+        let backlog_frames = self.audio.strip_backlog_frames();
+        let input_ms = if backlog_frames > 0 {
+            backlog_frames as f64 / sr * 1000.0
+        } else {
+            audio::INPUT_TARGET_MS as f64
+        };
+        let block_ms = self.main_buffer as f64 / sr * 1000.0;
+        let output_ms = self.main_buffer as f64 / sr * 1000.0;
+        let mut vst_ms = 0.0;
+        let mut vst_count = 0usize;
+        for slot in self.vsts.iter().take(self.active_strips) {
+            let (in_latency, out_latency) = slot.chain.latency();
+            let samples = in_latency.max(out_latency) as f64;
+            if samples > 0.0 {
+                vst_ms += samples / sr * 1000.0;
+                vst_count += 1;
+            }
+        }
+        let total = input_ms + block_ms + output_ms + vst_ms;
+        let detail = format!(
+            "Estimated insert latency\ninput backlog {input_ms:.1} ms ({backlog_frames} frames, measured)\nmixer block {block_ms:.1} ms ({} frames)\noutput request {output_ms:.1} ms ({} frames, shared mode may round it up)\nplug-in latency {vst_ms:.1} ms across {vst_count} insert(s), not compensated\ntotal {total:.1} ms\n\nA CPU spike shows up in the input backlog and is dropped back to the target\nonce it passes it, so a stall does not leave the strip permanently behind.",
+            self.main_buffer, self.main_buffer
+        );
+        (total, detail)
+    }
+
     fn strip_label(&self, slot: usize) -> String {
         self.strips
             .get(slot)
@@ -6390,8 +6423,9 @@ impl MixerApp {
                 }
             }
         }
+        let (latency_ms, latency_detail) = self.latency_report();
         let engine_text = format!(
-            "{} kHz  |  buffer {}  |  engine {}  |  {}",
+            "{} kHz  |  buffer {}  |  engine {}  |  {}  |  latency ~{:.0} ms",
             self.sample_rate as f32 / 1000.0,
             self.buffer,
             if self.engine_mode == 0 { "Normal" } else { "Swift" },
@@ -6401,7 +6435,8 @@ impl MixerApp {
                 "PLAYING"
             } else {
                 "STOPPED"
-            }
+            },
+            latency_ms
         );
         let tw = p
             .layout_no_wrap(engine_text.clone(), FontId::proportional(7.0), DIM)
