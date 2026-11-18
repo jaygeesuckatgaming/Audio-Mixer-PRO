@@ -2461,7 +2461,7 @@ impl MixerApp {
         match probe.try_recv() {
             Ok(list) => {
                 if list.len() != self.last_inputs.len() {
-                    diag_log(format!("inputs probe: {} device(s)", list.len()));
+                    diag_log(format!("inputs probe: {} device(s): {}", list.len(), list.iter().take(8).cloned().collect::<Vec<_>>().join(" | ")));
                 }
                 self.last_inputs = list;
                 // Start-up may have run before the probe answered, in which
@@ -2469,6 +2469,37 @@ impl MixerApp {
                 if !self.inputs_applied && !self.last_inputs.is_empty() {
                     self.inputs_applied = true;
                     self.apply_saved_inputs();
+                }
+                // Self-heal: a strip whose saved device was missing at start-up
+                // (a cable endpoint still being attached, a device plugged in
+                // later) is opened as soon as the probe actually lists it. This
+                // is what the picker used to be needed for.
+                for i in 0..self.active_strips.min(self.captures.len()) {
+                    if self.captures[i].is_some() {
+                        continue;
+                    }
+                    let name = self.strips[i].device.clone();
+                    let trimmed = name.trim();
+                    if trimmed.is_empty()
+                        || trimmed == "No input"
+                        || trimmed == "No device"
+                        || trimmed == "Virtual 1 (VAIO)"
+                        || trimmed == "Virtual 2 (AUX)"
+                        || trimmed.starts_with("VBAN: ")
+                    {
+                        continue;
+                    }
+                    if !self
+                        .last_inputs
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(trimmed))
+                    {
+                        continue;
+                    }
+                    if self.capture_jobs.iter().any(|(slot, _)| *slot == i) {
+                        continue;
+                    }
+                    self.spawn_capture_open(i, name);
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.inputs_probe = Some(probe),
@@ -2513,6 +2544,10 @@ impl MixerApp {
         {
             self.devices_probe = Some(receiver);
         }
+        // Refresh the capture list on the same cadence: a cable attached after
+        // start-up (or a device plugged in later) only becomes visible here, and
+        // the strips depend on this list to reopen their saved device.
+        self.probe_inputs_now();
     }
 
     /// React to a list that arrived from the probe thread.
@@ -8773,6 +8808,17 @@ impl eframe::App for MixerApp {
             if self.vst_log_clock >= 1.0 {
                 self.vst_log_clock = 0.0;
                 for (index, slot) in self.vsts.iter().enumerate() {
+                    for i in 0..self.active_strips {
+                        diag_log(format!(
+                            "strip[{i}] capture={} device='{}' route={:?} mute={} solo={} meter={:.3}",
+                            self.captures[i].is_some(),
+                            self.strips[i].device,
+                            self.strips[i].route,
+                            self.strips[i].mute,
+                            self.strips[i].solo,
+                            self.strips[i].meter
+                        ));
+                    }
                     if slot.chain.has_plugin() {
                         let label = self.strip_label(index);
                         let name = slot
