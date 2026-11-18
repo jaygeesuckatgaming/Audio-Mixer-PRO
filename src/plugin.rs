@@ -2,20 +2,24 @@
 //!
 //! The mixer was written against `VstChain`; CLAP slots expose the same shape,
 //! so this enum keeps every call site unchanged while the backend differs.
+//!
+//! The backend sits behind an `Arc` that is swapped only on load/unload, so the
+//! render thread processes without holding the slot lock: the UI's per-frame
+//! queries (has_plugin, peaks, chain summary) never wait on audio work.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::clap_plugin::ClapSlot;
 use crate::vst::{VstChain, VstInfo, VstParam};
 
-enum Inner {
-    Vst3(std::sync::Arc<VstChain>),
-    Clap(std::sync::Arc<ClapSlot>),
+enum Backend {
+    Vst3(Arc<VstChain>),
+    Clap(Arc<ClapSlot>),
 }
 
 pub struct PlugIn {
-    inner: Mutex<Inner>,
+    current: Mutex<Arc<Backend>>,
 }
 
 fn is_clap(path: &Path) -> bool {
@@ -30,209 +34,166 @@ fn is_clap(path: &Path) -> bool {
 }
 
 impl PlugIn {
-    pub fn new() -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
-            inner: Mutex::new(Inner::Vst3(VstChain::new())),
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new(Arc::new(Backend::Vst3(VstChain::new()))),
         })
+    }
+
+    /// Cheap snapshot: the lock is held only long enough to clone the Arc.
+    fn backend(&self) -> Arc<Backend> {
+        match self.current.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Load a `.vst3` bundle or a `.clap` library (optionally `file#plugin-id`).
     pub fn load(&self, path: &Path, sample_rate: f64, max_block: usize) -> Result<VstInfo, String> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| "The plug-in slot is unavailable".to_string())?;
-        if is_clap(path) {
+        let backend = if is_clap(path) {
             let slot = ClapSlot::new();
             let info = slot.load(path, sample_rate, max_block)?;
-            *guard = Inner::Clap(slot);
-            Ok(info)
+            (Arc::new(Backend::Clap(slot)), info)
         } else {
             let chain = VstChain::new();
             let info = chain.load(path, sample_rate, max_block)?;
-            *guard = Inner::Vst3(chain);
-            Ok(info)
-        }
+            (Arc::new(Backend::Vst3(chain)), info)
+        };
+        let mut guard = self
+            .current
+            .lock()
+            .map_err(|_| "The plug-in slot is unavailable".to_string())?;
+        *guard = backend.0;
+        Ok(backend.1)
     }
 
     pub fn unload(&self) {
-        if let Ok(guard) = self.inner.lock() {
-            match &*guard {
-                Inner::Vst3(chain) => chain.unload(),
-                Inner::Clap(slot) => slot.unload(),
-            }
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.unload(),
+            Backend::Clap(slot) => slot.unload(),
         }
     }
 
     pub fn has_plugin(&self) -> bool {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.has_plugin(),
-                Inner::Clap(slot) => slot.has_plugin(),
-            },
-            Err(_) => false,
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.has_plugin(),
+            Backend::Clap(slot) => slot.has_plugin(),
         }
     }
 
     pub fn info(&self) -> Option<VstInfo> {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.info(),
-                Inner::Clap(slot) => slot.info(),
-            },
-            Err(_) => None,
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.info(),
+            Backend::Clap(slot) => slot.info(),
         }
     }
 
     pub fn error(&self) -> Option<String> {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.error(),
-                Inner::Clap(slot) => slot.error(),
-            },
-            Err(_) => None,
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.error(),
+            Backend::Clap(slot) => slot.error(),
         }
     }
 
     pub fn diag(&self) -> String {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.diag(),
-                Inner::Clap(slot) => slot.diag(),
-            },
-            Err(_) => "slot unavailable".to_string(),
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.diag(),
+            Backend::Clap(slot) => slot.diag(),
         }
     }
 
     pub fn set_bypass(&self, bypass: bool) {
-        if let Ok(guard) = self.inner.lock() {
-            match &*guard {
-                Inner::Vst3(chain) => chain.set_bypass(bypass),
-                Inner::Clap(slot) => slot.set_bypass(bypass),
-            }
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.set_bypass(bypass),
+            Backend::Clap(slot) => slot.set_bypass(bypass),
         }
     }
 
     pub fn input_peak(&self) -> f32 {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.input_peak(),
-                Inner::Clap(slot) => slot.input_peak(),
-            },
-            Err(_) => 0.0,
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.input_peak(),
+            Backend::Clap(slot) => slot.input_peak(),
         }
     }
 
     pub fn latency(&self) -> (u32, u32) {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.latency(),
-                Inner::Clap(slot) => slot.latency(),
-            },
-            Err(_) => (0, 0),
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.latency(),
+            Backend::Clap(slot) => slot.latency(),
         }
     }
 
     pub fn chain_summary(&self) -> Option<Vec<String>> {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.chain_summary(),
-                Inner::Clap(slot) => slot.chain_summary(),
-            },
-            Err(_) => None,
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.chain_summary(),
+            Backend::Clap(slot) => slot.chain_summary(),
         }
     }
 
     pub fn parameters(&self) -> Vec<VstParam> {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.parameters(),
-                Inner::Clap(slot) => slot.parameters(),
-            },
-            Err(_) => Vec::new(),
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.parameters(),
+            Backend::Clap(slot) => slot.parameters(),
         }
     }
 
     pub fn set_parameter(&self, id: u32, value: f64) -> Result<(), String> {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.set_parameter(id, value),
-                Inner::Clap(slot) => slot.set_parameter(id, value),
-            },
-            Err(_) => Err("The plug-in slot is unavailable".to_string()),
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.set_parameter(id, value),
+            Backend::Clap(slot) => slot.set_parameter(id, value),
         }
     }
 
     pub fn save_state_to(&self, path: &Path) -> Result<(), String> {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.save_state_to(path),
-                Inner::Clap(slot) => slot.save_state_to(path),
-            },
-            Err(_) => Err("The plug-in slot is unavailable".to_string()),
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.save_state_to(path),
+            Backend::Clap(slot) => slot.save_state_to(path),
         }
     }
 
     pub fn load_state_from(&self, path: &Path) -> Result<(), String> {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.load_state_from(path),
-                Inner::Clap(slot) => slot.load_state_from(path),
-            },
-            Err(_) => Err("The plug-in slot is unavailable".to_string()),
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.load_state_from(path),
+            Backend::Clap(slot) => slot.load_state_from(path),
         }
     }
 
     pub fn open_editor(&self, mixer_hwnd: isize) -> Result<(), String> {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.open_editor(mixer_hwnd),
-                Inner::Clap(slot) => slot.open_editor(mixer_hwnd),
-            },
-            Err(_) => Err("The plug-in slot is unavailable".to_string()),
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.open_editor(mixer_hwnd),
+            Backend::Clap(slot) => slot.open_editor(mixer_hwnd),
         }
     }
 
     pub fn service_editor(&self) {
-        if let Ok(guard) = self.inner.lock() {
-            match &*guard {
-                Inner::Vst3(chain) => chain.service_editor(),
-                Inner::Clap(slot) => slot.service_editor(),
-            }
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.service_editor(),
+            Backend::Clap(slot) => slot.service_editor(),
         }
     }
 
     pub fn editor_is_open(&self) -> bool {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.editor_is_open(),
-                Inner::Clap(slot) => slot.editor_is_open(),
-            },
-            Err(_) => false,
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.editor_is_open(),
+            Backend::Clap(slot) => slot.editor_is_open(),
         }
     }
 
     pub fn close_editor(&self) {
-        if let Ok(guard) = self.inner.lock() {
-            match &*guard {
-                Inner::Vst3(chain) => chain.close_editor(),
-                Inner::Clap(slot) => slot.close_editor(),
-            }
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.close_editor(),
+            Backend::Clap(slot) => slot.close_editor(),
         }
     }
 
     pub fn snapshot_editor(&self, path: &str) -> Result<(), String> {
-        match self.inner.lock() {
-            Ok(guard) => match &*guard {
-                Inner::Vst3(chain) => chain.snapshot_editor(path),
-                Inner::Clap(slot) => slot.snapshot_editor(path),
-            },
-            Err(_) => Err("The plug-in slot is unavailable".to_string()),
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.snapshot_editor(path),
+            Backend::Clap(slot) => slot.snapshot_editor(path),
         }
     }
 
-    /// Render thread entry point. Uses `try_lock`: a slot being swapped under a
-    /// load must never stall the audio callback.
+    /// Render thread entry point: no lock is held while the plug-in runs.
     pub fn process(
         &self,
         in_l: &[f32],
@@ -240,12 +201,9 @@ impl PlugIn {
         out_l: &mut [f32],
         out_r: &mut [f32],
     ) -> bool {
-        let Ok(guard) = self.inner.try_lock() else {
-            return false;
-        };
-        match &*guard {
-            Inner::Vst3(chain) => chain.process(in_l, in_r, out_l, out_r),
-            Inner::Clap(slot) => slot.process(in_l, in_r, out_l, out_r),
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.process(in_l, in_r, out_l, out_r),
+            Backend::Clap(slot) => slot.process(in_l, in_r, out_l, out_r),
         }
     }
 }
