@@ -280,19 +280,54 @@ fn handle_service_client(mut stream: TcpStream, token: &str, log: &LogFn) -> Res
 
 /// Install the scheduled task that starts the elevated helper at logon and
 /// immediately. One UAC prompt for this call only.
+/// Where the resident helper runs from. It is a *copy* of the mixer binary so it
+/// never holds `audio_mixer_pro.exe` open, which otherwise blocks replacing or
+/// rebuilding the mixer while the helper is alive.
+pub fn helper_exe_path() -> Option<PathBuf> {
+    Some(helper_dir()?.join("attach_helper.exe"))
+}
+
+/// True when the resident helper copy is missing or older than this mixer
+/// build, so it needs refreshing (and the scheduled task re-pointing at it).
+pub fn helper_upgrade_needed() -> bool {
+    let Some(copy) = helper_exe_path() else {
+        return false;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let copied = fs::metadata(&copy).and_then(|m| m.modified()).ok();
+    let current = fs::metadata(&exe).and_then(|m| m.modified()).ok();
+    match (copied, current) {
+        (Some(copied), Some(current)) => copied < current,
+        _ => true,
+    }
+}
+
 pub fn install_helper(log: &LogFn) -> Result<(), String> {
     let token = random_token()?;
     save_helper_config(HELPER_PORT, &token)?;
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-    let directory = exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let helper_exe = helper_exe_path().ok_or_else(|| "LOCALAPPDATA is not set".to_string())?;
+    let directory = helper_exe
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
+    // The running helper is stopped before the copy is replaced, otherwise the
+    // file is locked; the task is then re-pointed at the fresh copy.
     let script = format!(
         "$ErrorActionPreference = 'Stop'\n\
-         $action = New-ScheduledTaskAction -Execute '{exe}' -Argument '--vc-attach-service {port} {token}' -WorkingDirectory '{dir}'\n\
+         Stop-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue\n\
+         Start-Sleep -Milliseconds 600\n\
+         Copy-Item -LiteralPath '{exe}' -Destination '{helper}' -Force\n\
+         $action = New-ScheduledTaskAction -Execute '{helper}' -Argument '--vc-attach-service {port} {token}' -WorkingDirectory '{dir}'\n\
          $principal = New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" -LogonType Interactive -RunLevel Highest\n\
          $trigger = New-ScheduledTaskTrigger -AtLogOn\n\
          Register-ScheduledTask -TaskName '{task}' -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null\n\
          Start-ScheduledTask -TaskName '{task}'\n",
         exe = ps_quote(&exe.to_string_lossy()),
+        helper = ps_quote(&helper_exe.to_string_lossy()),
         dir = ps_quote(&directory.to_string_lossy()),
         port = HELPER_PORT,
         token = token,

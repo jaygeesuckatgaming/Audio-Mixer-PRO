@@ -512,6 +512,15 @@ impl Worker {
                 }
             }
         }
+        // A helper copied from an older mixer build keeps the old binary alive;
+        // refresh it so it never blocks replacing the mixer.
+        let stale_copy = virtual_cables::win::helper_upgrade_needed()
+            && virtual_cables::win::helper_exe_path()
+                .map(|path| path.exists())
+                .unwrap_or(false);
+        if stale_copy {
+            self.install_helper(status, log);
+        }
         let helper = virtual_cables::win::helper_running();
         status.lock().unwrap().helper = helper;
         if let Some(broker) = self.broker.as_mut() {

@@ -10149,6 +10149,23 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if raw_args.iter().any(|arg| arg == "--vc-install-helper") {
+        // Refresh the resident helper: it now runs from its own copy so it never
+        // holds audio_mixer_pro.exe open.
+        let log: virtual_cables::LogFn =
+            std::sync::Arc::new(|line: String| eprintln!("{line}"));
+        match virtual_cables::win::install_helper(&log) {
+            Ok(()) => println!("helper install started"),
+            Err(err) => println!("helper install failed: {err}"),
+        }
+        // Give the elevated script time to copy and re-register the task.
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        if let Some(path) = virtual_cables::win::helper_exe_path() {
+            println!("helper copy: {} (exists={})", path.display(), path.exists());
+        }
+        println!("helper running: {}", virtual_cables::win::helper_running());
+        return Ok(());
+    }
     if raw_args.iter().any(|arg| arg == "--eq-selftest") {
         let path = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
