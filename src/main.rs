@@ -1094,6 +1094,9 @@ struct MixerApp {
     /// endpoint cannot be hammered once a second.
     capture_retry_at: [f64; audio::MAX_STRIPS],
     capture_backoff: [f64; audio::MAX_STRIPS],
+    /// Capture opens running on a worker. `InputCapture::open` touches the audio
+    /// service and blocks when an endpoint is wedged, so the UI never calls it.
+    capture_jobs: Vec<(usize, std::sync::mpsc::Receiver<audio::InputCapture>)>,
     /// `--meter-log`: write each strip's capture peak to startup.log once a
     /// second. Used to tell "no signal in the capture" apart from "routing".
     meter_log: bool,
@@ -1611,6 +1614,7 @@ impl MixerApp {
             last_inputs: Vec::new(),
             capture_retry_at: [0.0; audio::MAX_STRIPS],
             capture_backoff: [5.0; audio::MAX_STRIPS],
+            capture_jobs: Vec::new(),
             meter_log: std::env::args().any(|arg| arg == "--meter-log"),
             meter_clock: 0.0,
             a1_reopen_tries: 0,
@@ -2344,6 +2348,66 @@ impl MixerApp {
         }
     }
 
+    /// Open a capture device on a worker so a wedged endpoint cannot freeze
+    /// the console; the result is applied on a later frame.
+    fn spawn_capture_open(&mut self, slot: usize, name: String) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("capture-open".to_string())
+            .spawn(move || {
+                let _ = sender.send(audio::InputCapture::open(Some(&name)));
+            })
+            .is_ok()
+        {
+            self.capture_jobs.push((slot, receiver));
+        }
+    }
+
+    /// Apply capture opens that finished since the last frame.
+    fn poll_capture_jobs(&mut self) {
+        let mut done = Vec::new();
+        self.capture_jobs.retain(|(slot, receiver)| match receiver.try_recv() {
+            Ok(capture) => {
+                done.push((*slot, capture));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (slot, capture) in done {
+            self.apply_opened_capture(slot, capture);
+        }
+    }
+
+    /// Shared post-open handling for the picker and the watchdog.
+    fn apply_opened_capture(&mut self, i: usize, capture: audio::InputCapture) {
+        if capture.available {
+            self.vban.unbind(i);
+            self.strips[i].device = capture.device.clone();
+            self.audio.attach_input(i, capture.shared());
+            if i < 3 && !self.strips[i].route.iter().any(|r| *r) {
+                self.strips[i].route[0] = true;
+            }
+            let device = capture.device.clone();
+            self.captures[i] = Some(StripInput::Cpal(capture));
+            self.strips[i].tape_feed = false;
+            self.capture_backoff[i] = 5.0;
+            self.capture_retry_at[i] = 0.0;
+            self.toast(format!(
+                "Listening to {device} - its A1-A3/B1-B2 buttons now route it"
+            ));
+        } else {
+            let reason = capture.status.clone();
+            self.vban.unbind(i);
+            self.captures[i] = None;
+            self.audio.detach_input(i);
+            self.strips[i].device = capture.device.clone();
+            self.strips[i].meter = 0.0;
+            self.strips[i].peak = 0.0;
+            self.toast(format!("{reason}"));
+        }
+    }
+
     /// Drain the capture-device probe. Never enumerates on the UI thread.
     fn poll_input_devices(&mut self) {
         let Some(probe) = self.inputs_probe.take() else {
@@ -2440,19 +2504,12 @@ impl MixerApp {
                     continue;
                 }
                 let name = cap.device().to_string();
-                let reopened = InputCapture::open(Some(&name));
-                if reopened.available {
-                    self.audio.attach_input(i, reopened.shared());
-                    self.strips[i].device = reopened.device.clone();
-                    self.captures[i] = Some(StripInput::Cpal(reopened));
-                    self.capture_backoff[i] = 5.0;
-                    self.capture_retry_at[i] = 0.0;
-                    self.toast(format!("Input re-opened: {name}"));
-                } else {
-                    let backoff = self.capture_backoff[i].min(60.0);
-                    self.capture_retry_at[i] = self.time + backoff;
-                    self.capture_backoff[i] = (backoff * 2.0).min(60.0);
-                }
+                // Opening is a blocking audio-service call: run it on a worker
+                // and apply the result when it lands.
+                self.spawn_capture_open(i, name.clone());
+                let backoff = self.capture_backoff[i].min(60.0);
+                self.capture_retry_at[i] = self.time + backoff;
+                self.capture_backoff[i] = (backoff * 2.0).min(60.0);
             }
         }
 
@@ -3415,7 +3472,7 @@ impl MixerApp {
                 // opening) goes through that same service and would block the
                 // UI thread for minutes, so leave captures closed and let the
                 // watchdog try again once the service recovers.
-                if self.audio.available && self.last_outputs.is_empty() {
+                if self.audio.available && (self.last_outputs.is_empty() || self.last_inputs.is_empty()) {
                     diag_log("startup: audio service not answering, capture devices left closed");
                     self.toast_for(
                         "Audio service is not responding - input devices left off",
@@ -4213,7 +4270,7 @@ impl MixerApp {
     /// Lowest unused `Microphone (Virtual Cable NN)` with NN >= 03. Cables 01
     /// and 02 carry B1/B2, so input strips start at cable 03.
     fn next_free_virtual_cable(&self) -> Option<String> {
-        let inputs = InputCapture::devices();
+        let inputs = self.last_inputs.clone();
         let used: Vec<String> = self
             .strips
             .iter()
@@ -7955,7 +8012,8 @@ impl MixerApp {
             let is_strip_picker = matches!(target, Picker::Strip(_));
             let devices: Vec<String> = match target {
                 Picker::Strip(_) => {
-                    let mut inputs = InputCapture::devices();
+                    self.probe_inputs_now();
+                    let mut inputs = self.last_inputs.clone();
                     if inputs.is_empty() {
                         inputs.push("No input device found".to_string());
                     }
@@ -8099,37 +8157,10 @@ impl MixerApp {
                                         );
                                         self.toast(format!("VBAN input: {stream}"));
                                     } else {
-                                        let capture = InputCapture::open(Some(&d));
-                                        if capture.available {
-                                            self.vban.unbind(i);
-                                            self.strips[i].device =
-                                                capture.device.clone();
-                                            self.audio.attach_input(i, capture.shared());
-                                            if i < 3
-                                                && !self.strips[i].route.iter().any(|r| *r)
-                                            {
-                                                self.strips[i].route[0] = true;
-                                            }
-                                            self.captures[i] = Some(StripInput::Cpal(capture));
-                                            self.strips[i].tape_feed = false;
-                                            self.toast(format!(
-                                                "Listening to {d} - its A1-A3/B1-B2 buttons now route it"
-                                            ));
-                                        } else {
-                                            let reason = capture.status.clone();
-                                            self.vban.unbind(i);
-                                            self.captures[i] = None;
-                                            self.audio.detach_input(i);
-                                            self.strips[i].device = d.clone();
-                                            self.strips[i].meter = 0.0;
-                                            self.strips[i].peak = 0.0;
-                                            self.strips[i].route = [false; audio::MAX_BUSES];
-                                            self.strips[i].tape_feed = false;
-                                            self.toast_for(
-                                                format!("Could not open {d}: {reason}"),
-                                                8.0,
-                                            );
-                                        }
+                                        // Opening touches the audio service and can
+                                        // block, so it happens on a worker.
+                                        self.spawn_capture_open(i, d.clone());
+                                        self.toast(format!("Opening {d} ..."));
                                     }
                                 }
                                 Picker::Bus(i) => {
@@ -8150,8 +8181,10 @@ impl MixerApp {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             if ui.button("Rescan devices").clicked() {
-                                let n = InputCapture::devices().len();
-                                self.toast(format!("{n} input device(s) found"));
+                                // Enumeration blocks in the audio service when a
+                                // device is wedged: ask the probe thread instead.
+                                self.probe_inputs_now();
+                                self.toast("Rescanning input devices ...".to_string());
                             }
                         });
                         ui.label(
@@ -8799,6 +8832,7 @@ impl eframe::App for MixerApp {
         }
         self.poll_audio_devices(dt as f64);
         self.poll_input_devices();
+        self.poll_capture_jobs();
         self.sync_app_targets();
 
         egui::TopBottomPanel::top("topbar")

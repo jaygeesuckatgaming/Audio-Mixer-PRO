@@ -2573,6 +2573,9 @@ pub struct InputCapture {
     pub status: String,
 }
 
+fn _assert_send<T: Send>() {}
+fn _assert_capture_send() { _assert_send::<InputCapture>(); }
+
 impl InputCapture {
     pub fn open(preferred: Option<&str>) -> Self {
         let host = cpal::default_host();
