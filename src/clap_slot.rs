@@ -230,6 +230,69 @@ pub fn selftest(path: &Path) -> SelftestReport {
     };
     lines.push("activated".to_string());
 
+    // P2: latency, parameters and state are all main-thread operations.
+    {
+        use clack_extensions::latency::PluginLatency;
+        use clack_extensions::params::{ParamInfoBuffer, PluginParams};
+        use clack_extensions::state::PluginState;
+
+        let mut handle = instance.plugin_handle();
+        let latency = handle.get_extension::<PluginLatency>()
+            .map(|l| l.get(&handle))
+            .unwrap_or(0);
+        lines.push(format!("latency: {latency} samples"));
+
+        if let Some(params) = handle.get_extension::<PluginParams>() {
+            let count = params.count(&handle);
+            let mut buffer = ParamInfoBuffer::new();
+            let mut shown = 0;
+            for index in 0..count {
+                let Some(info) = params.get_info(&handle, index, &mut buffer) else {
+                    continue;
+                };
+                if shown < 4 {
+                    let mut text = [0u8; 128];
+                    let formatted = params
+                        .value_to_text(&handle, info.id, info.default_value, &mut text)
+                        .map(|slice| {
+                            String::from_utf8_lossy(slice)
+                                .trim_end_matches(' ')
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "  param {} = {}  (id {})",
+                        String::from_utf8_lossy(info.name),
+                        formatted,
+                        info.id.get()
+                    ));
+                }
+                shown += 1;
+            }
+            lines.push(format!("parameters: {shown}"));
+        } else {
+            lines.push("parameters: none exposed".to_string());
+        }
+
+        if let Some(state) = handle.get_extension::<PluginState>() {
+            let mut blob = Vec::new();
+            match state.save(&handle, &mut blob) {
+                Ok(()) => {
+                    let mut cursor = std::io::Cursor::new(blob.clone());
+                    let restored = state.load(&handle, &mut cursor).is_ok();
+                    lines.push(format!(
+                        "state: saved {} bytes, reload ok={restored}",
+                        blob.len()
+                    ));
+                }
+                Err(err) => lines.push(format!("state: save failed: {err:?}")),
+            }
+        } else {
+            lines.push("state: not supported".to_string());
+        }
+    }
+
+
     let mut started = match stopped.start_processing() {
         Ok(started) => started,
         Err(err) => {

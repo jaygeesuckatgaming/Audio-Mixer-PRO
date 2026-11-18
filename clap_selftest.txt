@@ -1,6 +1,13 @@
 library: C:\Users\jayge\AppData\Local\Programs\Common\CLAP\Surge XT Effects.clap  plug-in: Surge XT Effects (org.surge-synth-team.surge-xt-fx)
 instantiated
 activated
+latency: 0 samples
+  param Input Channel = -100.00 % (Left)  (id 720135338)
+  param Delay Time Left = 3.91 ms  (id 720135339)
+  param Delay Time Right = 3.91 ms  (id 720135340)
+  param Feedback/EQ Feedback = 0.00 %  (id 720135341)
+parameters: 13
+state: saved 1062 bytes, reload ok=true
 started
 process: blocks=96/96 peak=0.212161 nonfinite=0
 stopped and deactivated
