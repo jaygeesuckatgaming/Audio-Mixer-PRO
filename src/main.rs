@@ -2496,6 +2496,17 @@ impl MixerApp {
                     {
                         continue;
                     }
+                    // A cable endpoint shows up in enumeration while usbip is
+                    // still attaching it. Opening it then yields a stream that
+                    // runs but stays permanently silent, and it holds the
+                    // endpoint so the attach cannot finish (Chrome then cannot
+                    // even see the cable). Wait until the attach reports done.
+                    if self.vc_cfg.enabled
+                        && cable_label(&name).is_some()
+                        && !self.vc.status().attached
+                    {
+                        continue;
+                    }
                     if self.capture_jobs.iter().any(|(slot, _)| *slot == i) {
                         continue;
                     }
