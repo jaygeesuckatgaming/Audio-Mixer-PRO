@@ -1,0 +1,6 @@
+library: C:\Users\jayge\AppData\Local\Programs\Common\CLAP\Surge XT Effects.clap  plug-in: Surge XT Effects (org.surge-synth-team.surge-xt-fx)
+instantiated
+activated
+started
+process: blocks=96/96 peak=0.212161 nonfinite=0
+stopped and deactivated

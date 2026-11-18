@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod clap_host;
+mod clap_slot;
 mod editor_host;
 mod sessions;
 mod vban;
@@ -10064,6 +10066,7 @@ fn main() -> eframe::Result<()> {
     let mut startup_demo = None;
     let mut vst_probe: Option<Option<PathBuf>> = None;
     let mut vst_selftest: Option<Option<PathBuf>> = None;
+    let mut clap_selftest: Option<Option<PathBuf>> = None;
     let mut vst_mix_selftest: Option<Option<PathBuf>> = None;
     let mut vst_multi_selftest: Option<Option<PathBuf>> = None;
     let mut vst_editor_selftest: Option<Option<PathBuf>> = None;
@@ -10092,6 +10095,16 @@ fn main() -> eframe::Result<()> {
                 }
             });
             vst_selftest = Some(path);
+        } else if arg == "--clap-selftest" {
+            let next = args.next();
+            let path = next.and_then(|value| {
+                if value.starts_with('-') {
+                    None
+                } else {
+                    Some(PathBuf::from(value))
+                }
+            });
+            clap_selftest = Some(path);
         } else if arg == "--vst-mix-selftest" {
             let next = args.next();
             let path = next.and_then(|value| {
@@ -10189,6 +10202,50 @@ fn main() -> eframe::Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("vst_selftest.txt");
         vst::selftest(path.as_deref(), &report);
+        return Ok(());
+    }
+    if let Some(path) = clap_selftest {
+        let report = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("clap_selftest.txt");
+        let outcome = match path {
+            Some(path) => clap_slot::selftest(&path),
+            None => {
+                let found = clap_slot::scan();
+                let mut lines = vec![format!("scanned {} CLAP plug-in(s)", found.len())];
+                for entry in &found {
+                    lines.push(format!(
+                        "  {} | {} | {} | {} | {}",
+                        entry.name,
+                        entry.vendor,
+                        entry.version,
+                        entry.category(),
+                        entry.path.display()
+                    ));
+                }
+                match found.first() {
+                    Some(first) => {
+                        let mut result = clap_slot::selftest(&first.path);
+                        lines.push(String::new());
+                        lines.push(format!("selftest: {}", first.name));
+                        lines.extend(result.lines.drain(..));
+                        clap_slot::SelftestReport {
+                            ok: result.ok,
+                            lines,
+                        }
+                    }
+                    None => clap_slot::SelftestReport {
+                        ok: false,
+                        lines,
+                    },
+                }
+            }
+        };
+        let text = outcome.lines.join("
+") + "
+";
+        let _ = std::fs::write(&report, &text);
+        print!("{text}");
         return Ok(());
     }
     if let Some(path) = vst_mix_selftest {
