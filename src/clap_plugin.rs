@@ -10,7 +10,9 @@ use clack_extensions::gui::{GuiApiType, GuiConfiguration, GuiSize, PluginGui, Wi
 use clack_extensions::latency::PluginLatency;
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_extensions::state::PluginState;
+use clack_host::events::event_types::ParamValueEvent;
 use clack_host::events::io::EventBuffer;
+use clack_host::prelude::{Pckn, ClapId};
 use clack_host::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -30,6 +32,8 @@ pub struct ClapSlot {
     peak: AtomicU32,
     in_peak: AtomicU32,
     gui_open: AtomicBool,
+    /// Parameter changes waiting to be delivered as events in the next block.
+    pending: Mutex<Vec<(ClapId, f64)>>,
 }
 
 struct Main {
@@ -74,6 +78,7 @@ impl ClapSlot {
             peak: AtomicU32::new(0),
             in_peak: AtomicU32::new(0),
             gui_open: AtomicBool::new(false),
+            pending: Mutex::new(Vec::with_capacity(8)),
         })
     }
 
@@ -284,11 +289,19 @@ impl ClapSlot {
         out
     }
 
-    /// CLAP has no host-side setter: changes travel as events in the next
-    /// process block. Queued changes are not wired yet, so this reports that
-    /// rather than pretending the value took.
-    pub fn set_parameter(&self, _id: u32, _value: f64) -> Result<(), String> {
-        Err("CLAP parameter editing is not wired up yet".to_string())
+    /// CLAP has no host-side setter: a change is an event the plug-in receives
+    /// inside its next `process` call. It is queued here and delivered then.
+    pub fn set_parameter(&self, id: u32, value: f64) -> Result<(), String> {
+        let id = ClapId::from_raw(id).ok_or_else(|| "invalid parameter id".to_string())?;
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "parameter queue unavailable".to_string())?;
+        if pending.len() >= 8 {
+            return Err("too many parameter changes queued".to_string());
+        }
+        pending.push((id, value));
+        Ok(())
     }
 
     pub fn chain_summary(&self) -> Option<Vec<String>> {
@@ -429,6 +442,15 @@ impl ClapSlot {
         }
         self.in_peak.store(in_peak.to_bits(), Ordering::Relaxed);
 
+        // Deliver queued parameter changes as events, which is how a CLAP host
+        // adjusts a parameter. The buffer is preallocated to the queue cap, so
+        // this does not allocate on the audio thread.
+        input_events.clear();
+        if let Ok(mut pending) = self.pending.try_lock() {
+            for (id, value) in pending.drain(..) {
+                input_events.push(&ParamValueEvent::new(0, id, Pckn::match_all(), value));
+            }
+        }
         let events = InputEvents::from_buffer(input_events);
         let mut out_events = OutputEvents::from_buffer(output_events);
         let mut input_audio = input_ports.with_input_buffers([AudioPortBuffer {

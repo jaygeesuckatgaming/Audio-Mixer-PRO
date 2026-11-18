@@ -10263,7 +10263,28 @@ fn main() -> eframe::Result<()> {
                     "process: blocks={processed}/96 peak={peak:.6} nonfinite={nonfinite}"
                 ));
                 lines.push(format!("latency: {:?}", slot.latency()));
-                lines.push(format!("params: {}", slot.parameters().len()));
+                let params = slot.parameters();
+                lines.push(format!("params: {}", params.len()));
+                // Prove a CLAP parameter change actually lands: mute the first
+                // parameter that formats as a percentage and watch the peak.
+                if let Some(param) = params.iter().find(|p| p.formatted.contains("ms")) {
+                    let before = slot.parameters().iter().find(|p| p.id == param.id).map(|p| p.value);
+                    let _ = slot.set_parameter(param.id, 0.9);
+                    for block in 0..4 {
+                        for i in 0..frames {
+                            let t = (block * frames + i) as f32 / 48_000.0;
+                            let v = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.2;
+                            in_l[i] = v;
+                            in_r[i] = v;
+                        }
+                        slot.process(&in_l, &in_r, &mut out_l, &mut out_r);
+                    }
+                    let after = slot.parameters().iter().find(|p| p.id == param.id).map(|p| p.value);
+                    lines.push(format!(
+                        "param event: '{}' {} -> {:?}",
+                        param.name, before.map(|v| format!("{v:.3}")).unwrap_or_default(), after
+                    ));
+                }
                 if let Some(err) = slot.error() {
                     lines.push(format!("error: {err}"));
                 }
