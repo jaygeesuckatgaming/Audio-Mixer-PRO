@@ -1089,6 +1089,10 @@ struct MixerApp {
     /// Same for capture devices: the auto-restart watchdog must never call
     /// `InputCapture::devices()` on the UI thread.
     inputs_probe: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    /// Last time each probe was started, so a picker that asks every frame
+    /// cannot spawn a thread and enumerate devices at frame rate.
+    devices_probe_at: f64,
+    inputs_probe_at: f64,
     last_inputs: Vec<String>,
     /// Set once the saved captures have been applied from a probed list, so a
     /// start-up that raced the probe still ends up with its inputs open.
@@ -1614,6 +1618,8 @@ impl MixerApp {
             poll_clock: 0.0,
             devices_probe: None,
             inputs_probe: None,
+            devices_probe_at: 0.0,
+            inputs_probe_at: 0.0,
             last_inputs: Vec::new(),
             inputs_applied: false,
             capture_retry_at: [0.0; audio::MAX_STRIPS],
@@ -2340,9 +2346,10 @@ impl MixerApp {
 
     /// Kick the capture-device probe (the UI thread must never enumerate).
     fn probe_inputs_now(&mut self) {
-        if self.inputs_probe.is_some() {
+        if self.inputs_probe.is_some() || self.inputs_probe_at > 0.0 && self.time - self.inputs_probe_at < 1.0 {
             return;
         }
+        self.inputs_probe_at = self.time;
         let (sender, receiver) = std::sync::mpsc::channel();
         if std::thread::Builder::new()
             .name("input-probe".to_string())
@@ -2358,9 +2365,10 @@ impl MixerApp {
     /// Kick the device probe immediately if one is not already running. Used
     /// by start-up, which must not wait a full watchdog tick for the list.
     fn probe_devices_now(&mut self) {
-        if self.devices_probe.is_some() {
+        if self.devices_probe.is_some() || self.devices_probe_at > 0.0 && self.time - self.devices_probe_at < 1.0 {
             return;
         }
+        self.devices_probe_at = self.time;
         let (sender, receiver) = std::sync::mpsc::channel();
         if std::thread::Builder::new()
             .name("device-probe".to_string())
@@ -2452,10 +2460,9 @@ impl MixerApp {
         };
         match probe.try_recv() {
             Ok(list) => {
-                diag_log(format!(
-                    "inputs probe: {} device(s)",
-                    list.len()
-                ));
+                if list.len() != self.last_inputs.len() {
+                    diag_log(format!("inputs probe: {} device(s)", list.len()));
+                }
                 self.last_inputs = list;
                 // Start-up may have run before the probe answered, in which
                 // case the saved captures were skipped; apply them now.
