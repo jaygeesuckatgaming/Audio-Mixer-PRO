@@ -1090,6 +1090,9 @@ struct MixerApp {
     /// `InputCapture::devices()` on the UI thread.
     inputs_probe: Option<std::sync::mpsc::Receiver<Vec<String>>>,
     last_inputs: Vec<String>,
+    /// Set once the saved captures have been applied from a probed list, so a
+    /// start-up that raced the probe still ends up with its inputs open.
+    inputs_applied: bool,
     /// Per strip backoff for reopening a vanished capture device, so a dead
     /// endpoint cannot be hammered once a second.
     capture_retry_at: [f64; audio::MAX_STRIPS],
@@ -1612,6 +1615,7 @@ impl MixerApp {
             devices_probe: None,
             inputs_probe: None,
             last_inputs: Vec::new(),
+            inputs_applied: false,
             capture_retry_at: [0.0; audio::MAX_STRIPS],
             capture_backoff: [5.0; audio::MAX_STRIPS],
             capture_jobs: Vec::new(),
@@ -2414,7 +2418,19 @@ impl MixerApp {
             return;
         };
         match probe.try_recv() {
-            Ok(list) => self.last_inputs = list,
+            Ok(list) => {
+                diag_log(format!(
+                    "inputs probe: {} device(s)",
+                    list.len()
+                ));
+                self.last_inputs = list;
+                // Start-up may have run before the probe answered, in which
+                // case the saved captures were skipped; apply them now.
+                if !self.inputs_applied && !self.last_inputs.is_empty() {
+                    self.inputs_applied = true;
+                    self.apply_saved_inputs();
+                }
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.inputs_probe = Some(probe),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
