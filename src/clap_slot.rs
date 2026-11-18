@@ -373,3 +373,144 @@ pub fn selftest(path: &Path) -> SelftestReport {
 
     SelftestReport { ok, lines }
 }
+
+/// Open a plug-in's GUI in a window of our own for a few seconds, pumping
+/// messages so it actually paints. This is the P3 milestone: the same code
+/// path the mixer will use, just without the mixer around it.
+pub fn gui_selftest(path: &Path) -> SelftestReport {
+    use clack_extensions::gui::{GuiApiType, GuiConfiguration, GuiSize, PluginGui, Window};
+
+    let mut lines = Vec::new();
+    let mut ok = false;
+
+    let entry = match unsafe { PluginEntry::load(path) } {
+        Ok(entry) => entry,
+        Err(err) => {
+            lines.push(format!("FAIL: load: {err}"));
+            return SelftestReport { ok, lines };
+        }
+    };
+    let Some(factory) = entry.get_plugin_factory() else {
+        lines.push("FAIL: no plug-in factory".to_string());
+        return SelftestReport { ok, lines };
+    };
+    let Some(desc) = factory.plugin_descriptors().next() else {
+        lines.push("FAIL: no descriptors".to_string());
+        return SelftestReport { ok, lines };
+    };
+    let Some(id) = desc.id() else {
+        lines.push("FAIL: no id".to_string());
+        return SelftestReport { ok, lines };
+    };
+    let id = id.to_owned();
+    let info = match HostInfo::new("Audio Mixer PRO", "JayGee", "https://example.com", "0.1") {
+        Ok(info) => info,
+        Err(err) => {
+            lines.push(format!("FAIL: host info: {err}"));
+            return SelftestReport { ok, lines };
+        }
+    };
+    let mut instance = match PluginInstance::<ClapHost>::new(
+        |_| ClapShared::default(),
+        |_| (),
+        &entry,
+        &id,
+        &info,
+    ) {
+        Ok(instance) => instance,
+        Err(err) => {
+            lines.push(format!("FAIL: instantiate: {err}"));
+            return SelftestReport { ok, lines };
+        }
+    };
+    let config = PluginAudioConfiguration {
+        sample_rate: 48_000.0,
+        min_frames_count: 1,
+        max_frames_count: crate::vst::VST_MAX_BLOCK as u32,
+    };
+    let stopped = match instance.activate(|_, _| (), config) {
+        Ok(stopped) => stopped,
+        Err(err) => {
+            lines.push(format!("FAIL: activate: {err}"));
+            return SelftestReport { ok, lines };
+        }
+    };
+
+    let mut handle = instance.plugin_handle();
+    let Some(gui) = handle.get_extension::<PluginGui>() else {
+        lines.push("FAIL: plug-in has no GUI extension".to_string());
+        dropped(instance, stopped);
+        return SelftestReport { ok, lines };
+    };
+    let configuration = GuiConfiguration {
+        api_type: GuiApiType::WIN32,
+        is_floating: false,
+    };
+    if !gui.is_api_supported(&handle, configuration) {
+        lines.push("FAIL: Win32 embedded GUI not supported".to_string());
+        dropped(instance, stopped);
+        return SelftestReport { ok, lines };
+    }
+    lines.push("gui: Win32 embedded supported".to_string());
+
+    if let Err(err) = gui.create(&handle, configuration) {
+        lines.push(format!("FAIL: gui create: {err:?}"));
+        dropped(instance, stopped);
+        return SelftestReport { ok, lines };
+    }
+    let size = gui.get_size(&handle).unwrap_or(GuiSize {
+        width: 900,
+        height: 600,
+    });
+    lines.push(format!("gui created, size {}x{}", size.width, size.height));
+
+    let Some(mut window) = crate::host_window::HostWindow::open(
+        "CLAP GUI",
+        size.width as i32,
+        size.height as i32,
+    ) else {
+        lines.push("FAIL: could not create host window".to_string());
+        gui.destroy(&handle);
+        dropped(instance, stopped);
+        return SelftestReport { ok, lines };
+    };
+    let parent =
+        unsafe { Window::from_win32_hwnd(window.hwnd() as *mut std::ffi::c_void) };
+    if let Err(err) = unsafe { gui.set_parent(&handle, parent) } {
+        lines.push(format!("FAIL: set_parent: {err:?}"));
+        gui.destroy(&handle);
+        return SelftestReport { ok, lines };
+    }
+    let shown = gui.show(&handle).is_ok();
+    lines.push(format!("gui shown: {shown}"));
+
+    // Pump this thread's queue so the plug-in's window actually paints.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        crate::host_window::pump_messages();
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+    // Capture before tearing down, so the GUI can be inspected.
+    let shot = crate::host_window::snapshot_hwnd(window.hwnd(), "third_party/clap_gui.bmp");
+    lines.push(format!("capture: {shot:?}"));
+    let (cw, ch) = window.client_size();
+    lines.push(format!(
+        "host window client {}x{}, closed={}",
+        cw,
+        ch,
+        window.is_closed()
+    ));
+
+    let _ = gui.hide(&handle);
+    gui.destroy(&handle);
+    window.close();
+    drop(handle);
+    instance.deactivate(stopped);
+    lines.push("gui hidden and destroyed".to_string());
+    ok = shown && cw > 0 && ch > 0;
+    SelftestReport { ok, lines }
+}
+
+fn dropped(mut instance: PluginInstance<ClapHost>, stopped: StoppedPluginAudioProcessor<ClapHost>) {
+    instance.deactivate(stopped);
+}

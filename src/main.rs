@@ -4,6 +4,7 @@ mod audio;
 mod clap_host;
 mod clap_slot;
 mod editor_host;
+mod host_window;
 mod sessions;
 mod vban;
 mod vc;
@@ -10067,6 +10068,7 @@ fn main() -> eframe::Result<()> {
     let mut vst_probe: Option<Option<PathBuf>> = None;
     let mut vst_selftest: Option<Option<PathBuf>> = None;
     let mut clap_selftest: Option<Option<PathBuf>> = None;
+    let mut clap_gui: Option<Option<PathBuf>> = None;
     let mut vst_mix_selftest: Option<Option<PathBuf>> = None;
     let mut vst_multi_selftest: Option<Option<PathBuf>> = None;
     let mut vst_editor_selftest: Option<Option<PathBuf>> = None;
@@ -10105,6 +10107,16 @@ fn main() -> eframe::Result<()> {
                 }
             });
             clap_selftest = Some(path);
+        } else if arg == "--clap-gui" {
+            let next = args.next();
+            let path = next.and_then(|value| {
+                if value.starts_with('-') {
+                    None
+                } else {
+                    Some(PathBuf::from(value))
+                }
+            });
+            clap_gui = Some(path);
         } else if arg == "--vst-mix-selftest" {
             let next = args.next();
             let path = next.and_then(|value| {
@@ -10202,6 +10214,32 @@ fn main() -> eframe::Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("vst_selftest.txt");
         vst::selftest(path.as_deref(), &report);
+        return Ok(());
+    }
+    if let Some(path) = clap_gui {
+        let chosen = path.or_else(|| {
+            clap_slot::scan()
+                .into_iter()
+                .find(|entry| entry.category().contains("audio-effect"))
+                .map(|entry| entry.path)
+        });
+        let outcome = match chosen {
+            Some(path) => clap_slot::gui_selftest(&path),
+            None => clap_slot::SelftestReport {
+                ok: false,
+                lines: vec!["no CLAP plug-in found".to_string()],
+            },
+        };
+        let text = outcome.lines.join("
+") + "
+";
+        let _ = std::fs::write(
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("clap_gui.txt"),
+            &text,
+        );
+        print!("{text}");
         return Ok(());
     }
     if let Some(path) = clap_selftest {

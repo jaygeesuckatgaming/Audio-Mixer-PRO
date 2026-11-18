@@ -1,0 +1,6 @@
+gui: Win32 embedded supported
+gui created, size 600x490
+gui shown: true
+capture: Ok(())
+host window client 600x490, closed=false
+gui hidden and destroyed
