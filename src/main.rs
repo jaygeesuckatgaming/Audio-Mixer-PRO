@@ -6678,6 +6678,20 @@ impl MixerApp {
             FontId::proportional(7.0),
             DIM,
         );
+        // The latency figure is painted text, so it had no widget to hover:
+        // give it an invisible interact rect right over the phrase and hang the
+        // breakdown on that.
+        let latency_text = format!("latency ~{latency_ms:.0} ms");
+        let latency_w = p
+            .layout_no_wrap(latency_text, FontId::proportional(7.0), DIM)
+            .size()
+            .x;
+        let latency_rect = Rect::from_min_size(
+            Pos2::new(bar.right() - 6.0 - latency_w, bar.top()),
+            Vec2::new(latency_w + 6.0, bar.height()),
+        );
+        let latency_resp = ui.interact(latency_rect, Id::new("status_latency"), Sense::hover());
+        let _ = latency_resp.on_hover_text(latency_detail);
     }
 
     fn on_transport(&mut self, t: Transport) {
