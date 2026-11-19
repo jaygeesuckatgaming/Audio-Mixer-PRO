@@ -31,11 +31,12 @@ const BUS_PREFILL_FRAMES: usize = 1024;
 /// growing "output queue". Holding it at the prefill keeps the queue at two
 /// blocks instead of letting it park higher.
 const BUS_DRAIN_FRAMES: usize = 1024;
-/// Emulated USB cable endpoints hand the callback ~1056 frames at a time, so a
-/// 1024-frame ring starves on the callback itself; those get two callbacks of
-/// cushion. The kernel driver's Virtual Cable endpoints are ordinary WDM
-/// devices and do not need it.
-const USB_CABLE_CUSHION_FRAMES: usize = 1792;
+/// Emulated USB cable endpoints ask for 480 frames per callback but deliver
+/// them in bursts: several callbacks land back to back, so the ring has to hold
+/// more than one callback's worth. Measured starving 1-9 times a second with
+/// 1024 and with 1792 frames. Six callbacks of cushion, 60 ms, is fine for an
+/// app feed; the status bar follows the monitoring bus, not this one.
+const USB_CABLE_CUSHION_FRAMES: usize = 2880;
 
 /// Ring depth the callback keeps queued for this endpoint.
 fn bus_cushion_frames(device: &str) -> usize {
@@ -515,11 +516,11 @@ impl TrackInfo {
             n => format!("{n} ch"),
         };
         let mut out = format!(
-            "{} ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {} Hz ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}{}",
+            "{} ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {} Hz ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}{}",
             self.format, self.sample_rate, bits, channels
         );
         if self.truncated {
-            out.push_str(" ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· first 30 min only");
+            out.push_str(" ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· first 30 min only");
         }
         out
     }
@@ -689,6 +690,8 @@ struct Shared {
     /// Frames the endpoint asked for in its last callback; the cable ring has to
     /// be at least this deep or the callback itself starves.
     bus_callback_frames: [AtomicUsize; MAX_BUSES],
+    /// Sample-rate ratio this bus stream consumes at (1.0 = matched).
+    bus_step: [AtomicU32; MAX_BUSES],
     error: Mutex<Option<String>>,
 }
 
@@ -733,6 +736,7 @@ impl Shared {
             mixer_late: AtomicU64::new(0),
             bus_underruns: std::array::from_fn(|_| AtomicU64::new(0)),
             bus_callback_frames: std::array::from_fn(|_| AtomicUsize::new(0)),
+            bus_step: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             vsts: std::array::from_fn(|_| crate::plugin::PlugIn::new()),
             duck_enabled: AtomicBool::new(false),
             duck_source: AtomicUsize::new(usize::MAX),
@@ -1784,6 +1788,14 @@ impl AudioEngine {
             .get(bus.min(MAX_BUSES - 1))
             .map(|slot| slot.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    pub fn bus_step(&self, bus: usize) -> f32 {
+        self.shared
+            .bus_step
+            .get(bus.min(MAX_BUSES - 1))
+            .map(|slot| f32::from_bits(slot.load(Ordering::Relaxed)))
+            .unwrap_or(1.0)
     }
 
     pub fn ring_frames(&self, bus: usize) -> usize {
@@ -3517,6 +3529,11 @@ where
                     // it needs; the log reports it next to any starvation.
                     if let Some(slot) = shared.bus_callback_frames.get(owner) {
                         slot.store(data.len() / channels.max(1), Ordering::Relaxed);
+                    }
+                    if let Some(slot) = shared.bus_step.get(owner) {
+                        let ratio = shared.sample_rate.load(Ordering::Relaxed) as f32
+                            / output_rate.max(1.0);
+                        slot.store(ratio.max(0.01).to_bits(), Ordering::Relaxed);
                     }
                 }
                 let step = if output_rate > 0.0 {

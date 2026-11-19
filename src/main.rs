@@ -2650,9 +2650,11 @@ impl MixerApp {
                 .filter(|(_, count)| **count > 0)
                 .map(|(bus, count)| {
                     format!(
-                        "{}={count} (callback {} frames)",
+                        "{}={count} (cb {} frames, step {:.3}, ring {})",
                         self.buses[bus].name,
-                        self.audio.callback_frames_for(bus)
+                        self.audio.callback_frames_for(bus),
+                        self.audio.bus_step(bus),
+                        self.audio.ring_frames(bus)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -5687,7 +5689,7 @@ impl MixerApp {
 
             match self.vsts[idx].info.as_ref() {
                 Some(info) => {
-                    let vendor = format!("{} {} Ã‚Â· {}", info.vendor, info.version, info.format);
+                    let vendor = format!("{} {} Ãƒâ€šÃ‚Â· {}", info.vendor, info.version, info.format);
                     ui.painter().text(
                         Pos2::new(insert.left() + 5.0, insert.top() + 6.0),
                         Align2::LEFT_TOP,
