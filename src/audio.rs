@@ -1656,8 +1656,23 @@ pub struct AudioEngine {
     bus_groups: Vec<BusGroup>,
     bus_pending: Vec<PendingBusGroup>,
     bus_device_names: [String; MAX_BUSES],
+    /// Last failure text per bus, shown in the status dot's tooltip.
+    bus_last_error: [String; MAX_BUSES],
     bus_retry_at: [Option<std::time::Instant>; MAX_BUSES],
     bus_last_request: [String; MAX_BUSES],
+}
+
+/// What a bus card's status dot shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BusState {
+    /// No device routed, or the engine is not running.
+    Off,
+    /// The stream is being opened on a worker right now.
+    Opening,
+    /// A stream is playing into the device.
+    Running,
+    /// The last open failed; it is retried every few seconds.
+    Failed,
 }
 
 /// One running output stream and the buses it carries.
@@ -1742,6 +1757,7 @@ impl AudioEngine {
             bus_groups: Vec::new(),
             bus_pending: Vec::new(),
             bus_device_names: std::array::from_fn(|_| String::new()),
+            bus_last_error: std::array::from_fn(|_| String::new()),
             bus_retry_at: std::array::from_fn(|_| None),
             bus_last_request: std::array::from_fn(|_| String::new()),
         }
@@ -1819,6 +1835,7 @@ impl AudioEngine {
         self.bus_pending.clear();
         for b in 0..MAX_BUSES {
             self.bus_device_names[b].clear();
+            self.bus_last_error[b].clear();
             self.bus_retry_at[b] = None;
             self.bus_last_request[b].clear();
             self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
@@ -1833,6 +1850,7 @@ impl AudioEngine {
         self.bus_pending.clear();
         for b in 0..MAX_BUSES {
             self.bus_device_names[b].clear();
+            self.bus_last_error[b].clear();
             self.bus_retry_at[b] = None;
             self.bus_last_request[b].clear();
             self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
@@ -2168,6 +2186,7 @@ impl AudioEngine {
                         }
                         self.shared.bus_out_active[b].store(true, Ordering::Relaxed);
                         self.bus_retry_at[b] = None;
+                        self.bus_last_error[b].clear();
                     }
                     crate::diag_log(format!(
                         "audio: bus {labels} output on '{}' at {rate} Hz",
@@ -2182,6 +2201,7 @@ impl AudioEngine {
                 Err(err) => {
                     for &b in &group.buses {
                         self.bus_retry_at[b] = Some(now + std::time::Duration::from_secs(3));
+                        self.bus_last_error[b] = err.clone();
                         self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
                         lock_source(&self.shared.bus_out_rings[b]).clear();
                     }
@@ -2216,6 +2236,10 @@ impl AudioEngine {
         });
 
         for b in 0..MAX_BUSES {
+            if wanted[b].is_none() {
+                self.bus_last_error[b].clear();
+                self.bus_retry_at[b] = None;
+            }
             self.bus_device_names[b] = wanted[b].clone().unwrap_or_default();
             self.bus_last_request[b] = requested[b].to_string();
         }
@@ -2242,6 +2266,7 @@ impl AudioEngine {
             for b in group.buses {
                 self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
                 lock_source(&self.shared.bus_out_rings[b]).clear();
+                self.bus_last_error[b].clear();
             }
         }
         self.bus_groups = keep;
@@ -2289,6 +2314,33 @@ impl AudioEngine {
 
     fn bus_is_pending(&self, bus: usize) -> bool {
         self.bus_pending.iter().any(|p| p.buses.contains(&bus))
+    }
+
+    /// State for a bus card's status dot.
+    pub fn bus_state(&self, bus: usize) -> BusState {
+        if self.bus_is_open(bus) {
+            BusState::Running
+        } else if self.bus_is_pending(bus) {
+            BusState::Opening
+        } else if !self
+            .bus_last_error
+            .get(bus)
+            .map(String::is_empty)
+            .unwrap_or(true)
+        {
+            BusState::Failed
+        } else {
+            BusState::Off
+        }
+    }
+
+    /// Text of the last open failure for a bus, if it is still the current
+    /// state (cleared as soon as the bus opens or is rerouted).
+    pub fn bus_error(&self, bus: usize) -> Option<&str> {
+        self.bus_last_error
+            .get(bus)
+            .filter(|error| !error.is_empty())
+            .map(String::as_str)
     }
 
     /// Human-readable bus name: A1..A3 are the console's main buses, B1/B2

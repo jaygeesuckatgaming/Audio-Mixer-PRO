@@ -6010,6 +6010,31 @@ impl MixerApp {
 
         let header = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, 26.0));
         let hresp = ui.interact(header, Id::new(("bus_head", idx)), Sense::click());
+        // Status stripe on the card's left edge: green while the stream runs,
+        // amber while it is being opened, red after a failed open (retried
+        // every three seconds), dim when the bus has no device. The hover text
+        // carries the last error.
+        let state = self.audio.bus_state(idx);
+        let (dot_color, state_text) = match state {
+            audio::BusState::Running => (GREEN, "output running".to_string()),
+            audio::BusState::Opening => (AMBER, "opening the output ...".to_string()),
+            audio::BusState::Failed => (
+                RED,
+                format!(
+                    "output failed: {}",
+                    self.audio.bus_error(idx).unwrap_or("unknown error")
+                ),
+            ),
+            audio::BusState::Off => (DIM, "no output device".to_string()),
+        };
+        ui.painter().rect_filled(
+            Rect::from_min_size(
+                Pos2::new(card.left() + 2.0, card.top() + 4.0),
+                Vec2::new(3.0, 22.0),
+            ),
+            1.5,
+            dot_color,
+        );
         ui.painter().text(
             Pos2::new(header.left(), header.top() + 1.0),
             Align2::LEFT_TOP,
@@ -6109,7 +6134,7 @@ impl MixerApp {
             self.bus_rename_text = self.buses[idx].name.clone();
             self.bus_rename_focus = true;
         }
-        let hover = if looping {
+        let mut hover = if looping {
             format!(
                 "FEEDBACK LOOP: {loop_names} captures this cable and is routed back into it, \
                  so the bus feeds itself. Change that input or this bus's device."
@@ -6122,6 +6147,8 @@ impl MixerApp {
             "Click to choose the output device for this bus. Double-click the title to rename it."
                 .to_string()
         };
+        hover.push_str("\n\n");
+        hover.push_str(&state_text);
         let _ = hresp.on_hover_text(hover);
         y += 29.0;
 
