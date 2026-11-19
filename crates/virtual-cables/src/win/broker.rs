@@ -212,9 +212,20 @@ pub fn connect_helper(log: &LogFn) -> Option<BrokerClient> {
 /// Elevated long-running helper. Launched by the scheduled task with
 /// `--vc-attach-service <port> <token>` and stays available for the mixer.
 pub fn run_attach_service(port: u16, token: &str, log: &LogFn) -> Result<(), String> {
+    // Prefer the token in attach_helper.txt over the one baked into the
+    // scheduled task's command line. The task's copy is fixed at install time, so
+    // a config rewrite - or a cancelled reinstall - would otherwise leave the two
+    // out of sync and every client would fail authentication until another UAC
+    // prompt. Reading the file means a plain task restart picks up the current
+    // token, which is what keeps the mixer free of prompts.
+    let (port, token) = match load_helper_config() {
+        Some(config) => (config.port, config.token),
+        None => (port, token.to_string()),
+    };
     if token.len() != 64 {
         return Err("invalid attach-helper token".to_string());
     }
+    let token = token.as_str();
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|err| format!("could not bind attach helper: {err}"))?;
     log(format!("Attach helper listening on 127.0.0.1:{port}"));
@@ -304,9 +315,71 @@ pub fn helper_upgrade_needed() -> bool {
     }
 }
 
+/// Run `schtasks.exe` without a console window.
+fn run_schtasks(arguments: &[&str]) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let system_root =
+        std::env::var_os("SystemRoot").ok_or_else(|| "SystemRoot is not set".to_string())?;
+    let exe = PathBuf::from(system_root)
+        .join("System32")
+        .join("schtasks.exe");
+    let output = std::process::Command::new(exe)
+        .args(arguments)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Whether the scheduled task for the resident helper exists at all.
+pub fn helper_task_installed() -> bool {
+    run_schtasks(&["/Query", "/TN", HELPER_TASK_NAME]).is_ok()
+}
+
+/// Ask Windows to start the resident helper. Starting a task you own needs no
+/// elevation - the task itself runs with the highest privileges - so this is the
+/// path that keeps the mixer free of UAC prompts once the helper is installed.
+pub fn start_helper_task() -> Result<(), String> {
+    run_schtasks(&["/Run", "/TN", HELPER_TASK_NAME])
+        .map_err(|err| format!("could not start the attach helper task: {err}"))
+}
+
+/// Stop and start the task, so a helper still running with an older token
+/// re-reads the current one from its command line.
+pub fn restart_helper_task() -> Result<(), String> {
+    let _ = run_schtasks(&["/End", "/TN", HELPER_TASK_NAME]);
+    std::thread::sleep(Duration::from_millis(400));
+    start_helper_task()
+}
+
+/// Replace the helper copy with this build and restart the task.
+///
+/// No elevation: the copy lives in the user's own folder and the task is the
+/// user's own, so an update can refresh the helper without another prompt (the
+/// one-time install is the only thing that needs the administrator password).
+pub fn refresh_helper_copy() -> Result<(), String> {
+    let helper = helper_exe_path().ok_or_else(|| "LOCALAPPDATA is not set".to_string())?;
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let _ = run_schtasks(&["/End", "/TN", HELPER_TASK_NAME]);
+    std::thread::sleep(Duration::from_millis(600));
+    if let Some(dir) = helper.parent() {
+        fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    }
+    fs::copy(&exe, &helper).map_err(|err| format!("could not refresh the helper: {err}"))?;
+    start_helper_task()
+}
+
 pub fn install_helper(log: &LogFn) -> Result<(), String> {
     let token = random_token()?;
-    save_helper_config(HELPER_PORT, &token)?;
+    // NOTE: the token is written to attach_helper.txt only after the elevated
+    // script returns. Writing it up front means a cancelled UAC leaves the
+    // config and the task's command line with different tokens, after which
+    // every connect_helper() fails and the mixer falls back to prompting.
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
     let helper_exe = helper_exe_path().ok_or_else(|| "LOCALAPPDATA is not set".to_string())?;
     let directory = helper_exe
@@ -338,6 +411,7 @@ pub fn install_helper(log: &LogFn) -> Result<(), String> {
         .join("install_helper.ps1");
     fs::write(&script_path, script).map_err(|err| err.to_string())?;
     run_powershell_script(&script_path)?;
+    save_helper_config(HELPER_PORT, &token)?;
     log("Background attach helper installation started (one-time UAC)".to_string());
     Ok(())
 }

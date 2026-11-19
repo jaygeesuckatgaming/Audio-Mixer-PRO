@@ -284,7 +284,16 @@ impl VirtualCables {
                         self.remove_helper();
                     }
                 } else {
-                    ui.label(egui::RichText::new("not running").color(DIM).size(10.0));
+                    let missing = !virtual_cables::win::helper_task_installed();
+                    ui.label(
+                        egui::RichText::new(if missing {
+                            "not installed"
+                        } else {
+                            "not running"
+                        })
+                        .color(DIM)
+                        .size(10.0),
+                    );
                     if ui.button("Install (one-time admin)").clicked() {
                         self.install_helper();
                     }
@@ -292,7 +301,7 @@ impl VirtualCables {
             });
             ui.label(
                 egui::RichText::new(
-                    "Install the helper once; afterwards the mixer attaches without a UAC prompt.",
+                    "Cables need the administrator helper. Press Install once; afterwards the                      mixer attaches with no UAC prompt.",
                 )
                 .size(9.0)
                 .color(FAINT),
@@ -495,8 +504,44 @@ impl Worker {
                     std::thread::sleep(Duration::from_millis(200));
                 }
             }
+            // The helper the mixer installed once is a scheduled task, so the
+            // mixer can start it itself - starting a task you own needs no
+            // elevation. Only an absent task or one that refuses to start falls
+            // back to the UAC prompt.
+            if connected.is_none() && virtual_cables::win::helper_task_installed() {
+                if virtual_cables::win::start_helper_task().is_ok() {
+                    log_fn("attach helper task started (no UAC)".to_string());
+                    for _ in 0..10 {
+                        if let Some(broker) = virtual_cables::win::connect_helper(&log_fn) {
+                            connected = Some(broker);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+                if connected.is_none() && virtual_cables::win::restart_helper_task().is_ok() {
+                    // The helper answers on its port but rejects the token: it is
+                    // still running an older one, so restart it.
+                    log_fn("attach helper restarted after a token mismatch".to_string());
+                    for _ in 0..10 {
+                        if let Some(broker) = virtual_cables::win::connect_helper(&log_fn) {
+                            connected = Some(broker);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            }
+
             if let Some(broker) = connected {
                 self.broker = Some(broker);
+            } else if !virtual_cables::win::helper_task_installed() {
+                // Never install silently: installing needs the administrator
+                // password prompt, which belongs to the person's decision.
+                let message = "Cables need the administrator helper - open CABLES and press Install (one-time admin).".to_string();
+                log_fn(message.clone());
+                set_status(status, self.handle.is_some(), false, message);
+                return;
             } else {
                 match start_broker(&log_fn) {
                     Ok(broker) => self.broker = Some(broker),
@@ -519,7 +564,18 @@ impl Worker {
                 .map(|path| path.exists())
                 .unwrap_or(false);
         if stale_copy {
-            self.install_helper(status, log);
+            // The copy is in the user's own folder and the task is theirs, so an
+            // update can refresh it without the administrator prompt.
+            if virtual_cables::win::refresh_helper_copy().is_ok() {
+                make_log(log)("attach helper updated to this build (no UAC)".to_string());
+                for _ in 0..10 {
+                    if let Some(broker) = virtual_cables::win::connect_helper(&make_log(log)) {
+                        self.broker = Some(broker);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
         }
         let helper = virtual_cables::win::helper_running();
         status.lock().unwrap().helper = helper;
