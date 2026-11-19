@@ -20,17 +20,17 @@ pub const DEMO_LEN_SECS: f32 = 252.0;
 /// the bus mix; the secondary device streams consume it at their own rate.
 const BUS_RING_FRAMES: usize = 16_384;
 /// Frames of silence pushed into a bus ring when its stream opens, so the
-/// consumer starts with headroom instead of an immediate underrun. Two 256
-/// blocks or one 512 block: the mixer's own catch-up refills the ring after a
-/// stalled block, so this only has to cover callback jitter.
-const BUS_PREFILL_FRAMES: usize = 512;
+/// consumer starts with headroom instead of an immediate underrun. Two blocks
+/// at 512 frames: measured with one block, every bus starved a callback about
+/// once a second.
+const BUS_PREFILL_FRAMES: usize = 1024;
 /// What the stream callback trims the ring back to when it has grown. It used
 /// to be half the capacity (8192 frames, 170 ms), which never fired in normal
 /// use: a device clock even slightly slower than the mixer's timer let the
 /// queue creep up with uptime, and that is what the latency readout showed as a
-/// growing "output queue". Keeping it just above the prefill holds the queue
-/// near one block plus jitter while still absorbing a late mixer block.
-const BUS_DRAIN_FRAMES: usize = 768;
+/// growing "output queue". Holding it at the prefill keeps the queue at two
+/// blocks instead of letting it park higher.
+const BUS_DRAIN_FRAMES: usize = 1024;
 /// Longest track this build will hold in memory. The original streams from
 /// disk; this rebuild decodes to RAM, so it stops at 30 minutes with a clear
 /// message instead of failing silently.
@@ -501,11 +501,11 @@ impl TrackInfo {
             n => format!("{n} ch"),
         };
         let mut out = format!(
-            "{} · {} Hz · {}{}",
+            "{} Â· {} Hz Â· {}{}",
             self.format, self.sample_rate, bits, channels
         );
         if self.truncated {
-            out.push_str(" · first 30 min only");
+            out.push_str(" Â· first 30 min only");
         }
         out
     }
@@ -671,7 +671,7 @@ struct Shared {
     /// queued audio. Both are zero on a healthy session; a burst (starting a
     /// heavy app) shows up here before it is audible.
     mixer_late: AtomicU64,
-    bus_underruns: AtomicU64,
+    bus_underruns: [AtomicU64; MAX_BUSES],
     error: Mutex<Option<String>>,
 }
 
@@ -714,7 +714,7 @@ impl Shared {
             callback_load: f32_atomic(0.0),
             strip_backlog: AtomicUsize::new(0),
             mixer_late: AtomicU64::new(0),
-            bus_underruns: AtomicU64::new(0),
+            bus_underruns: std::array::from_fn(|_| AtomicU64::new(0)),
             vsts: std::array::from_fn(|_| crate::plugin::PlugIn::new()),
             duck_enabled: AtomicBool::new(false),
             duck_source: AtomicUsize::new(usize::MAX),
@@ -1748,12 +1748,14 @@ impl AudioEngine {
             .unwrap_or(0)
     }
 
-    /// Mixer blocks that missed their deadline and bus callbacks that ran dry
-    /// since the previous call, as `(late blocks, bus underruns)`.
-    pub fn take_stream_stats(&self) -> (u64, u64) {
+    /// Mixer blocks that missed their deadline and, per bus, callbacks that ran
+    /// dry since the previous call. Per-bus attribution matters: a single
+    /// starving device (a Bluetooth headset running to its own clock) is
+    /// invisible in a single total.
+    pub fn take_stream_stats(&self) -> (u64, [u64; MAX_BUSES]) {
         (
             self.shared.mixer_late.swap(0, Ordering::Relaxed),
-            self.shared.bus_underruns.swap(0, Ordering::Relaxed),
+            std::array::from_fn(|bus| self.shared.bus_underruns[bus].swap(0, Ordering::Relaxed)),
         )
     }
 
@@ -3479,7 +3481,8 @@ where
                                 // Count once per callback: this is audible
                                 // silence where the mixer owed audio.
                                 starved = true;
-                                shared.bus_underruns.fetch_add(1, Ordering::Relaxed);
+                                let owner = buses.first().copied().unwrap_or(0);
+                                shared.bus_underruns[owner].fetch_add(1, Ordering::Relaxed);
                             }
                             last = (0.0, 0.0);
                             accumulator = 0.0;

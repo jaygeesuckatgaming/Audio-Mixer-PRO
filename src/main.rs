@@ -2628,10 +2628,24 @@ impl MixerApp {
         // turns "it glitched when app X started" into a log line that names the
         // cause: a late mixer block (scheduling) or a dry bus ring (output).
         let (late_blocks, bus_underruns) = self.audio.take_stream_stats();
-        if late_blocks > 0 || bus_underruns > 0 {
-            diag_log(format!(
-                "audio: {late_blocks} late mixer block(s), {bus_underruns} bus underrun(s) in the last second"
-            ));
+        let underrun_total: u64 = bus_underruns.iter().sum();
+        if late_blocks > 0 || underrun_total > 0 {
+            let detail = bus_underruns
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(bus, count)| format!("{}={count}", self.buses[bus].name))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if detail.is_empty() {
+                diag_log(format!(
+                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s) in the last second"
+                ));
+            } else {
+                diag_log(format!(
+                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s) in the last second: {detail}"
+                ));
+            }
         }
         // The output queue is the term that used to creep upward with uptime;
         // record it when it moves by more than 10 ms so that is visible in the
