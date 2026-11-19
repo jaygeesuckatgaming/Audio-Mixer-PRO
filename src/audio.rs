@@ -1650,12 +1650,40 @@ pub struct AudioEngine {
     mixer_stop: Option<Arc<AtomicBool>>,
     mixer_join: Option<std::thread::JoinHandle<()>>,
     mixer_block: usize,
-    /// Output streams for A1, A2, A3 and (in driver mode) B1, B2. Each
-    /// consumes its own bus ring.
-    bus_streams: [Option<cpal::Stream>; MAX_BUSES],
+    /// One output stream per *device*, carrying every bus routed to it. A
+    /// cable endpoint should see one clock, so B1 and B3 choosing the same
+    /// speaker are mixed here instead of opening two streams.
+    bus_groups: Vec<BusGroup>,
     bus_device_names: [String; MAX_BUSES],
     bus_retry_at: [Option<std::time::Instant>; MAX_BUSES],
     bus_last_request: [String; MAX_BUSES],
+}
+
+/// One running output stream and the buses it carries.
+struct BusGroup {
+    device: String,
+    buses: Vec<usize>,
+    /// Kept alive for as long as the group exists.
+    #[allow(dead_code)]
+    stream: cpal::Stream,
+}
+
+/// Group the resolved bus device names: every bus routed to the same endpoint
+/// lands in one group, in bus order, so the caller opens a single stream for
+/// it. This is what keeps two buses on one cable on one clock.
+fn group_buses_by_device(wanted: &[Option<String>; MAX_BUSES]) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for bus in 0..MAX_BUSES {
+        let Some(name) = &wanted[bus] else { continue };
+        match groups
+            .iter_mut()
+            .find(|(device, _)| device.eq_ignore_ascii_case(name))
+        {
+            Some((_, buses)) => buses.push(bus),
+            None => groups.push((name.clone(), vec![bus])),
+        }
+    }
+    groups
 }
 
 impl AudioEngine {
@@ -1701,7 +1729,7 @@ impl AudioEngine {
             mixer_stop: None,
             mixer_join: None,
             mixer_block: 512,
-            bus_streams: std::array::from_fn(|_| None),
+            bus_groups: Vec::new(),
             bus_device_names: std::array::from_fn(|_| String::new()),
             bus_retry_at: std::array::from_fn(|_| None),
             bus_last_request: std::array::from_fn(|_| String::new()),
@@ -1776,8 +1804,8 @@ impl AudioEngine {
     /// pick up a device that was connected after the list was probed (Bluetooth
     /// headphones, a USB interface that just finished enumerating, ...).
     pub fn refresh_bus_outputs(&mut self) {
+        self.bus_groups.clear();
         for b in 0..MAX_BUSES {
-            self.bus_streams[b] = None;
             self.bus_device_names[b].clear();
             self.bus_retry_at[b] = None;
             self.bus_last_request[b].clear();
@@ -1789,8 +1817,8 @@ impl AudioEngine {
     pub fn stop_stream(&mut self) {
         self.stop_mixer();
         self.pending_start = None;
+        self.bus_groups.clear();
         for b in 0..MAX_BUSES {
-            self.bus_streams[b] = None;
             self.bus_device_names[b].clear();
             self.bus_retry_at[b] = None;
             self.bus_last_request[b].clear();
@@ -2057,25 +2085,8 @@ impl AudioEngine {
         }
         let requested = names_in;
         let now = std::time::Instant::now();
-        let same_request =
-            (0..MAX_BUSES).all(|b| self.bus_last_request[b].eq_ignore_ascii_case(requested[b]));
-        if same_request {
-            // A bus that never opened must keep being retried: its name may
-            // only appear once Windows finishes enumerating the device, and a
-            // bus that never opened has no retry deadline yet.
-            let retry_due = (0..MAX_BUSES).any(|b| {
-                self.bus_streams[b].is_none()
-                    && !requested[b].is_empty()
-                    && (self.bus_device_names[b].is_empty()
-                        || self.bus_retry_at[b].map(|at| now >= at).unwrap_or(true))
-            });
-            if !retry_due {
-                return;
-            }
-        }
-        for b in 0..MAX_BUSES {
-            self.bus_last_request[b] = requested[b].to_string();
-        }
+        let request_changed =
+            (0..MAX_BUSES).any(|b| !self.bus_last_request[b].eq_ignore_ascii_case(requested[b]));
 
         let names = available;
         // The same endpoint may be used by more than one bus (Voicemeeter
@@ -2102,63 +2113,105 @@ impl AudioEngine {
                 })
                 .cloned()
         };
-        let wanted = requested.map(resolve);
+        let wanted: [Option<String>; MAX_BUSES] = std::array::from_fn(|b| resolve(requested[b]));
+
+        // One stream per endpoint: every bus that feeds the same device is
+        // mixed inside that stream's callback. Two buses on one cable used to
+        // be two streams with two clocks.
+        let desired = group_buses_by_device(&wanted);
+
+        let same_grouping = desired.len() == self.bus_groups.len()
+            && desired.iter().all(|(device, buses)| {
+                self.bus_groups
+                    .iter()
+                    .any(|g| g.device.eq_ignore_ascii_case(device) && g.buses == *buses)
+            });
+
+        // A bus whose device is not there yet (Windows still enumerating it)
+        // is retried every few seconds, never once per frame.
+        let retry_due = (0..MAX_BUSES).any(|b| {
+            wanted[b].is_some()
+                && !self.bus_is_open(b)
+                && self.bus_retry_at[b].map(|at| now >= at).unwrap_or(true)
+        });
+        // A bus that is open on a device it no longer asks for is closed at
+        // once, without waiting for a retry deadline.
+        let unrouted = (0..MAX_BUSES).any(|b| {
+            self.bus_is_open(b) && wanted[b].as_deref() != Some(self.bus_device_names[b].as_str())
+        });
 
         for b in 0..MAX_BUSES {
-            let desired = wanted[b].clone();
-            if self.bus_streams[b].is_some() {
-                if desired.as_deref() == Some(self.bus_device_names[b].as_str()) {
-                    continue;
-                }
-                self.bus_streams[b] = None;
-                self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
-                lock_source(&self.shared.bus_out_rings[b]).clear();
-                self.bus_device_names[b].clear();
-            }
-            let Some(name) = desired else {
-                self.bus_device_names[b].clear();
-                self.bus_retry_at[b] = None;
+            self.bus_device_names[b] = wanted[b].clone().unwrap_or_default();
+            self.bus_last_request[b] = requested[b].to_string();
+        }
+
+        if same_grouping || (!request_changed && !retry_due && !unrouted) {
+            return;
+        }
+
+        let mut groups: Vec<BusGroup> = Vec::new();
+        let mut previous = std::mem::take(&mut self.bus_groups);
+        for (device, buses) in &desired {
+            // Reuse a stream that already serves exactly this device and bus
+            // set, so touching one bus does not restart the others.
+            if let Some(pos) = previous
+                .iter()
+                .position(|g| g.device.eq_ignore_ascii_case(device) && g.buses == *buses)
+            {
+                groups.push(previous.swap_remove(pos));
                 continue;
-            };
-            if self.bus_device_names[b].eq_ignore_ascii_case(&name) {
-                if self.bus_retry_at[b]
-                    .map(|at| std::time::Instant::now() < at)
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
             }
-            self.bus_device_names[b] = name.clone();
-            match open_bus_output(&name, self.shared.clone(), b) {
+            let labels = buses
+                .iter()
+                .map(|&b| Self::bus_label(b))
+                .collect::<Vec<_>>()
+                .join("+");
+            match open_bus_group(device, self.shared.clone(), buses) {
                 Ok((stream, rate)) => {
-                    self.bus_streams[b] = Some(stream);
-                    self.bus_retry_at[b] = None;
-                    {
-                        let mut ring = lock_source(&self.shared.bus_out_rings[b]);
-                        ring.clear();
-                        for _ in 0..BUS_PREFILL_FRAMES {
-                            ring.push_back((0.0, 0.0));
+                    for &b in buses {
+                        {
+                            let mut ring = lock_source(&self.shared.bus_out_rings[b]);
+                            ring.clear();
+                            for _ in 0..BUS_PREFILL_FRAMES {
+                                ring.push_back((0.0, 0.0));
+                            }
                         }
+                        self.shared.bus_out_active[b].store(true, Ordering::Relaxed);
+                        self.bus_retry_at[b] = None;
                     }
-                    self.shared.bus_out_active[b].store(true, Ordering::Relaxed);
                     crate::diag_log(format!(
-                        "audio: bus {} output on '{}' at {} Hz",
-                        Self::bus_label(b),
-                        name,
-                        rate
+                        "audio: bus {labels} output on '{device}' at {rate} Hz"
                     ));
+                    groups.push(BusGroup {
+                        device: device.clone(),
+                        buses: buses.clone(),
+                        stream,
+                    });
                 }
                 Err(err) => {
-                    self.bus_retry_at[b] =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                    for &b in buses {
+                        self.bus_retry_at[b] = Some(now + std::time::Duration::from_secs(3));
+                        self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
+                        lock_source(&self.shared.bus_out_rings[b]).clear();
+                    }
                     crate::diag_log(format!(
-                        "audio: bus {} output '{}' failed: {err}",
-                        Self::bus_label(b),
-                        name
+                        "audio: bus {labels} output '{device}' failed: {err}"
                     ));
                 }
             }
         }
+        // Anything left in `previous` is no longer routed to any bus.
+        for group in previous {
+            for b in group.buses {
+                self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
+                lock_source(&self.shared.bus_out_rings[b]).clear();
+            }
+        }
+        self.bus_groups = groups;
+    }
+
+    fn bus_is_open(&self, bus: usize) -> bool {
+        self.bus_groups.iter().any(|g| g.buses.contains(&bus))
     }
 
     /// Human-readable bus name: A1..A3 are the console's main buses, B1/B2
@@ -2608,7 +2661,9 @@ pub struct InputCapture {
 }
 
 fn _assert_send<T: Send>() {}
-fn _assert_capture_send() { _assert_send::<InputCapture>(); }
+fn _assert_capture_send() {
+    _assert_send::<InputCapture>();
+}
 
 impl InputCapture {
     pub fn open(preferred: Option<&str>) -> Self {
@@ -3141,11 +3196,12 @@ impl Drop for AudioEngine {
     }
 }
 
-/// Open one secondary bus device and start its stream.
-fn open_bus_output(
+/// Open one output device and start a stream that carries every bus routed to
+/// it. Returns the stream and the device rate.
+fn open_bus_group(
     name: &str,
     shared: Arc<Shared>,
-    bus: usize,
+    buses: &[usize],
 ) -> Result<(cpal::Stream, u32), String> {
     let host = cpal::default_host();
     let device = host
@@ -3163,41 +3219,42 @@ fn open_bus_output(
     let sample_format = default.sample_format();
     let config = default.config();
     let rate = config.sample_rate.0;
-    let stream = build_bus_stream_for_format(sample_format, &device, &config, shared, bus)?;
+    let stream = build_bus_group_for_format(sample_format, &device, &config, shared, buses)?;
     stream
         .play()
         .map_err(|e| format!("Could not start {name}: {e}"))?;
     Ok((stream, rate))
 }
 
-fn build_bus_stream_for_format(
+fn build_bus_group_for_format(
     sample_format: cpal::SampleFormat,
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     shared: Arc<Shared>,
-    bus: usize,
+    buses: &[usize],
 ) -> Result<cpal::Stream, String> {
+    let buses = Arc::new(buses.to_vec());
     match sample_format {
-        cpal::SampleFormat::F32 => build_bus_stream::<f32>(device, config, shared, bus),
-        cpal::SampleFormat::I16 => build_bus_stream::<i16>(device, config, shared, bus),
-        cpal::SampleFormat::U16 => build_bus_stream::<u16>(device, config, shared, bus),
-        cpal::SampleFormat::I32 => build_bus_stream::<i32>(device, config, shared, bus),
-        cpal::SampleFormat::U32 => build_bus_stream::<u32>(device, config, shared, bus),
-        cpal::SampleFormat::I8 => build_bus_stream::<i8>(device, config, shared, bus),
-        cpal::SampleFormat::U8 => build_bus_stream::<u8>(device, config, shared, bus),
-        cpal::SampleFormat::I64 => build_bus_stream::<i64>(device, config, shared, bus),
-        cpal::SampleFormat::U64 => build_bus_stream::<u64>(device, config, shared, bus),
-        cpal::SampleFormat::F64 => build_bus_stream::<f64>(device, config, shared, bus),
-        cpal::SampleFormat::I24 => build_bus_stream::<cpal::I24>(device, config, shared, bus),
+        cpal::SampleFormat::F32 => build_bus_group::<f32>(device, config, shared, buses),
+        cpal::SampleFormat::I16 => build_bus_group::<i16>(device, config, shared, buses),
+        cpal::SampleFormat::U16 => build_bus_group::<u16>(device, config, shared, buses),
+        cpal::SampleFormat::I32 => build_bus_group::<i32>(device, config, shared, buses),
+        cpal::SampleFormat::U32 => build_bus_group::<u32>(device, config, shared, buses),
+        cpal::SampleFormat::I8 => build_bus_group::<i8>(device, config, shared, buses),
+        cpal::SampleFormat::U8 => build_bus_group::<u8>(device, config, shared, buses),
+        cpal::SampleFormat::I64 => build_bus_group::<i64>(device, config, shared, buses),
+        cpal::SampleFormat::U64 => build_bus_group::<u64>(device, config, shared, buses),
+        cpal::SampleFormat::F64 => build_bus_group::<f64>(device, config, shared, buses),
+        cpal::SampleFormat::I24 => build_bus_group::<cpal::I24>(device, config, shared, buses),
         other => Err(format!("Unsupported audio sample format: {other}")),
     }
 }
 
-fn build_bus_stream<T>(
+fn build_bus_group<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     shared: Arc<Shared>,
-    bus: usize,
+    buses: Arc<Vec<usize>>,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + cpal::FromSample<f32> + 'static,
@@ -3215,23 +3272,32 @@ where
                 } else {
                     1.0
                 };
+                // A bus belongs to exactly one group, so these rings are never
+                // touched by another stream's callback and this cannot
+                // deadlock against one.
+                let mut rings: Vec<_> = buses
+                    .iter()
+                    .map(|&bus| lock_source(&shared.bus_out_rings[bus]))
+                    .collect();
                 let mut accumulator = 0.0f32;
                 let mut last = (0.0f32, 0.0f32);
-                let mut ring = lock_source(&shared.bus_out_rings[bus]);
                 for frame in data.chunks_mut(channels) {
                     accumulator += step;
                     while accumulator >= 1.0 {
-                        match ring.pop_front() {
-                            Some(sample) => {
-                                last = sample;
-                                accumulator -= 1.0;
-                            }
-                            None => {
-                                last = (0.0, 0.0);
-                                accumulator = 0.0;
-                                break;
+                        if rings.iter().any(|ring| ring.is_empty()) {
+                            last = (0.0, 0.0);
+                            accumulator = 0.0;
+                            break;
+                        }
+                        let mut mixed = (0.0f32, 0.0f32);
+                        for ring in rings.iter_mut() {
+                            if let Some(sample) = ring.pop_front() {
+                                mixed.0 += sample.0;
+                                mixed.1 += sample.1;
                             }
                         }
+                        last = (mixed.0.clamp(-1.0, 1.0), mixed.1.clamp(-1.0, 1.0));
+                        accumulator -= 1.0;
                     }
                     if channels == 1 {
                         frame[0] = T::from_sample((last.0 + last.1) * 0.5);
@@ -3243,13 +3309,15 @@ where
                         }
                     }
                 }
-                let excess = ring.len().saturating_sub(BUS_RING_FRAMES / 2);
-                if excess > 0 {
-                    let _ = ring.drain(..excess);
+                for ring in rings.iter_mut() {
+                    let excess = ring.len().saturating_sub(BUS_RING_FRAMES / 2);
+                    if excess > 0 {
+                        let _ = ring.drain(..excess);
+                    }
                 }
             },
             move |err| {
-                *lock_source(&error_shared.error) = Some(format!("A2/A3 output error: {err}"));
+                *lock_source(&error_shared.error) = Some(format!("Bus output error: {err}"));
             },
             None,
         )
@@ -3862,6 +3930,38 @@ pub fn wav_selftest() {
 #[cfg(test)]
 mod latency_tests {
     use super::*;
+
+    #[test]
+    fn buses_on_one_device_share_a_stream() {
+        // B1 (bus 3) and B3 (bus 5) both on cable 01, B2 (bus 4) elsewhere.
+        let wanted: [Option<String>; MAX_BUSES] = [
+            None,
+            None,
+            None,
+            Some("Speakers (USB Cable 01)".to_string()),
+            Some("Speakers (USB Cable 02)".to_string()),
+            Some("Speakers (USB Cable 01)".to_string()),
+        ];
+        let groups = group_buses_by_device(&wanted);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].1, vec![3, 5]);
+        assert_eq!(groups[1].1, vec![4]);
+    }
+
+    #[test]
+    fn bus_grouping_is_case_insensitive_and_sparse() {
+        let wanted: [Option<String>; MAX_BUSES] = [
+            None,
+            None,
+            None,
+            None,
+            Some("Speakers (USB Cable 02)".to_string()),
+            Some("speakers (usb cable 02)".to_string()),
+        ];
+        let groups = group_buses_by_device(&wanted);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1, vec![4, 5]);
+    }
 
     #[test]
     fn reader_trims_startup_backlog() {

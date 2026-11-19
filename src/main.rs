@@ -10727,7 +10727,7 @@ mod tests {
         ];
         assert_eq!(
             MixerApp::next_free_virtual_cable_from(&inputs, &used).as_deref(),
-            Some("Microphone (Virtual Cable 04)")
+            Some("Microphone (Virtual Cable 01)")
         );
     }
 
