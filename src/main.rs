@@ -998,6 +998,9 @@ struct MixerApp {
     /// startup.log once a second.
     vst_log: bool,
     vst_log_clock: f64,
+    /// Plug-in that was loaded when the previous session died. Restoring it
+    /// again would kill the new session the same way, so it is skipped.
+    vst_crash_suspect: Option<String>,
     /// `--vst-shot <path>`: save the open editor's picture six seconds in,
     /// from inside the app so nothing steals the editor's focus first.
     vst_shot: Option<String>,
@@ -1408,6 +1411,13 @@ fn vst_state_file(slot: usize) -> PathBuf {
     }
 }
 
+/// Written just before a plug-in is loaded and removed on a clean exit. A
+/// plug-in that faults takes the whole process with it, so a file left behind
+/// is the only record of what was running when the mixer died.
+fn vst_last_load_file() -> PathBuf {
+    settings_file().with_file_name("vst_last_load.txt")
+}
+
 impl MixerApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
@@ -1550,6 +1560,7 @@ impl MixerApp {
                 .and_then(|value| value.parse::<usize>().ok()),
             vst_log: std::env::args().any(|a| a == "--vst-log"),
             vst_log_clock: 0.0,
+            vst_crash_suspect: None,
             vst_shot: std::env::args()
                 .position(|a| a == "--vst-shot")
                 .and_then(|pos| std::env::args().nth(pos + 1)),
@@ -1653,6 +1664,20 @@ impl MixerApp {
         // The original reads the last scene before the first paint
         // (FUN_0052f0b0 calls FUN_0052ec00 on LastSettings or VMB_StartupFile).
         app.read_persistence_flags();
+        // A plug-in that faults takes the process with it, so this file is the
+        // only evidence of what was running when the mixer died. Read it once
+        // and refuse to restore that plug-in for the rest of the session; a
+        // deliberate pick from the plug-in list still loads it.
+        app.vst_crash_suspect = std::fs::read_to_string(vst_last_load_file())
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        let _ = std::fs::remove_file(vst_last_load_file());
+        if let Some(path) = &app.vst_crash_suspect {
+            diag_log(format!(
+                "startup: previous session ended with '{path}' loaded"
+            ));
+        }
         let has_saved_scene = settings_file().exists() || Path::new("mixer_settings.txt").exists();
         if app.load_on_startup && has_saved_scene {
             // Parse the scene now (cheap, pure state) but do NOT open its
@@ -1886,6 +1911,9 @@ impl MixerApp {
         if slot >= self.vsts.len() {
             return;
         }
+        // Record what is about to run: a plug-in that faults kills the process,
+        // so this file is the only evidence the next start can use.
+        let _ = std::fs::write(vst_last_load_file(), path.display().to_string());
         let label = self.strip_label(slot);
         let previous = self.vsts[slot].path.clone();
         let wanted_bypass = self.vsts[slot].bypass;
@@ -1951,6 +1979,26 @@ impl MixerApp {
             // carry a `#plugin-id` suffix; the file itself is what must exist.
             let file_part = path_text.split('#').next().unwrap_or(&path_text).to_string();
             let path = PathBuf::from(&path_text);
+            // A plug-in that was loaded when the last session died is not
+            // restored: restoring it is what turns one crash into a crash loop.
+            if self
+                .vst_crash_suspect
+                .as_deref()
+                .is_some_and(|suspect| suspect.eq_ignore_ascii_case(&path_text))
+            {
+                self.vsts[slot].error = Some(
+                    "Not reloaded: it was loaded when the mixer crashed last time".to_string(),
+                );
+                self.vsts[slot].info = None;
+                diag_log(format!(
+                    "vst[{slot}] '{}' not restored: it crashed the previous session",
+                    file_part
+                ));
+                self.toast(format!(
+                    "VST on {label}: skipped, it crashed the mixer last session"
+                ));
+                continue;
+            }
             if !Path::new(&file_part).exists() {
                 self.vsts[slot].error = Some(format!(
                     "The selected plug-in is no longer at {}",
@@ -8840,6 +8888,9 @@ impl eframe::App for MixerApp {
             slot.chain.close_editor();
         }
         self.vc.stop();
+        // A clean exit means the next start must not blame a plug-in for a
+        // crash that did not happen.
+        let _ = std::fs::remove_file(vst_last_load_file());
         if self.save_on_exit && self.shot_path.is_none() {
             self.save_settings();
         }
