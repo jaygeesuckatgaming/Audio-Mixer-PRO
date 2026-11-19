@@ -1089,6 +1089,8 @@ struct MixerApp {
     /// even when the person never pressed Save Settings.
     save_on_exit: bool,
     poll_clock: f64,
+    /// Last set of output groups written to the log.
+    last_groups: String,
     /// Last output-queue depth written to the log, so growth is visible without
     /// hovering the status bar.
     last_ring_logged: usize,
@@ -1634,6 +1636,7 @@ impl MixerApp {
             load_on_startup: true,
             save_on_exit: true,
             poll_clock: 0.0,
+            last_groups: String::new(),
             last_ring_logged: 0,
             devices_probe: None,
             inputs_probe: None,
@@ -2638,6 +2641,11 @@ impl MixerApp {
             return;
         }
         self.poll_clock = 0.0;
+        let groups = self.audio.group_report();
+        if groups != self.last_groups {
+            diag_log(format!("audio: output groups: {groups}"));
+            self.last_groups = groups;
+        }
         // Once a second, say when the audio path could not keep up. This is what
         // turns "it glitched when app X started" into a log line that names the
         // cause: a late mixer block (scheduling) or a dry bus ring (output).
@@ -5689,7 +5697,7 @@ impl MixerApp {
 
             match self.vsts[idx].info.as_ref() {
                 Some(info) => {
-                    let vendor = format!("{} {} Ãƒâ€šÃ‚Â· {}", info.vendor, info.version, info.format);
+                    let vendor = format!("{} {} ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}", info.vendor, info.version, info.format);
                     ui.painter().text(
                         Pos2::new(insert.left() + 5.0, insert.top() + 6.0),
                         Align2::LEFT_TOP,
