@@ -1042,6 +1042,9 @@ struct MixerApp {
     auto_exit: Option<f64>,
     bus_eq_open: Option<usize>,
     picker: Option<Picker>,
+    /// One flag per bus: a feedback loop was already announced, so the toast
+    /// fires on the transition instead of every frame.
+    loop_warned: [bool; audio::MAX_BUSES],
     label_edit: Option<usize>,
     label_buf: String,
     /// In-app clipboard used by the strip context menu's Copy All / Paste
@@ -1586,6 +1589,7 @@ impl MixerApp {
                 .and_then(|value| value.parse::<f64>().ok()),
             bus_eq_open: None,
             picker: None,
+            loop_warned: [false; audio::MAX_BUSES],
             label_edit: None,
             label_buf: String::new(),
             strip_clip: None,
@@ -5946,8 +5950,53 @@ impl MixerApp {
     // Output buses
     // -----------------------------------------------------------------------
 
-    fn draw_bus_card(&mut self, ui: &egui::Ui, card: Rect, idx: usize) {
+    /// Cable number a bus plays into, including the automatic wiring of an
+    /// unset B1/B2. `None` when the bus has nowhere to go.
+    fn bus_cable_number(&self, bus: usize) -> Option<u32> {
+        let device = self.buses.get(bus)?.device.trim();
+        if !device.is_empty() {
+            return cable_number(device);
+        }
+        match bus {
+            3 if self.driver_mode || self.vc_cfg.enabled => Some(1),
+            4 if self.driver_mode || self.vc_cfg.enabled => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Strips that would hear their own bus: a strip capturing cable N that is
+    /// routed to a bus playing into cable N closes the ring, which is what
+    /// turns into echo and then howl.
+    fn feedback_loops(&self) -> [Vec<usize>; audio::MAX_BUSES] {
+        let bus_cables: [Option<u32>; audio::MAX_BUSES] =
+            std::array::from_fn(|bus| self.bus_cable_number(bus));
+        let active = self.strips.len().min(self.active_strips);
+        let strip_cables: Vec<Option<u32>> = self.strips[..active]
+            .iter()
+            .map(|strip| cable_number(&strip.device))
+            .collect();
+        let routes: Vec<[bool; audio::MAX_BUSES]> =
+            self.strips[..active].iter().map(|strip| strip.route).collect();
+        feedback_loops_from(&bus_cables, &strip_cables, &routes)
+    }
+
+    fn draw_bus_card(&mut self, ui: &egui::Ui, card: Rect, idx: usize, loop_strips: &[usize]) {
         let accent = if idx < 3 { AMBER } else { BLUE };
+        let looping = !loop_strips.is_empty();
+        let loop_names = loop_strips
+            .iter()
+            .map(|&strip| self.strip_label(strip))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if looping && !self.loop_warned[idx] {
+            self.loop_warned[idx] = true;
+            self.toast(format!(
+                "BUS {}: feedback loop - {loop_names} listens to this cable and feeds it back",
+                self.buses[idx].name
+            ));
+        } else if !looping {
+            self.loop_warned[idx] = false;
+        }
         let inner = card.shrink2(Vec2::new(5.0, 4.0));
         ui.painter().rect_filled(card, 5.0, Color32::from_rgb(24, 27, 33));
         ui.painter().rect_stroke(card, 5.0, Stroke::new(1.0, LINE));
@@ -5990,8 +6039,26 @@ impl MixerApp {
                 w + 2.0,
             ),
             FontId::proportional(7.3),
-            DIM,
+            if looping { RED } else { DIM },
         );
+        // A bus that would hear its own output gets a red badge next to REF;
+        // hovering the card explains which input closes the ring.
+        if looping {
+            let chip = Rect::from_min_size(
+                Pos2::new(card.right() - 64.0, card.top() + 3.0),
+                Vec2::new(32.0, 13.0),
+            );
+            ui.painter().rect_filled(chip, 3.0, Color32::from_rgb(70, 20, 24));
+            ui.painter()
+                .rect_stroke(chip, 3.0, Stroke::new(1.0, RED));
+            ui.painter().text(
+                chip.center(),
+                Align2::CENTER_CENTER,
+                "LOOP",
+                FontId::proportional(7.0),
+                RED,
+            );
+        }
         // Small REF chip in the header's right corner: re-scan the device list
         // and reopen this bus, so a device connected after the last probe
         // (Bluetooth headphones, a USB interface still enumerating) shows up
@@ -6042,12 +6109,20 @@ impl MixerApp {
             self.bus_rename_text = self.buses[idx].name.clone();
             self.bus_rename_focus = true;
         }
-        let _ = hresp.on_hover_text(if idx == 3 || idx == 4 {
+        let hover = if looping {
+            format!(
+                "FEEDBACK LOOP: {loop_names} captures this cable and is routed back into it, \
+                 so the bus feeds itself. Change that input or this bus's device."
+            )
+        } else if idx == 3 || idx == 4 {
             "Click to choose the output device for this bus; leave it unset to use the \
              automatic virtual cable. Double-click the title to rename the bus."
+                .to_string()
         } else {
             "Click to choose the output device for this bus. Double-click the title to rename it."
-        });
+                .to_string()
+        };
+        let _ = hresp.on_hover_text(hover);
         y += 29.0;
 
         // bus mode selector
@@ -9152,9 +9227,10 @@ impl eframe::App for MixerApp {
                     x += card_w + gap;
                 }
                 x += gap_mid - gap;
+                let loops = self.feedback_loops();
                 for i in 0..audio::MAX_BUSES {
                     let card = Rect::from_min_size(Pos2::new(x, top), Vec2::new(card_w, h));
-                    self.draw_bus_card(ui, card, i);
+                    self.draw_bus_card(ui, card, i, &loops[i]);
                     x += card_w + gap;
                 }
             });
@@ -10072,6 +10148,43 @@ fn is_usb_cable_endpoint(device: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Cable number behind an endpoint name ("Speakers (USB Cable 02)" -> 2), for
+/// both the USB/IP cables and the kernel driver's cables.
+fn cable_number(device: &str) -> Option<u32> {
+    cable_label(device).and_then(|label| {
+        label
+            .rsplit_once(' ')
+            .and_then(|(_, digits)| digits.parse::<u32>().ok())
+    })
+}
+
+/// Bus index -> strips that would hear their own output. Pure form of
+/// `MixerApp::feedback_loops`, so it can be checked without a window.
+fn feedback_loops_from(
+    bus_cables: &[Option<u32>; audio::MAX_BUSES],
+    strip_cables: &[Option<u32>],
+    routes: &[[bool; audio::MAX_BUSES]],
+) -> [Vec<usize>; audio::MAX_BUSES] {
+    let mut loops: [Vec<usize>; audio::MAX_BUSES] = std::array::from_fn(|_| Vec::new());
+    for bus in 0..audio::MAX_BUSES {
+        let Some(cable) = bus_cables[bus] else {
+            continue;
+        };
+        for (strip, strip_cable) in strip_cables.iter().enumerate() {
+            if *strip_cable != Some(cable) {
+                continue;
+            }
+            let feeds_cable = routes.get(strip).is_some_and(|route| {
+                (0..audio::MAX_BUSES).any(|b| route[b] && bus_cables[b] == Some(cable))
+            });
+            if feeds_cable {
+                loops[bus].push(strip);
+            }
+        }
+    }
+    loops
+}
+
 fn clock(secs: f32) -> String {
     let s = secs.max(0.0) as u32;
     format!("{:02}:{:02}", s / 60, s % 60)
@@ -10756,6 +10869,32 @@ mod tests {
             MixerApp::next_free_virtual_cable_from(&inputs, &used).as_deref(),
             Some("Microphone (Virtual Cable 01)")
         );
+    }
+
+    #[test]
+    fn feedback_loop_flags_every_bus_on_the_cable() {
+        // B1 and B3 both play into cable 01; B2 into cable 02.
+        let bus_cables: [Option<u32>; audio::MAX_BUSES] =
+            [None, None, None, Some(1), Some(2), Some(1)];
+        // INPUT 1 listens to cable 01 and is routed to B3 only.
+        let strip_cables = [Some(1)];
+        let mut route = [false; audio::MAX_BUSES];
+        route[5] = true;
+        let loops = feedback_loops_from(&bus_cables, &strip_cables, &[route]);
+        // Both buses on that cable feed the strip, so both are flagged.
+        assert_eq!(loops[3], vec![0]);
+        assert_eq!(loops[5], vec![0]);
+        assert!(loops[4].is_empty());
+    }
+
+    #[test]
+    fn strip_on_one_cable_routed_to_another_is_not_a_loop() {
+        let bus_cables: [Option<u32>; audio::MAX_BUSES] = [None, None, None, Some(1), Some(2), None];
+        let strip_cables = [Some(1)];
+        let mut route = [false; audio::MAX_BUSES];
+        route[4] = true; // B2 plays into cable 02
+        let loops = feedback_loops_from(&bus_cables, &strip_cables, &[route]);
+        assert!(loops.iter().all(|bus| bus.is_empty()));
     }
 
     #[test]
