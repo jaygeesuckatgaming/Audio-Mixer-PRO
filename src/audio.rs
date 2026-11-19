@@ -658,6 +658,11 @@ struct Shared {
     /// gate attenuation (0 dB open, about -60 dB closed).
     strip_comp_gr: [AtomicU32; MAX_STRIPS],
     strip_gate_att: [AtomicU32; MAX_STRIPS],
+    /// Mixer blocks that missed their deadline, and bus streams that ran out of
+    /// queued audio. Both are zero on a healthy session; a burst (starting a
+    /// heavy app) shows up here before it is audible.
+    mixer_late: AtomicU64,
+    bus_underruns: AtomicU64,
     error: Mutex<Option<String>>,
 }
 
@@ -699,6 +704,8 @@ impl Shared {
             callback_frames: AtomicUsize::new(0),
             callback_load: f32_atomic(0.0),
             strip_backlog: AtomicUsize::new(0),
+            mixer_late: AtomicU64::new(0),
+            bus_underruns: AtomicU64::new(0),
             vsts: std::array::from_fn(|_| crate::plugin::PlugIn::new()),
             duck_enabled: AtomicBool::new(false),
             duck_source: AtomicUsize::new(usize::MAX),
@@ -1716,6 +1723,25 @@ impl AudioEngine {
     /// Deepest capture backlog across routed strips, in frames.
     pub fn strip_backlog_frames(&self) -> usize {
         self.shared.strip_backlog.load(Ordering::Relaxed)
+    }
+
+    /// Deepest bus output ring, in frames: audio already mixed but still waiting
+    /// to be played. This is real latency the status bar used to leave out.
+    pub fn bus_ring_frames(&self) -> usize {
+        (0..MAX_BUSES)
+            .filter(|&bus| self.shared.bus_out_active[bus].load(Ordering::Relaxed))
+            .map(|bus| lock_source(&self.shared.bus_out_rings[bus]).len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Mixer blocks that missed their deadline and bus callbacks that ran dry
+    /// since the previous call, as `(late blocks, bus underruns)`.
+    pub fn take_stream_stats(&self) -> (u64, u64) {
+        (
+            self.shared.mixer_late.swap(0, Ordering::Relaxed),
+            self.shared.bus_underruns.swap(0, Ordering::Relaxed),
+        )
     }
 
     pub fn vst(&self, slot: usize) -> Arc<crate::plugin::PlugIn> {
@@ -3325,7 +3351,17 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
         next += period;
         let now = std::time::Instant::now();
         if next < now {
-            next = now + period;
+            // The block was produced after its play time had passed: the bus
+            // rings lost a block of cushion, and enough of these in a row are
+            // audible.
+            shared.mixer_late.fetch_add(1, Ordering::Relaxed);
+            // Catch up instead of abandoning the block. Rendering back-to-back
+            // refills the ring the burst drained; the loop then falls back into
+            // its normal pacing. Only give up if we are hopelessly behind, so a
+            // permanently overloaded machine cannot spin here forever.
+            if now.duration_since(next) > std::time::Duration::from_millis(50) {
+                next = now + period;
+            }
         }
     }
 }
@@ -3421,10 +3457,17 @@ where
                     .collect();
                 let mut accumulator = 0.0f32;
                 let mut last = (0.0f32, 0.0f32);
+                let mut starved = false;
                 for frame in data.chunks_mut(channels) {
                     accumulator += step;
                     while accumulator >= 1.0 {
                         if rings.iter().any(|ring| ring.is_empty()) {
+                            if !starved {
+                                // Count once per callback: this is audible
+                                // silence where the mixer owed audio.
+                                starved = true;
+                                shared.bus_underruns.fetch_add(1, Ordering::Relaxed);
+                            }
                             last = (0.0, 0.0);
                             accumulator = 0.0;
                             break;

@@ -1850,6 +1850,10 @@ impl MixerApp {
         };
         let block_ms = self.main_buffer as f64 / sr * 1000.0;
         let output_ms = self.main_buffer as f64 / sr * 1000.0;
+        // The bus ring holds mixed audio the device has not played yet. It is
+        // the cushion that absorbs a scheduling burst, and it is latency.
+        let ring_frames = self.audio.bus_ring_frames();
+        let ring_ms = ring_frames as f64 / sr * 1000.0;
         let mut vst_ms = 0.0;
         let mut vst_count = 0usize;
         for slot in self.vsts.iter().take(self.active_strips) {
@@ -1860,9 +1864,9 @@ impl MixerApp {
                 vst_count += 1;
             }
         }
-        let total = input_ms + block_ms + output_ms + vst_ms;
+        let total = input_ms + block_ms + ring_ms + output_ms + vst_ms;
         let detail = format!(
-            "Estimated insert latency\ninput backlog {input_ms:.1} ms ({backlog_frames} frames, measured)\nmixer block {block_ms:.1} ms ({} frames)\noutput request {output_ms:.1} ms ({} frames, shared mode may round it up)\nplug-in latency {vst_ms:.1} ms across {vst_count} insert(s), not compensated\ntotal {total:.1} ms\n\nA CPU spike shows up in the input backlog and is dropped back to the target\nonce it passes it, so a stall does not leave the strip permanently behind.",
+            "Estimated insert latency\ninput backlog {input_ms:.1} ms ({backlog_frames} frames, measured)\nmixer block {block_ms:.1} ms ({} frames)\noutput queue {ring_ms:.1} ms ({ring_frames} frames, bus ring)\noutput request {output_ms:.1} ms ({} frames, shared mode may round it up)\nplug-in latency {vst_ms:.1} ms across {vst_count} insert(s), not compensated\ntotal {total:.1} ms\n\nThe output queue is the cushion that absorbs a burst such as launching another\napp. A CPU spike also shows up in the input backlog; it is now slipped back to\nthe target over a few seconds instead of staying where it landed.",
             self.main_buffer, self.main_buffer
         );
         (total, detail)
@@ -2568,6 +2572,15 @@ impl MixerApp {
             return;
         }
         self.poll_clock = 0.0;
+        // Once a second, say when the audio path could not keep up. This is what
+        // turns "it glitched when app X started" into a log line that names the
+        // cause: a late mixer block (scheduling) or a dry bus ring (output).
+        let (late_blocks, bus_underruns) = self.audio.take_stream_stats();
+        if late_blocks > 0 || bus_underruns > 0 {
+            diag_log(format!(
+                "audio: {late_blocks} late mixer block(s), {bus_underruns} bus underrun(s) in the last second"
+            ));
+        }
         let (sender, receiver) = std::sync::mpsc::channel();
         if std::thread::Builder::new()
             .name("device-probe".to_string())
