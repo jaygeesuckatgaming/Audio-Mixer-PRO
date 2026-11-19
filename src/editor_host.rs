@@ -21,12 +21,13 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetWindowLongPtrW, PeekMessageW, RegisterClassExW, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOW, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE, WM_ENTERMENULOOP, WM_EXITMENULOOP,
-    WM_KILLFOCUS, WM_NCRBUTTONDOWN, WM_SETFOCUS, WM_SYSCOMMAND, WNDCLASSEXW, WS_MAXIMIZEBOX,
-    WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    GetClientRect, GetWindowLongPtrW, IsIconic, PeekMessageW, RegisterClassExW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE, SW_SHOW,
+    WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE, WM_ENTERMENULOOP, WM_EXITMENULOOP, WM_KILLFOCUS,
+    WM_NCRBUTTONDOWN, WM_SETFOCUS, WM_SYSCOMMAND, WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
+    WS_THICKFRAME,
 };
 
 const CLASS_NAME: &str = "MusicRemoverEditorHost";
@@ -41,15 +42,17 @@ fn tracing() -> bool {
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if tracing()
         && (msg == WM_ACTIVATE
-        || msg == WM_SETFOCUS
-        || msg == WM_KILLFOCUS
-        || msg == WM_SYSCOMMAND
-        || msg == WM_ENTERMENULOOP
-        || msg == WM_EXITMENULOOP
-        || msg == WM_NCRBUTTONDOWN
-        || msg == WM_ACTIVATEAPP)
+            || msg == WM_SETFOCUS
+            || msg == WM_KILLFOCUS
+            || msg == WM_SYSCOMMAND
+            || msg == WM_ENTERMENULOOP
+            || msg == WM_EXITMENULOOP
+            || msg == WM_NCRBUTTONDOWN
+            || msg == WM_ACTIVATEAPP)
     {
-        crate::diag_log(format!("editor: host msg {msg:#06x} wparam {wp} (hwnd {hwnd:p})"));
+        crate::diag_log(format!(
+            "editor: host msg {msg:#06x} wparam {wp} (hwnd {hwnd:p})"
+        ));
     }
     if msg == WM_CLOSE {
         let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AtomicBool;
@@ -147,7 +150,10 @@ impl EditorHost {
         let outer_w = rect.right - rect.left;
         let outer_h = rect.bottom - rect.top;
 
-        let class: Vec<u16> = CLASS_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let class: Vec<u16> = CLASS_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let title: Vec<u16> = format!("{title} - VST3")
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -364,6 +370,35 @@ impl EditorHost {
         !self.closed.load(Ordering::Relaxed) && self.editor.is_some()
     }
 
+    /// Bring an already open editor to the front and give it the keyboard.
+    /// Clicking the strip's insert panel while its window sits behind another
+    /// app must show the window instead of silently doing nothing. Focus
+    /// reaches the plug-in through WM_SETFOCUS, which already calls
+    /// `IPlugView::onFocus`, so its meters start again.
+    pub fn raise(&self) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let hwnd = self.hwnd as HWND;
+        unsafe {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            } else {
+                ShowWindow(hwnd, SW_SHOW);
+            }
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            SetForegroundWindow(hwnd);
+        }
+    }
+
     /// Place the window next to the mixer and pin its frame, the same geometry
     /// the standalone window path used.
     pub fn place_beside(&mut self, mixer: isize) {
@@ -471,7 +506,14 @@ impl EditorHost {
                 ..std::mem::zeroed()
             };
             let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-            let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+            let dib = CreateDIBSection(
+                dc,
+                &info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            );
             if dib.is_null() || bits.is_null() {
                 DeleteDC(dc);
                 return Err("no DIB".to_string());
@@ -546,4 +588,3 @@ impl Drop for EditorHost {
         }
     }
 }
-

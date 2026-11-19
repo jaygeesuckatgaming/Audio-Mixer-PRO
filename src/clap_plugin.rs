@@ -12,8 +12,8 @@ use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_extensions::state::PluginState;
 use clack_host::events::event_types::ParamValueEvent;
 use clack_host::events::io::EventBuffer;
-use clack_host::prelude::{Pckn, ClapId};
 use clack_host::prelude::*;
+use clack_host::prelude::{ClapId, Pckn};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -500,8 +500,24 @@ impl ClapSlot {
         let Some(main) = slot.as_mut() else {
             return Err("No CLAP plug-in is loaded".to_string());
         };
-        if main.window.is_some() {
-            return Ok(());
+        if let Some(window) = main.window.as_mut() {
+            if !window.is_closed() {
+                // Clicking the insert panel again shows the window instead of
+                // silently doing nothing.
+                window.raise();
+                return Ok(());
+            }
+            // WM_CLOSE only hides the host window, so the slot still thought
+            // it had an editor while the person saw nothing. Drop the view and
+            // fall through to build a new one.
+            main.window = None;
+            main.gui_created = false;
+            let mut stale = main.instance.plugin_handle();
+            if let Some(gui) = stale.get_extension::<PluginGui>() {
+                let _ = gui.hide(&stale);
+                gui.destroy(&stale);
+            }
+            self.gui_open.store(false, Ordering::Relaxed);
         }
         let mut handle = main.instance.plugin_handle();
         let gui = handle

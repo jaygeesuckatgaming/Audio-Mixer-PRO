@@ -378,12 +378,14 @@ impl VstChain {
                     loaded.info.name
                 ));
             }
-            if inner
-                .editor
-                .as_ref()
-                .map_or(false, |window| window.0.is_open())
-            {
-                return Ok(());
+            // An editor that is already up is brought forward: clicking the
+            // strip's insert panel is the person's "show me that window", and
+            // a silent no-op left it hidden behind other applications.
+            if let Some(window) = inner.editor.as_ref() {
+                if window.0.is_open() {
+                    window.0.raise();
+                    return Ok(());
+                }
             }
             (loaded.plugin.clone(), loaded.info.name.clone())
         };

@@ -8,10 +8,11 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetWindowLongPtrW, PeekMessageW, RegisterClassExW, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW,
-    WM_CLOSE, WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    GetClientRect, GetWindowLongPtrW, IsIconic, PeekMessageW, RegisterClassExW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW, WM_CLOSE,
+    WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 
 const CLASS_NAME: &str = "MusicRemoverHostWindow";
@@ -115,6 +116,33 @@ impl HostWindow {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    /// Bring the window to the front, restoring it if it was minimised. Used
+    /// when the person clicks a strip's insert panel while its editor sits
+    /// behind another window.
+    pub fn raise(&self) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let hwnd = self.hwnd as HWND;
+        unsafe {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            } else {
+                ShowWindow(hwnd, SW_SHOW);
+            }
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            SetForegroundWindow(hwnd);
+        }
     }
 
     pub fn set_client_size(&mut self, width: i32, height: i32) {
