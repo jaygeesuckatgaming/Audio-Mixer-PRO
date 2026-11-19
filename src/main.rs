@@ -10130,6 +10130,12 @@ fn driver_cables_present_from(devices: &[String]) -> bool {
         .iter()
         .filter(|d| d.to_ascii_lowercase().starts_with("speakers"))
         .filter_map(|d| cable_label(d))
+        // Only the kernel driver makes "Virtual Cable" endpoints. The USB/IP
+        // set is called "USB Cable" and must not be read as the driver: with
+        // four USB cables attached this used to report KERNEL DRIVER ACTIVE and
+        // an automatic B1/B2 then looked for a "Virtual Cable" that is not
+        // there.
+        .filter(|label| label.starts_with("Virtual Cable "))
         .collect();
     labels.sort();
     labels.dedup();
@@ -10896,6 +10902,24 @@ mod tests {
             MixerApp::next_free_virtual_cable_from(&inputs, &used).as_deref(),
             Some("Microphone (Virtual Cable 01)")
         );
+    }
+
+    #[test]
+    fn usb_cables_do_not_count_as_the_kernel_driver() {
+        let devices: Vec<String> = (1..=4)
+            .map(|n| format!("Speakers (USB Cable {n:02})"))
+            .collect();
+        assert!(!driver_cables_present_from(&devices));
+    }
+
+    #[test]
+    fn four_driver_cables_count_as_the_kernel_driver() {
+        let mut devices: Vec<String> = (1..=4)
+            .map(|n| format!("Speakers (Virtual Cable {n:02})"))
+            .collect();
+        // Both sets installed at once: the USB set must not change the answer.
+        devices.extend((1..=4).map(|n| format!("Speakers (USB Cable {n:02})")));
+        assert!(driver_cables_present_from(&devices));
     }
 
     #[test]
