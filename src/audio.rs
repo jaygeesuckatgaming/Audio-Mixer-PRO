@@ -1411,11 +1411,15 @@ impl Dsp {
                         std::mem::swap(&mut l, &mut r);
                     }
 
+                    // Meter the mix before the safety limiter. tanh can never
+                    // exceed 1.0, so measuring after it pinned every bus meter
+                    // at 0 dBFS however hard the fader was pushed and hid the
+                    // drive completely.
+                    bus_peak[b] = bus_peak[b].max(l.abs()).max(r.abs());
                     l = soft_clip(l);
                     r = soft_clip(r);
                     bus_l[b] = l;
                     bus_r[b] = r;
-                    bus_peak[b] = bus_peak[b].max(l.abs()).max(r.abs());
                 }
 
                 let (l, r) = (bus_l[0], bus_r[0]);

@@ -2803,45 +2803,13 @@ impl MixerApp {
             );
         }
 
-        let output = self.audio.peak();
-        // The virtual buses have no physical device in this rebuild. Show the
-        // real level that the routed strips (and the tape deck) would send
-        // through their own fader, so a strip's A2/A3/B1/B2 button visibly
-        // does something even though only A1 is opened.
-        let mut bus_source = [0.0f32; audio::MAX_BUSES];
-        for bi in 1..audio::MAX_BUSES {
-            let mut sum = 0.0f32;
-            for (si, s) in self.strips.iter().take(self.active_strips).enumerate() {
-                if !s.route[bi] || s.mute || (any_solo && !s.solo) {
-                    continue;
-                }
-                let raw = self
-                    .captures
-                    .get(si)
-                    .and_then(|c| c.as_ref())
-                    .map(|c| c.peak())
-                    .unwrap_or_else(|| if s.tape_feed { tape_source } else { 0.0 });
-                sum += raw * db_to_lin(s.gain_db);
-            }
-            if self.tape.route[bi] {
-                sum += tape_source;
-            }
-            bus_source[bi] = sum;
-        }
         let bus_peaks: [f32; audio::MAX_BUSES] =
             std::array::from_fn(|bus| self.audio.bus_peak(bus));
         for (bi, b) in self.buses.iter_mut().enumerate() {
-            let mut target = if bi == 0 {
-                // The A1 meter is the level measured at the real output, so it
-                // includes every routed strip, the A1 fader, mute, mono, EQ and
-                // soft limiter.
-                output
-            } else if bi >= 1 {
-                // A2/A3 and B1/B2 are real bus stems now (VBAN/cable outputs).
-                bus_peaks[bi]
-            } else {
-                bus_source[bi] * db_to_lin(b.gain_db)
-            };
+            // Every bus meters its mix before the output limiter, so pushing a
+            // fader is visible on the meter; the limiter still protects what
+            // leaves the device.
+            let mut target = bus_peaks[bi];
             if b.mute {
                 target = 0.0;
             }
