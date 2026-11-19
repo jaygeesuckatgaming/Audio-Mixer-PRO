@@ -1654,6 +1654,7 @@ pub struct AudioEngine {
     /// cable endpoint should see one clock, so B1 and B3 choosing the same
     /// speaker are mixed here instead of opening two streams.
     bus_groups: Vec<BusGroup>,
+    bus_pending: Vec<PendingBusGroup>,
     bus_device_names: [String; MAX_BUSES],
     bus_retry_at: [Option<std::time::Instant>; MAX_BUSES],
     bus_last_request: [String; MAX_BUSES],
@@ -1666,6 +1667,15 @@ struct BusGroup {
     /// Kept alive for as long as the group exists.
     #[allow(dead_code)]
     stream: cpal::Stream,
+}
+
+/// A stream being opened on a worker thread. Device enumeration and stream
+/// creation talk to the audio service, which can block for minutes when an
+/// endpoint is wedged; that must never happen on the UI thread.
+struct PendingBusGroup {
+    device: String,
+    buses: Vec<usize>,
+    result: std::sync::mpsc::Receiver<Result<(cpal::Stream, u32), String>>,
 }
 
 /// Group the resolved bus device names: every bus routed to the same endpoint
@@ -1730,6 +1740,7 @@ impl AudioEngine {
             mixer_join: None,
             mixer_block: 512,
             bus_groups: Vec::new(),
+            bus_pending: Vec::new(),
             bus_device_names: std::array::from_fn(|_| String::new()),
             bus_retry_at: std::array::from_fn(|_| None),
             bus_last_request: std::array::from_fn(|_| String::new()),
@@ -1805,6 +1816,7 @@ impl AudioEngine {
     /// headphones, a USB interface that just finished enumerating, ...).
     pub fn refresh_bus_outputs(&mut self) {
         self.bus_groups.clear();
+        self.bus_pending.clear();
         for b in 0..MAX_BUSES {
             self.bus_device_names[b].clear();
             self.bus_retry_at[b] = None;
@@ -1818,6 +1830,7 @@ impl AudioEngine {
         self.stop_mixer();
         self.pending_start = None;
         self.bus_groups.clear();
+        self.bus_pending.clear();
         for b in 0..MAX_BUSES {
             self.bus_device_names[b].clear();
             self.bus_retry_at[b] = None;
@@ -2120,6 +2133,67 @@ impl AudioEngine {
         // be two streams with two clocks.
         let desired = group_buses_by_device(&wanted);
 
+        // Collect finished worker opens before deciding anything: a stream that
+        // just came up changes the grouping, a failure arms a retry.
+        let mut pending = std::mem::take(&mut self.bus_pending);
+        let mut index = 0;
+        while index < pending.len() {
+            let finished = match pending[index].result.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("the output worker stopped".to_string()))
+                }
+            };
+            let Some(result) = finished else {
+                index += 1;
+                continue;
+            };
+            let group = pending.swap_remove(index);
+            let labels = group
+                .buses
+                .iter()
+                .map(|&b| Self::bus_label(b))
+                .collect::<Vec<_>>()
+                .join("+");
+            match result {
+                Ok((stream, rate)) => {
+                    for &b in &group.buses {
+                        {
+                            let mut ring = lock_source(&self.shared.bus_out_rings[b]);
+                            ring.clear();
+                            for _ in 0..BUS_PREFILL_FRAMES {
+                                ring.push_back((0.0, 0.0));
+                            }
+                        }
+                        self.shared.bus_out_active[b].store(true, Ordering::Relaxed);
+                        self.bus_retry_at[b] = None;
+                    }
+                    crate::diag_log(format!(
+                        "audio: bus {labels} output on '{}' at {rate} Hz",
+                        group.device
+                    ));
+                    self.bus_groups.push(BusGroup {
+                        device: group.device,
+                        buses: group.buses,
+                        stream,
+                    });
+                }
+                Err(err) => {
+                    for &b in &group.buses {
+                        self.bus_retry_at[b] = Some(now + std::time::Duration::from_secs(3));
+                        self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
+                        lock_source(&self.shared.bus_out_rings[b]).clear();
+                    }
+                    crate::diag_log(format!(
+                        "audio: bus {labels} output '{}' failed: {err}",
+                        group.device
+                    ));
+                }
+            }
+        }
+        self.bus_pending = pending;
+
         let same_grouping = desired.len() == self.bus_groups.len()
             && desired.iter().all(|(device, buses)| {
                 self.bus_groups
@@ -2127,11 +2201,12 @@ impl AudioEngine {
                     .any(|g| g.device.eq_ignore_ascii_case(device) && g.buses == *buses)
             });
 
-        // A bus whose device is not there yet (Windows still enumerating it)
-        // is retried every few seconds, never once per frame.
+        // A bus whose device is not there yet is retried every few seconds,
+        // never once per frame.
         let retry_due = (0..MAX_BUSES).any(|b| {
             wanted[b].is_some()
                 && !self.bus_is_open(b)
+                && !self.bus_is_pending(b)
                 && self.bus_retry_at[b].map(|at| now >= at).unwrap_or(true)
         });
         // A bus that is open on a device it no longer asks for is closed at
@@ -2145,73 +2220,75 @@ impl AudioEngine {
             self.bus_last_request[b] = requested[b].to_string();
         }
 
-        if same_grouping || (!request_changed && !retry_due && !unrouted) {
+        if same_grouping && self.bus_pending.is_empty() {
+            return;
+        }
+        if !request_changed && !retry_due && !unrouted && self.bus_pending.is_empty() {
             return;
         }
 
-        let mut groups: Vec<BusGroup> = Vec::new();
+        // Keep the streams that still match the routing, close the rest.
         let mut previous = std::mem::take(&mut self.bus_groups);
+        let mut keep: Vec<BusGroup> = Vec::new();
         for (device, buses) in &desired {
-            // Reuse a stream that already serves exactly this device and bus
-            // set, so touching one bus does not restart the others.
             if let Some(pos) = previous
                 .iter()
                 .position(|g| g.device.eq_ignore_ascii_case(device) && g.buses == *buses)
             {
-                groups.push(previous.swap_remove(pos));
-                continue;
-            }
-            let labels = buses
-                .iter()
-                .map(|&b| Self::bus_label(b))
-                .collect::<Vec<_>>()
-                .join("+");
-            match open_bus_group(device, self.shared.clone(), buses) {
-                Ok((stream, rate)) => {
-                    for &b in buses {
-                        {
-                            let mut ring = lock_source(&self.shared.bus_out_rings[b]);
-                            ring.clear();
-                            for _ in 0..BUS_PREFILL_FRAMES {
-                                ring.push_back((0.0, 0.0));
-                            }
-                        }
-                        self.shared.bus_out_active[b].store(true, Ordering::Relaxed);
-                        self.bus_retry_at[b] = None;
-                    }
-                    crate::diag_log(format!(
-                        "audio: bus {labels} output on '{device}' at {rate} Hz"
-                    ));
-                    groups.push(BusGroup {
-                        device: device.clone(),
-                        buses: buses.clone(),
-                        stream,
-                    });
-                }
-                Err(err) => {
-                    for &b in buses {
-                        self.bus_retry_at[b] = Some(now + std::time::Duration::from_secs(3));
-                        self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
-                        lock_source(&self.shared.bus_out_rings[b]).clear();
-                    }
-                    crate::diag_log(format!(
-                        "audio: bus {labels} output '{device}' failed: {err}"
-                    ));
-                }
+                keep.push(previous.swap_remove(pos));
             }
         }
-        // Anything left in `previous` is no longer routed to any bus.
         for group in previous {
             for b in group.buses {
                 self.shared.bus_out_active[b].store(false, Ordering::Relaxed);
                 lock_source(&self.shared.bus_out_rings[b]).clear();
             }
         }
-        self.bus_groups = groups;
+        self.bus_groups = keep;
+
+        // Start a worker for every group that is neither open nor already
+        // opening. This is the only place a device is touched, and it is off
+        // the UI thread, so a wedged audio service cannot freeze the window.
+        for (device, buses) in &desired {
+            let open = self
+                .bus_groups
+                .iter()
+                .any(|g| g.device.eq_ignore_ascii_case(device) && g.buses == *buses);
+            let opening = self
+                .bus_pending
+                .iter()
+                .any(|p| p.device.eq_ignore_ascii_case(device) && p.buses == *buses);
+            if open || opening {
+                continue;
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let shared = self.shared.clone();
+            let device_worker = device.clone();
+            let buses_worker = buses.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(open_bus_group(&device_worker, shared, &buses_worker));
+            });
+            self.bus_pending.push(PendingBusGroup {
+                device: device.clone(),
+                buses: buses.clone(),
+                result: rx,
+            });
+        }
+        // An open whose bus was rerouted or removed is abandoned; the worker
+        // finishes on its own and the stream it produced is dropped.
+        self.bus_pending.retain(|p| {
+            desired
+                .iter()
+                .any(|(device, buses)| device.eq_ignore_ascii_case(&p.device) && *buses == p.buses)
+        });
     }
 
     fn bus_is_open(&self, bus: usize) -> bool {
         self.bus_groups.iter().any(|g| g.buses.contains(&bus))
+    }
+
+    fn bus_is_pending(&self, bus: usize) -> bool {
+        self.bus_pending.iter().any(|p| p.buses.contains(&bus))
     }
 
     /// Human-readable bus name: A1..A3 are the console's main buses, B1/B2
