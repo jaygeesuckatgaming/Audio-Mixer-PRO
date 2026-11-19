@@ -2261,6 +2261,25 @@ impl MixerApp {
         let a3 = self.buses[2].device.clone();
         // B3 is a plain bus: it only plays to the device chosen for it.
         let b3 = self.buses[5].device.clone();
+        // Outputs obey the same rule as captures: a USB cable endpoint appears
+        // in enumeration while usbip is still attaching it, and opening it then
+        // holds the endpoint so the attach never completes, leaving that cable
+        // unusable for the rest of the session. Wait for the attach report; the
+        // bus is reopened as soon as it arrives.
+        let usb_ready = !self.vc_cfg.enabled || self.vc.status().attached;
+        let gate = |name: String| -> String {
+            if usb_ready || !is_usb_cable_endpoint(&name) {
+                name
+            } else {
+                String::new()
+            }
+        };
+        let a1 = gate(a1);
+        let a2 = gate(a2);
+        let a3 = gate(a3);
+        let b1 = gate(b1);
+        let b2 = gate(b2);
+        let b3 = gate(b3);
         self.audio.set_bus_outputs_with(
             &self.last_outputs,
             [
@@ -2502,7 +2521,7 @@ impl MixerApp {
                     // endpoint so the attach cannot finish (Chrome then cannot
                     // even see the cable). Wait until the attach reports done.
                     if self.vc_cfg.enabled
-                        && cable_label(&name).is_some()
+                        && is_usb_cable_endpoint(&name)
                         && !self.vc.status().attached
                     {
                         continue;
@@ -10043,6 +10062,14 @@ fn cable_label(device: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// True for the emulated USB/IP cable endpoints (the kernel driver's
+/// "Virtual Cable" endpoints are ordinary WDM devices that exist from boot).
+fn is_usb_cable_endpoint(device: &str) -> bool {
+    cable_label(device)
+        .map(|label| label.starts_with("USB Cable"))
+        .unwrap_or(false)
 }
 
 fn clock(secs: f32) -> String {
