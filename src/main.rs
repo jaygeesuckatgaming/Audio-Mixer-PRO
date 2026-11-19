@@ -2777,7 +2777,20 @@ impl MixerApp {
                     }
                 });
             let s = &mut self.strips[i];
-            let mut target = raw * db_to_lin(s.gain_db);
+            // The engine measures the strip where it actually leaves the
+            // strip: after the fader, pan and the insert. That is what the
+            // meter must show - an input peak times the fader ignored any
+            // gain or limiting inside the plug-in and had no relation to the
+            // signal being sent to the buses. The capture estimate stays as a
+            // fallback while the mixer thread is not running.
+            let estimated = raw * db_to_lin(s.gain_db);
+            // The tape deck is mixed into the buses rather than through a
+            // strip, so a tape-fed virtual input keeps the estimate.
+            let mut target = if self.audio.available && !s.tape_feed {
+                self.audio.strip_peak(i)
+            } else {
+                estimated
+            };
             if s.mute || (any_solo && !s.solo) {
                 target = 0.0;
             }
@@ -5934,7 +5947,11 @@ impl MixerApp {
             true,
             max_db,
             self.streamer_brightness(idx),
-            "Strip gain: drag, wheel steps 3 dB, double click for 0 dB",
+            if self.limit_remote {
+                "Strip gain: capped at 0 dB by MENU > Limit Remote Gain to 0 dBfs"
+            } else {
+                "Strip gain: drag, wheel steps 3 dB, double click for 0 dB"
+            },
         );
         meter_widget(
             ui,
@@ -6340,7 +6357,11 @@ impl MixerApp {
             false,
             max_db,
             self.streamer_brightness(self.active_strips + idx),
-            "Bus gain: drag, wheel steps 3 dB, double click for 0 dB",
+            if self.limit_remote {
+                "Bus gain: capped at 0 dB by MENU > Limit Remote Gain to 0 dBfs"
+            } else {
+                "Bus gain: drag, wheel steps 3 dB, double click for 0 dB"
+            },
         );
         meter_widget(
             ui,
