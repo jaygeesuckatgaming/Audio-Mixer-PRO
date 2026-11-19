@@ -2572,9 +2572,15 @@ const INPUT_BUFFER_FRAMES: u32 = 512;
 /// Keep the live input near this much audio; a startup backlog is trimmed and
 /// slow clock drift is corrected toward it instead of growing toward the ring
 /// capacity.
-pub const INPUT_TARGET_MS: f32 = 25.0;
-/// Extra fill tolerated before the drift controller starts dropping frames.
-const INPUT_TARGET_HYSTERESIS_MS: f32 = 15.0;
+pub const INPUT_TARGET_MS: f32 = 20.0;
+/// Extra fill tolerated before the drift controller starts slipping frames out.
+/// It used to be 15 ms, which let a spike park a strip just under 40 ms and the
+/// status bar then reported that for the rest of the session.
+const INPUT_TARGET_HYSTERESIS_MS: f32 = 5.0;
+/// Frames slipped out per second while the backlog is above the tolerated fill.
+/// 5 ms/s returns a 15 ms spike to the target in about three seconds and is far
+/// too small a rate change to hear, unlike the old single hard trim.
+const INPUT_SLIP_FRAMES_PER_SEC: usize = 250;
 
 /// Interleaved stereo frames waiting to be mixed into the output. The capture
 /// callback appends, the output callback consumes. A short ring keeps the
@@ -2754,14 +2760,19 @@ impl InputReader {
         // the ring; playing that backlog out afterwards would leave the strip
         // permanently behind by however long the spike lasted.
         //
-        // Real drift is only a few frames, but backlogs are milliseconds to
-        // hundreds of milliseconds, so drop straight back to the target rather
-        // than slipping one frame per 128 calls (which would take minutes to
-        // converge). The jump is a single discontinuity, the same trade every
-        // low-latency engine makes.
+        // Slip single frames out while the fill is above the tolerated band
+        // instead of chopping the whole backlog in one discontinuity: at a few
+        // hundred frames per second the rate change is inaudible and the strip
+        // is back at the target within a couple of seconds. Parking the excess
+        // (the old behaviour) is what made the latency readout climb and stay
+        // there.
         if ring.fill() > high {
-            ring.trim_to(target);
-            self.drift_tick = 0;
+            self.drift_tick = self.drift_tick.saturating_add(1);
+            let slip = (output_rate as usize / INPUT_SLIP_FRAMES_PER_SEC).max(1) as u32;
+            if self.drift_tick >= slip {
+                self.drift_tick = 0;
+                let _ = ring.pop();
+            }
         } else {
             self.drift_tick = 0;
         }
@@ -4090,6 +4101,37 @@ mod latency_tests {
         let groups = group_buses_by_device(&wanted);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].1, vec![4, 5]);
+    }
+
+    #[test]
+    fn reader_slips_a_spike_backlog_back_toward_the_target() {
+        let mut ring = SampleRing::new();
+        for _ in 0..5_000 {
+            ring.push([0.1, 0.1]);
+        }
+        let mut reader = InputReader::new();
+        // First call trims the startup backlog to the target.
+        let _ = reader.next(&mut ring, 48_000, 48_000);
+        // A spike of roughly 40 ms on top of that.
+        for _ in 0..2_000 {
+            ring.push([0.1, 0.1]);
+        }
+        let before = ring.fill();
+        // Ten seconds of capture and playback running frame for frame.
+        for _ in 0..480_000 {
+            ring.push([0.1, 0.1]);
+            let _ = reader.next(&mut ring, 48_000, 48_000);
+        }
+        let after = ring.fill();
+        assert!(
+            after < before,
+            "backlog did not recover: {before} -> {after} frames"
+        );
+        let high = (48_000.0 * (INPUT_TARGET_MS + INPUT_TARGET_HYSTERESIS_MS) / 1000.0) as usize;
+        assert!(
+            after <= high + 8,
+            "backlog parked above the tolerated band: {after} frames, band ends at {high}"
+        );
     }
 
     #[test]
