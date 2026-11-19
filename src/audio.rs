@@ -31,6 +31,20 @@ const BUS_PREFILL_FRAMES: usize = 1024;
 /// growing "output queue". Holding it at the prefill keeps the queue at two
 /// blocks instead of letting it park higher.
 const BUS_DRAIN_FRAMES: usize = 1024;
+/// Emulated USB cable endpoints hand the callback ~1056 frames at a time, so a
+/// 1024-frame ring starves on the callback itself; those get two callbacks of
+/// cushion. The kernel driver's Virtual Cable endpoints are ordinary WDM
+/// devices and do not need it.
+const USB_CABLE_CUSHION_FRAMES: usize = 1792;
+
+/// Ring depth the callback keeps queued for this endpoint.
+fn bus_cushion_frames(device: &str) -> usize {
+    if device.to_ascii_lowercase().contains("usb cable") {
+        USB_CABLE_CUSHION_FRAMES
+    } else {
+        BUS_DRAIN_FRAMES
+    }
+}
 /// Longest track this build will hold in memory. The original streams from
 /// disk; this rebuild decodes to RAM, so it stops at 30 minutes with a clear
 /// message instead of failing silently.
@@ -501,11 +515,11 @@ impl TrackInfo {
             n => format!("{n} ch"),
         };
         let mut out = format!(
-            "{} Â· {} Hz Â· {}{}",
+            "{} ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {} Hz ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}{}",
             self.format, self.sample_rate, bits, channels
         );
         if self.truncated {
-            out.push_str(" Â· first 30 min only");
+            out.push_str(" ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· first 30 min only");
         }
         out
     }
@@ -672,6 +686,9 @@ struct Shared {
     /// heavy app) shows up here before it is audible.
     mixer_late: AtomicU64,
     bus_underruns: [AtomicU64; MAX_BUSES],
+    /// Frames the endpoint asked for in its last callback; the cable ring has to
+    /// be at least this deep or the callback itself starves.
+    bus_callback_frames: [AtomicUsize; MAX_BUSES],
     error: Mutex<Option<String>>,
 }
 
@@ -715,6 +732,7 @@ impl Shared {
             strip_backlog: AtomicUsize::new(0),
             mixer_late: AtomicU64::new(0),
             bus_underruns: std::array::from_fn(|_| AtomicU64::new(0)),
+            bus_callback_frames: std::array::from_fn(|_| AtomicUsize::new(0)),
             vsts: std::array::from_fn(|_| crate::plugin::PlugIn::new()),
             duck_enabled: AtomicBool::new(false),
             duck_source: AtomicUsize::new(usize::MAX),
@@ -1748,6 +1766,30 @@ impl AudioEngine {
             .unwrap_or(0)
     }
 
+    /// Ring depth of the bus that feeds the monitoring output (A1) when it is
+    /// open, otherwise the deepest open bus. The status bar follows this: the
+    /// cable buses can carry a deeper cushion without making the speakers late.
+    pub fn monitor_ring_frames(&self) -> usize {
+        let a1 = lock_source(&self.shared.bus_out_rings[0]).len();
+        if self.shared.bus_out_active[0].load(Ordering::Relaxed) && a1 > 0 {
+            a1
+        } else {
+            self.bus_ring_frames()
+        }
+    }
+
+    pub fn callback_frames_for(&self, bus: usize) -> usize {
+        self.shared
+            .bus_callback_frames
+            .get(bus.min(MAX_BUSES - 1))
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    pub fn ring_frames(&self, bus: usize) -> usize {
+        lock_source(&self.shared.bus_out_rings[bus.min(MAX_BUSES - 1)]).len()
+    }
+
     /// Mixer blocks that missed their deadline and, per bus, callbacks that ran
     /// dry since the previous call. Per-bus attribution matters: a single
     /// starving device (a Bluetooth headset running to its own clock) is
@@ -2217,11 +2259,12 @@ impl AudioEngine {
                 .join("+");
             match result {
                 Ok((stream, rate)) => {
+                    let cushion = bus_cushion_frames(&group.device);
                     for &b in &group.buses {
                         {
                             let mut ring = lock_source(&self.shared.bus_out_rings[b]);
                             ring.clear();
-                            for _ in 0..BUS_PREFILL_FRAMES {
+                            for _ in 0..cushion {
                                 ring.push_back((0.0, 0.0));
                             }
                         }
@@ -3410,7 +3453,14 @@ fn open_bus_group(
     let sample_format = default.sample_format();
     let config = default.config();
     let rate = config.sample_rate.0;
-    let stream = build_bus_group_for_format(sample_format, &device, &config, shared, buses)?;
+    let stream = build_bus_group_for_format(
+        sample_format,
+        &device,
+        &config,
+        shared,
+        buses,
+        bus_cushion_frames(name),
+    )?;
     stream
         .play()
         .map_err(|e| format!("Could not start {name}: {e}"))?;
@@ -3423,20 +3473,23 @@ fn build_bus_group_for_format(
     config: &cpal::StreamConfig,
     shared: Arc<Shared>,
     buses: &[usize],
+    cushion: usize,
 ) -> Result<cpal::Stream, String> {
     let buses = Arc::new(buses.to_vec());
     match sample_format {
-        cpal::SampleFormat::F32 => build_bus_group::<f32>(device, config, shared, buses),
-        cpal::SampleFormat::I16 => build_bus_group::<i16>(device, config, shared, buses),
-        cpal::SampleFormat::U16 => build_bus_group::<u16>(device, config, shared, buses),
-        cpal::SampleFormat::I32 => build_bus_group::<i32>(device, config, shared, buses),
-        cpal::SampleFormat::U32 => build_bus_group::<u32>(device, config, shared, buses),
-        cpal::SampleFormat::I8 => build_bus_group::<i8>(device, config, shared, buses),
-        cpal::SampleFormat::U8 => build_bus_group::<u8>(device, config, shared, buses),
-        cpal::SampleFormat::I64 => build_bus_group::<i64>(device, config, shared, buses),
-        cpal::SampleFormat::U64 => build_bus_group::<u64>(device, config, shared, buses),
-        cpal::SampleFormat::F64 => build_bus_group::<f64>(device, config, shared, buses),
-        cpal::SampleFormat::I24 => build_bus_group::<cpal::I24>(device, config, shared, buses),
+        cpal::SampleFormat::F32 => build_bus_group::<f32>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::I16 => build_bus_group::<i16>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::U16 => build_bus_group::<u16>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::I32 => build_bus_group::<i32>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::U32 => build_bus_group::<u32>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::I8 => build_bus_group::<i8>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::U8 => build_bus_group::<u8>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::I64 => build_bus_group::<i64>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::U64 => build_bus_group::<u64>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::F64 => build_bus_group::<f64>(device, config, shared, buses, cushion),
+        cpal::SampleFormat::I24 => {
+            build_bus_group::<cpal::I24>(device, config, shared, buses, cushion)
+        }
         other => Err(format!("Unsupported audio sample format: {other}")),
     }
 }
@@ -3446,6 +3499,7 @@ fn build_bus_group<T>(
     config: &cpal::StreamConfig,
     shared: Arc<Shared>,
     buses: Arc<Vec<usize>>,
+    cushion: usize,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + cpal::FromSample<f32> + 'static,
@@ -3458,6 +3512,13 @@ where
             config,
             move |data: &mut [T], _info: &cpal::OutputCallbackInfo| {
                 let master_rate = shared.sample_rate.load(Ordering::Relaxed) as f32;
+                if let Some(&owner) = buses.first() {
+                    // What this endpoint asks for in one callback sizes the ring
+                    // it needs; the log reports it next to any starvation.
+                    if let Some(slot) = shared.bus_callback_frames.get(owner) {
+                        slot.store(data.len() / channels.max(1), Ordering::Relaxed);
+                    }
+                }
                 let step = if output_rate > 0.0 {
                     (master_rate / output_rate).max(0.01)
                 } else {
@@ -3478,13 +3539,15 @@ where
                     while accumulator >= 1.0 {
                         if rings.iter().any(|ring| ring.is_empty()) {
                             if !starved {
-                                // Count once per callback: this is audible
-                                // silence where the mixer owed audio.
+                                // Count once per callback: the mixer owed audio
+                                // here. What is played instead is the previous
+                                // sample held, not silence: a 10 ms gap in the
+                                // waveform is the click people hear, while a held
+                                // sample is inaudible until the ring refills.
                                 starved = true;
                                 let owner = buses.first().copied().unwrap_or(0);
                                 shared.bus_underruns[owner].fetch_add(1, Ordering::Relaxed);
                             }
-                            last = (0.0, 0.0);
                             accumulator = 0.0;
                             break;
                         }
@@ -3509,7 +3572,7 @@ where
                     }
                 }
                 for ring in rings.iter_mut() {
-                    let excess = ring.len().saturating_sub(BUS_DRAIN_FRAMES);
+                    let excess = ring.len().saturating_sub(cushion);
                     if excess > 0 {
                         let _ = ring.drain(..excess);
                     }

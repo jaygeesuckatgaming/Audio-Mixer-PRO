@@ -1880,9 +1880,23 @@ impl MixerApp {
         let block_ms = self.main_buffer as f64 / sr * 1000.0;
         let output_ms = self.main_buffer as f64 / sr * 1000.0;
         // The bus ring holds mixed audio the device has not played yet. It is
-        // the cushion that absorbs a scheduling burst, and it is latency.
-        let ring_frames = self.audio.bus_ring_frames();
+        // the cushion that absorbs a scheduling burst, and it is latency. The
+        // figure follows the monitoring bus: a cable that feeds another
+        // application may carry a deeper cushion without delaying the speakers.
+        let ring_frames = self.audio.monitor_ring_frames();
         let ring_ms = ring_frames as f64 / sr * 1000.0;
+        let per_bus = (0..audio::MAX_BUSES)
+            .map(|bus| (bus, self.audio.ring_frames(bus)))
+            .filter(|(_, frames)| *frames > 0)
+            .map(|(bus, frames)| {
+                format!(
+                    "{} {:.1} ms",
+                    self.buses[bus].name,
+                    frames as f64 / sr * 1000.0
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut vst_ms = 0.0;
         let mut vst_count = 0usize;
         for slot in self.vsts.iter().take(self.active_strips) {
@@ -1895,7 +1909,7 @@ impl MixerApp {
         }
         let total = input_ms + block_ms + ring_ms + output_ms + vst_ms;
         let detail = format!(
-            "Estimated insert latency\ninput backlog {input_ms:.1} ms ({backlog_frames} frames, measured)\nmixer block {block_ms:.1} ms ({} frames)\noutput queue {ring_ms:.1} ms ({ring_frames} frames, bus ring)\noutput request {output_ms:.1} ms ({} frames, shared mode may round it up)\nplug-in latency {vst_ms:.1} ms across {vst_count} insert(s), not compensated\ntotal {total:.1} ms\n\nThe output queue is the cushion that absorbs a burst such as launching another\napp. A CPU spike also shows up in the input backlog; it is now slipped back to\nthe target over a few seconds instead of staying where it landed.",
+            "Estimated insert latency\ninput backlog {input_ms:.1} ms ({backlog_frames} frames, measured)\nmixer block {block_ms:.1} ms ({} frames)\noutput queue {ring_ms:.1} ms ({ring_frames} frames, monitoring bus)\noutput request {output_ms:.1} ms ({} frames, shared mode may round it up)\nplug-in latency {vst_ms:.1} ms across {vst_count} insert(s), not compensated\ntotal {total:.1} ms\n\nEvery bus ring right now: {per_bus}\n\nThe output queue is the cushion that absorbs a burst such as launching another\napp. A CPU spike also shows up in the input backlog; it is now slipped back to\nthe target over a few seconds instead of staying where it landed. The total\nfollows the monitoring bus; each bus's own depth is listed above.",
             self.main_buffer, self.main_buffer
         );
         (total, detail)
@@ -2634,7 +2648,13 @@ impl MixerApp {
                 .iter()
                 .enumerate()
                 .filter(|(_, count)| **count > 0)
-                .map(|(bus, count)| format!("{}={count}", self.buses[bus].name))
+                .map(|(bus, count)| {
+                    format!(
+                        "{}={count} (callback {} frames)",
+                        self.buses[bus].name,
+                        self.audio.callback_frames_for(bus)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
             if detail.is_empty() {
@@ -5667,7 +5687,7 @@ impl MixerApp {
 
             match self.vsts[idx].info.as_ref() {
                 Some(info) => {
-                    let vendor = format!("{} {} · {}", info.vendor, info.version, info.format);
+                    let vendor = format!("{} {} Ã‚Â· {}", info.vendor, info.version, info.format);
                     ui.painter().text(
                         Pos2::new(insert.left() + 5.0, insert.top() + 6.0),
                         Align2::LEFT_TOP,
