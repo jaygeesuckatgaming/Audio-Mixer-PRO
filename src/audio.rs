@@ -20,8 +20,17 @@ pub const DEMO_LEN_SECS: f32 = 252.0;
 /// the bus mix; the secondary device streams consume it at their own rate.
 const BUS_RING_FRAMES: usize = 16_384;
 /// Frames of silence pushed into a bus ring when its stream opens, so the
-/// consumer starts with headroom instead of an immediate underrun.
-const BUS_PREFILL_FRAMES: usize = 1024;
+/// consumer starts with headroom instead of an immediate underrun. Two 256
+/// blocks or one 512 block: the mixer's own catch-up refills the ring after a
+/// stalled block, so this only has to cover callback jitter.
+const BUS_PREFILL_FRAMES: usize = 512;
+/// What the stream callback trims the ring back to when it has grown. It used
+/// to be half the capacity (8192 frames, 170 ms), which never fired in normal
+/// use: a device clock even slightly slower than the mixer's timer let the
+/// queue creep up with uptime, and that is what the latency readout showed as a
+/// growing "output queue". Keeping it just above the prefill holds the queue
+/// near one block plus jitter while still absorbing a late mixer block.
+const BUS_DRAIN_FRAMES: usize = 768;
 /// Longest track this build will hold in memory. The original streams from
 /// disk; this rebuild decodes to RAM, so it stops at 30 minutes with a clear
 /// message instead of failing silently.
@@ -3497,7 +3506,7 @@ where
                     }
                 }
                 for ring in rings.iter_mut() {
-                    let excess = ring.len().saturating_sub(BUS_RING_FRAMES / 2);
+                    let excess = ring.len().saturating_sub(BUS_DRAIN_FRAMES);
                     if excess > 0 {
                         let _ = ring.drain(..excess);
                     }

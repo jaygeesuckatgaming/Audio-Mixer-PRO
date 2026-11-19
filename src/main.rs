@@ -1089,6 +1089,9 @@ struct MixerApp {
     /// even when the person never pressed Save Settings.
     save_on_exit: bool,
     poll_clock: f64,
+    /// Last output-queue depth written to the log, so growth is visible without
+    /// hovering the status bar.
+    last_ring_logged: usize,
     /// In-flight `output_devices()` probe. Enumeration blocks when the audio
     /// service is wedged, so it never runs on the UI thread.
     devices_probe: Option<std::sync::mpsc::Receiver<Vec<String>>>,
@@ -1631,6 +1634,7 @@ impl MixerApp {
             load_on_startup: true,
             save_on_exit: true,
             poll_clock: 0.0,
+            last_ring_logged: 0,
             devices_probe: None,
             inputs_probe: None,
             devices_probe_at: 0.0,
@@ -2627,6 +2631,17 @@ impl MixerApp {
         if late_blocks > 0 || bus_underruns > 0 {
             diag_log(format!(
                 "audio: {late_blocks} late mixer block(s), {bus_underruns} bus underrun(s) in the last second"
+            ));
+        }
+        // The output queue is the term that used to creep upward with uptime;
+        // record it when it moves by more than 10 ms so that is visible in the
+        // log as well as in the tooltip.
+        let ring_frames = self.audio.bus_ring_frames();
+        if ring_frames.abs_diff(self.last_ring_logged) >= 480 {
+            self.last_ring_logged = ring_frames;
+            diag_log(format!(
+                "audio: output queue {ring_frames} frames ({:.1} ms)",
+                ring_frames as f32 / self.sample_rate.max(1) as f32 * 1000.0
             ));
         }
         let (sender, receiver) = std::sync::mpsc::channel();
