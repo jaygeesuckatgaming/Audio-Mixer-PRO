@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::LogFn;
 
-use super::usbip_exe::{run_attach_helper, usbip_available};
+use super::usbip_exe::{reset_cables, run_attach_helper, usbip_available};
 
 const HELPER_TASK_NAME: &str = "Audio Mixer Pro Virtual Cables";
 const HELPER_PORT: u16 = 3241;
@@ -18,6 +18,22 @@ pub struct BrokerClient {
 }
 
 impl BrokerClient {
+    /// Repair a wedged cable: the elevated helper removes this set's device
+    /// nodes before attaching, so Windows cannot hand back the broken one.
+    pub fn reset(&mut self, count: u8) -> Result<(), String> {
+        writeln!(self.writer, "RESET {count}").map_err(|err| err.to_string())?;
+        self.writer.flush().map_err(|err| err.to_string())?;
+        let mut line = String::new();
+        self.reader
+            .read_line(&mut line)
+            .map_err(|err| err.to_string())?;
+        if line.trim() == "OK" {
+            Ok(())
+        } else {
+            Err(format!("Windows cable reset failed: {}", line.trim()))
+        }
+    }
+
     pub fn sync(&mut self, count: u8) -> Result<(), String> {
         writeln!(self.writer, "SYNC {count}").map_err(|err| err.to_string())?;
         self.writer.flush().map_err(|err| err.to_string())?;
@@ -115,7 +131,7 @@ pub fn run_attach_broker(address: &str, token: &str, log: &LogFn) -> Result<(), 
         if fields.len() == 1 && fields[0] == "QUIT" {
             return Ok(());
         }
-        if fields.len() != 2 || fields[0] != "SYNC" {
+        if fields.len() != 2 || (fields[0] != "SYNC" && fields[0] != "RESET") {
             let _ = writeln!(stream, "ERR invalid request");
             continue;
         }
@@ -126,7 +142,11 @@ pub fn run_attach_broker(address: &str, token: &str, log: &LogFn) -> Result<(), 
                 continue;
             }
         };
-        match run_attach_helper(count, log) {
+        match if fields[0] == "RESET" {
+            reset_cables(count, log)
+        } else {
+            run_attach_helper(count, log)
+        } {
             Ok(()) => {
                 let _ = writeln!(stream, "OK");
             }
@@ -264,7 +284,7 @@ fn handle_service_client(mut stream: TcpStream, token: &str, log: &LogFn) -> Res
         if fields.len() == 1 && fields[0] == "QUIT" {
             return Ok(());
         }
-        if fields.len() != 2 || fields[0] != "SYNC" {
+        if fields.len() != 2 || (fields[0] != "SYNC" && fields[0] != "RESET") {
             let _ = writeln!(stream, "ERR invalid request");
             continue;
         }
@@ -275,7 +295,11 @@ fn handle_service_client(mut stream: TcpStream, token: &str, log: &LogFn) -> Res
                 continue;
             }
         };
-        match run_attach_helper(count, log) {
+        match if fields[0] == "RESET" {
+            reset_cables(count, log)
+        } else {
+            run_attach_helper(count, log)
+        } {
             Ok(()) => {
                 let _ = writeln!(stream, "OK");
             }
@@ -366,11 +390,35 @@ pub fn refresh_helper_copy() -> Result<(), String> {
     let helper = helper_exe_path().ok_or_else(|| "LOCALAPPDATA is not set".to_string())?;
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
     let _ = run_schtasks(&["/End", "/TN", HELPER_TASK_NAME]);
-    std::thread::sleep(Duration::from_millis(600));
     if let Some(dir) = helper.parent() {
         fs::create_dir_all(dir).map_err(|err| err.to_string())?;
     }
-    fs::copy(&exe, &helper).map_err(|err| format!("could not refresh the helper: {err}"))?;
+    // The copy is the image a running helper executes, so /End has to actually
+    // finish before it can be replaced; a fixed delay was not enough and the
+    // refresh silently failed while the old helper kept serving.
+    let mut copied = false;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(200));
+        if fs::copy(&exe, &helper).is_ok() {
+            copied = true;
+            break;
+        }
+    }
+    if !copied {
+        // Windows lets a running image be renamed even though it cannot be
+        // overwritten, so park it and put the new build in its place.
+        let retired = helper.with_file_name("attach_helper.old.exe");
+        let _ = fs::remove_file(&retired);
+        if fs::rename(&helper, &retired).is_ok() {
+            fs::copy(&exe, &helper)
+                .map_err(|err| format!("could not refresh the helper: {err}"))?;
+            let _ = fs::remove_file(&retired);
+            copied = true;
+        }
+    }
+    if !copied {
+        return Err("the running helper kept its file locked".to_string());
+    }
     start_helper_task()
 }
 

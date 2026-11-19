@@ -115,6 +115,20 @@ pub fn detach_own_ports(executable: &PathBuf, log: &LogFn) {
 }
 
 pub fn run_attach_helper(count: u8, log: &LogFn) -> Result<(), String> {
+    attach_cycle(count, false, log)
+}
+
+/// Repair path behind the CABLES panel's Reattach button. Detaching and
+/// re-attaching alone is not enough when Windows hands the same device node
+/// back for a wedged endpoint: the audio side then stays unopenable while PnP
+/// reports the device as fine (measured: `Speakers (USB Cable 01)` remained
+/// unopenable for every client until its node was removed). Removing the
+/// cable's nodes first forces the attach to build fresh ones.
+pub fn reset_cables(count: u8, log: &LogFn) -> Result<(), String> {
+    attach_cycle(count, true, log)
+}
+
+fn attach_cycle(count: u8, clean: bool, log: &LogFn) -> Result<(), String> {
     if !(1..=32).contains(&count) {
         return Err(format!("invalid cable count {count}"));
     }
@@ -144,6 +158,12 @@ pub fn run_attach_helper(count: u8, log: &LogFn) -> Result<(), String> {
     }
 
     detach_own_ports(&executable, log);
+    if clean {
+        remove_device_nodes(count, log);
+        // Let the PnP manager finish removing the nodes before the attach
+        // asks for new ones.
+        sleep(Duration::from_millis(400));
+    }
     for number in 1..=count {
         let bus_id = format!("1-{number}");
         run(
@@ -157,4 +177,49 @@ pub fn run_attach_helper(count: u8, log: &LogFn) -> Result<(), String> {
         "Windows device synchronization completed for {count} cable(s)"
     ));
     Ok(())
+}
+
+/// Remove this set's USB device nodes, present and ghosted. `pnputil` needs an
+/// exact instance id, so PowerShell enumerates them (`Get-PnpDevice` includes
+/// non-present devices) and removes each one; the elevated helper owns this
+/// step because device removal is privileged.
+fn remove_device_nodes(count: u8, log: &LogFn) {
+    let patterns = (1..=count)
+        .map(|number| format!("'USB\\VID_FFFF&PID_CA{number:02}&MI_00*'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$p = @({patterns}); \
+         Get-PnpDevice -ErrorAction SilentlyContinue | \
+         Where-Object {{ $id = $_.InstanceId; $p | Where-Object {{ $id -like $_ }} }} | \
+         ForEach-Object {{ pnputil /remove-device $_.InstanceId | Out-Null }}"
+    );
+    log(format!(
+        "Removing previous device nodes for {count} cable(s) before attaching"
+    ));
+    match Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            log("Previous cable device nodes removed".to_string());
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let message = stderr.trim();
+            log(if message.is_empty() {
+                "Device cleanup finished with a non-zero exit".to_string()
+            } else {
+                format!("Device cleanup reported: {message}")
+            });
+        }
+        Err(err) => log(format!("Could not run the device cleanup: {err}")),
+    }
 }

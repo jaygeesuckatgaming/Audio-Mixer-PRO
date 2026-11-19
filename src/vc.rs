@@ -413,7 +413,7 @@ fn worker_loop(
         match command {
             Command::Start(cfg) => worker.start(cfg, &status, &log, &devices),
             Command::Stop => worker.stop(&status, &devices),
-            Command::Reattach => worker.attach(&status, &log),
+            Command::Reattach => worker.attach(&status, &log, true),
             Command::InstallHelper => worker.install_helper(&status, &log),
             Command::RemoveHelper => worker.remove_helper(&status, &log),
             Command::Quit => break,
@@ -484,10 +484,10 @@ impl Worker {
             false,
             format!("listening; attaching {} cable(s)...", self.cfg.cables),
         );
-        self.attach(status, log);
+        self.attach(status, log, false);
     }
 
-    fn attach(&mut self, status: &Arc<Mutex<Status>>, log: &Arc<Mutex<VecDeque<String>>>) {
+    fn attach(&mut self, status: &Arc<Mutex<Status>>, log: &Arc<Mutex<VecDeque<String>>>, clean: bool) {
         if self.handle.is_none() {
             set_status(status, false, false, "not running".to_string());
             return;
@@ -580,7 +580,7 @@ impl Worker {
         let helper = virtual_cables::win::helper_running();
         status.lock().unwrap().helper = helper;
         if let Some(broker) = self.broker.as_mut() {
-            match broker.sync(self.cfg.cables) {
+            match if clean { broker.reset(self.cfg.cables) } else { broker.sync(self.cfg.cables) } {
                 Ok(()) => set_status(
                     status,
                     true,
@@ -625,7 +625,7 @@ impl Worker {
                     self.broker = Some(broker);
                     status.lock().unwrap().helper = true;
                     if self.handle.is_some() {
-                        self.attach(status, log);
+                        self.attach(status, log, false);
                     } else {
                         set_status(
                             status,
