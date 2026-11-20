@@ -6724,8 +6724,12 @@ impl MixerApp {
             },
             latency_ms
         );
+        // Monospaced so the padded columns are also equal *widths*: in the
+        // proportional face a "1" is narrower than an "8", so a constant
+        // character count still changed the panel width as the digits changed.
+        let status_font = FontId::monospace(7.0);
         let tw = p
-            .layout_no_wrap(engine_text.clone(), FontId::proportional(7.0), DIM)
+            .layout_no_wrap(engine_text.clone(), status_font.clone(), DIM)
             .size()
             .x;
         let backdrop = Rect::from_min_max(
@@ -6737,7 +6741,7 @@ impl MixerApp {
             Pos2::new(bar.right() - 6.0, bar.center().y),
             Align2::RIGHT_CENTER,
             engine_text,
-            FontId::proportional(7.0),
+            status_font.clone(),
             DIM,
         );
         // The latency figure is painted text, so it had no widget to hover:
@@ -6745,7 +6749,7 @@ impl MixerApp {
         // breakdown on that.
         let latency_text = format!("latency ~{latency_ms:>4.0} ms");
         let latency_w = p
-            .layout_no_wrap(latency_text, FontId::proportional(7.0), DIM)
+            .layout_no_wrap(latency_text, status_font, DIM)
             .size()
             .x;
         let latency_rect = Rect::from_min_size(
