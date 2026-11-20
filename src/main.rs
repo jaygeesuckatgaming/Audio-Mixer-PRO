@@ -1094,6 +1094,10 @@ struct MixerApp {
     /// Last measured width of the status line, so a change can be logged instead
     /// of guessed at.
     last_status_width: f32,
+    /// Latency shown in the status bar, refreshed once a second.
+    latency_ms_shown: f64,
+    latency_detail_shown: String,
+    latency_tick: f64,
     /// Last output-queue depth written to the log, so growth is visible without
     /// hovering the status bar.
     last_ring_logged: usize,
@@ -1641,6 +1645,9 @@ impl MixerApp {
             poll_clock: 0.0,
             last_groups: String::new(),
             last_status_width: -1.0,
+            latency_ms_shown: 0.0,
+            latency_detail_shown: String::new(),
+            latency_tick: 1.0,
             last_ring_logged: 0,
             devices_probe: None,
             inputs_probe: None,
@@ -1903,7 +1910,7 @@ impl MixerApp {
                 )
             })
             .collect::<Vec<_>>()
-            .join(", ");
+            .join("\n");
         let mut vst_ms = 0.0;
         let mut vst_count = 0usize;
         for slot in self.vsts.iter().take(self.active_strips) {
@@ -1916,7 +1923,7 @@ impl MixerApp {
         }
         let total = input_ms + block_ms + ring_ms + output_ms + vst_ms;
         let detail = format!(
-            "Estimated insert latency\ninput backlog {input_ms:.1} ms ({backlog_frames} frames, measured)\nmixer block {block_ms:.1} ms ({} frames)\noutput queue {ring_ms:.1} ms ({ring_frames} frames, monitoring bus)\noutput request {output_ms:.1} ms ({} frames, shared mode may round it up)\nplug-in latency {vst_ms:.1} ms across {vst_count} insert(s), not compensated\ntotal {total:.1} ms\n\nEvery bus ring right now: {per_bus}\n\nThe output queue is the cushion that absorbs a burst such as launching another\napp. A CPU spike also shows up in the input backlog; it is now slipped back to\nthe target over a few seconds instead of staying where it landed. The total\nfollows the monitoring bus; each bus's own depth is listed above.",
+            "Estimated insert latency\ninput backlog {input_ms:.1} ms ({backlog_frames} frames, measured)\nmixer block {block_ms:.1} ms ({} frames)\noutput queue {ring_ms:.1} ms ({ring_frames} frames, monitoring bus)\noutput request {output_ms:.1} ms ({} frames, shared mode may round it up)\nplug-in latency {vst_ms:.1} ms across {vst_count} insert(s), not compensated\ntotal {total:.1} ms\n\nEvery bus ring right now:\n{per_bus}\n\nThe output queue is the cushion that absorbs a burst such as launching another\napp. A CPU spike also shows up in the input backlog; it is now slipped back to\nthe target over a few seconds instead of staying where it landed. The total\nfollows the monitoring bus; each bus's own depth is listed above.",
             self.main_buffer, self.main_buffer
         );
         (total, detail)
@@ -5701,7 +5708,7 @@ impl MixerApp {
 
             match self.vsts[idx].info.as_ref() {
                 Some(info) => {
-                    let vendor = format!("{} {} ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}", info.vendor, info.version, info.format);
+                    let vendor = format!("{} {} ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}", info.vendor, info.version, info.format);
                     ui.painter().text(
                         Pos2::new(insert.left() + 5.0, insert.top() + 6.0),
                         Align2::LEFT_TOP,
@@ -6710,7 +6717,19 @@ impl MixerApp {
                 }
             }
         }
-        let (latency_ms, latency_detail) = self.latency_report();
+        // Refresh the readout once a second instead of every frame: the measured
+        // value jitters by a millisecond or two continuously, which reads as the
+        // whole line twitching. The tooltip is refreshed on the same tick so the
+        // two never disagree.
+        self.latency_tick += ui.ctx().input(|i| i.stable_dt).min(0.1) as f64;
+        if self.latency_tick >= 1.0 || self.latency_detail_shown.is_empty() {
+            self.latency_tick = 0.0;
+            let (ms, detail) = self.latency_report();
+            self.latency_ms_shown = ms;
+            self.latency_detail_shown = detail;
+        }
+        let latency_ms = self.latency_ms_shown;
+        let latency_detail = self.latency_detail_shown.clone();
         // Fixed-width fields. The backdrop is sized from this text, so any change
         // in digit count or in STOPPED/PLAYING/RECORDING used to resize it every
         // few seconds; padding makes the string the same length in every state.
@@ -6765,7 +6784,13 @@ impl MixerApp {
             Vec2::new(latency_w + 6.0, bar.height()),
         );
         let latency_resp = ui.interact(latency_rect, Id::new("status_latency"), Sense::hover());
-        let _ = latency_resp.on_hover_text(latency_detail);
+        // A fixed maximum width: the bus list and the live millisecond values
+        // used to make this floating box grow and shrink on every update, which
+        // read as "the window is resizing". Wrapped text at a set width cannot.
+        let _ = latency_resp.on_hover_ui(|ui| {
+            ui.set_max_width(340.0);
+            ui.label(latency_detail);
+        });
     }
 
     fn on_transport(&mut self, t: Transport) {
