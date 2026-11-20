@@ -1091,6 +1091,9 @@ struct MixerApp {
     poll_clock: f64,
     /// Last set of output groups written to the log.
     last_groups: String,
+    /// Last measured width of the status line, so a change can be logged instead
+    /// of guessed at.
+    last_status_width: f32,
     /// Last output-queue depth written to the log, so growth is visible without
     /// hovering the status bar.
     last_ring_logged: usize,
@@ -1637,6 +1640,7 @@ impl MixerApp {
             save_on_exit: true,
             poll_clock: 0.0,
             last_groups: String::new(),
+            last_status_width: -1.0,
             last_ring_logged: 0,
             devices_probe: None,
             inputs_probe: None,
@@ -5697,7 +5701,7 @@ impl MixerApp {
 
             match self.vsts[idx].info.as_ref() {
                 Some(info) => {
-                    let vendor = format!("{} {} ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}", info.vendor, info.version, info.format);
+                    let vendor = format!("{} {} ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}", info.vendor, info.version, info.format);
                     ui.painter().text(
                         Pos2::new(insert.left() + 5.0, insert.top() + 6.0),
                         Align2::LEFT_TOP,
@@ -6732,6 +6736,10 @@ impl MixerApp {
             .layout_no_wrap(engine_text.clone(), status_font.clone(), DIM)
             .size()
             .x;
+        if (tw - self.last_status_width).abs() > 0.25 {
+            diag_log(format!("status: width {tw:.2} text={engine_text}"));
+            self.last_status_width = tw;
+        }
         let backdrop = Rect::from_min_max(
             Pos2::new(bar.right() - tw - 10.0, bar.top() + 1.0),
             Pos2::new(bar.right() - 2.0, bar.bottom() - 1.0),
