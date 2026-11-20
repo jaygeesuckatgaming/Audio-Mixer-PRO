@@ -5708,7 +5708,7 @@ impl MixerApp {
 
             match self.vsts[idx].info.as_ref() {
                 Some(info) => {
-                    let vendor = format!("{} {} ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}", info.vendor, info.version, info.format);
+                    let vendor = format!("{} {} ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· {}", info.vendor, info.version, info.format);
                     ui.painter().text(
                         Pos2::new(insert.left() + 5.0, insert.top() + 6.0),
                         Align2::LEFT_TOP,
@@ -9010,6 +9010,7 @@ impl eframe::App for MixerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        UI_HEARTBEAT_MS.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
         if self.first_frame {
             self.first_frame = false;
             if self.shot_path.is_some() {
@@ -10549,10 +10550,54 @@ fn install_panic_log() {
     }));
 }
 
+/// Milliseconds since the epoch.
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Last time the UI painted, in epoch milliseconds. A watchdog thread reads this
+/// so a frozen window leaves a record in the log while it is still frozen; when
+/// the window is stuck inside the GL driver the audio threads keep running, so
+/// the log is the only way to tell what happened.
+static UI_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn main() -> eframe::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     install_panic_log();
     diag_log("main: entry");
+    // Watchdog: a frame that never returns still has working audio threads, so
+    // record the stall while it is happening. Measured cause of one such stall:
+    // the UI thread inside nvoglv64 waiting on vertical blank from SwapBuffers.
+    std::thread::spawn(|| {
+        let mut last_report = 0u64;
+        let mut stalled = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            let heartbeat = UI_HEARTBEAT_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if heartbeat == 0 {
+                continue;
+            }
+            let now = epoch_ms();
+            let gap = now.saturating_sub(heartbeat);
+            if gap > 2_500 {
+                if now.saturating_sub(last_report) > 5_000 {
+                    diag_log(format!(
+                        "ui: no frame for {:.1} s (window is not painting; audio continues)",
+                        gap as f64 / 1000.0
+                    ));
+                    last_report = now;
+                }
+                stalled = true;
+            } else if stalled {
+                diag_log("ui: frames resumed");
+                stalled = false;
+                last_report = 0;
+            }
+        }
+    });
     // Child-process VST3 scanner (see vst::start_scan). It only reads plug-in
     // metadata and writes a report, so a bad plug-in cannot hurt the console.
     if let Some(position) = raw_args.iter().position(|arg| arg == "--vst-scan-json") {
@@ -11023,6 +11068,11 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
+        // Do not wait for vertical blank. The UI thread was captured blocked in
+        // nvoglv64 -> SwapBuffers -> NtGdiDdDDIWaitForVerticalBlankEvent while the
+        // audio threads kept running, which freezes the window with sound still
+        // playing. Frame pacing comes from request_repaint_after(16 ms) instead.
+        vsync: false,
         ..Default::default()
     };
 
