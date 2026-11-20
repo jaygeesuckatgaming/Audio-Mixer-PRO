@@ -43,11 +43,6 @@ const BUS_DRAIN_FRAMES: usize = 2048;
 /// 1024 and with 1792 frames. Six callbacks of cushion, 60 ms, is fine for an
 /// app feed; the status bar follows the monitoring bus, not this one.
 const USB_CABLE_CUSHION_FRAMES: usize = 2048;
-/// The mixer renders a block early when any active bus ring falls below this.
-/// It ties production to what the devices are actually consuming, so a burst of
-/// callbacks (or a device running slightly faster than the timer) cannot drain a
-/// ring to zero.
-const MIX_LOW_WATER: usize = 2048;
 
 /// Ring depth the callback keeps queued for this endpoint.
 fn bus_cushion_frames(device: &str) -> usize {
@@ -3466,19 +3461,8 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
 
     let mut next = std::time::Instant::now();
     loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
         let now = std::time::Instant::now();
-        // Render early when an active bus ring is short. The devices ask for
-        // 480-frame callbacks every ~10 ms while this loop produces 512 every
-        // 10.67 ms, and a burst of callbacks can empty a ring before the next
-        // tick. Serving the demand directly ties production to consumption.
-        let short = (0..MAX_BUSES).any(|bus| {
-            shared.bus_out_active[bus].load(Ordering::Relaxed)
-                && lock_source(&shared.bus_out_rings[bus]).len() < MIX_LOW_WATER
-        });
-        if next > now && !short {
+        if next > now {
             let wait = next - now;
             #[cfg(windows)]
             match &timer {
@@ -3487,18 +3471,12 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
             }
             #[cfg(not(windows))]
             std::thread::sleep(wait);
-            // Re-check: a ring may have gone short while waiting.
-            continue;
         }
-        // Only an on-time block advances the schedule. An early block (rendered
-        // because a ring was short) must leave the deadline where it is:
-        // otherwise a few early renders push it a period into the future and the
-        // loop sleeps while the rings drain, which starved every bus.
-        let on_time = now >= next;
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         dsp.render(&mut buffer, 2, &shared);
-        if on_time {
-            next += period;
-        }
+        next += period;
         let now = std::time::Instant::now();
         if next < now {
             // The block was produced after its play time had passed: the bus
@@ -3600,9 +3578,8 @@ where
     let output_rate = config.sample_rate.0 as f32;
     let error_shared = shared.clone();
     // Carried across callbacks: the last sample keeps a starving callback from
-    // dropping to zero, and the fade smooths the transition in both directions.
+    // dropping to zero.
     let mut last = (0.0f32, 0.0f32);
-    let mut fade = 1.0f32;
     device
         .build_output_stream(
             config,
@@ -3644,25 +3621,19 @@ where
                 let step = base_step;
                 let mut accumulator = 0.0f32;
                 let mut starved = false;
-                // About 1.3 ms at 48 kHz: long enough to avoid a step, short
-                // enough to be inaudible.
-                const FADE_STEP: f32 = 1.0 / 64.0;
                 for frame in data.chunks_mut(channels) {
                     accumulator += step;
-                    let mut gap = false;
                     while accumulator >= 1.0 {
                         if rings.iter().any(|ring| ring.is_empty()) {
                             if !starved {
                                 // Count once per callback: the mixer owed audio
-                                // here. The gap is faded out and back in rather
-                                // than filled with a held or zero sample; either
-                                // of those is a step in the waveform, which is
-                                // what this click was.
+                                // here. The previous sample is held rather than
+                                // dropping to zero, so the gap is not a step in
+                                // the waveform.
                                 starved = true;
                                 let owner = buses.first().copied().unwrap_or(0);
                                 shared.bus_underruns[owner].fetch_add(1, Ordering::Relaxed);
                             }
-                            gap = true;
                             accumulator = 0.0;
                             break;
                         }
@@ -3674,20 +3645,13 @@ where
                             }
                         }
                         last = (mixed.0.clamp(-1.0, 1.0), mixed.1.clamp(-1.0, 1.0));
-                        if fade < 1.0 {
-                            fade = (fade + FADE_STEP).min(1.0);
-                        }
                         accumulator -= 1.0;
                     }
-                    if gap {
-                        fade = (fade - FADE_STEP).max(0.0);
-                    }
-                    let (l, r) = (last.0 * fade, last.1 * fade);
                     if channels == 1 {
-                        frame[0] = T::from_sample((l + r) * 0.5);
+                        frame[0] = T::from_sample((last.0 + last.1) * 0.5);
                     } else {
-                        frame[0] = T::from_sample(l);
-                        frame[1] = T::from_sample(r);
+                        frame[0] = T::from_sample(last.0);
+                        frame[1] = T::from_sample(last.1);
                         for sample in frame.iter_mut().skip(2) {
                             *sample = T::from_sample(0.0f32);
                         }
