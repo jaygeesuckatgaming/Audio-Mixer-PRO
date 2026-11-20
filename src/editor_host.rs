@@ -21,13 +21,13 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetWindowLongPtrW, IsIconic, PeekMessageW, RegisterClassExW,
+    GetAncestor, GetClientRect, GetWindowLongPtrW, IsIconic, PeekMessageW, RegisterClassExW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE, SW_SHOW,
-    WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE, WM_ENTERMENULOOP, WM_EXITMENULOOP, WM_KILLFOCUS,
-    WM_NCRBUTTONDOWN, WM_SETFOCUS, WM_SYSCOMMAND, WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
-    WS_THICKFRAME,
+    CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, PM_NOREMOVE,
+    PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    SW_RESTORE, SW_SHOW, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CLOSE, WM_ENTERMENULOOP, WM_EXITMENULOOP,
+    WM_KILLFOCUS, WM_NCRBUTTONDOWN, WM_SETFOCUS, WM_SYSCOMMAND, WNDCLASSEXW, WS_MAXIMIZEBOX,
+    WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 
 const CLASS_NAME: &str = "MusicRemoverEditorHost";
@@ -294,7 +294,7 @@ impl EditorHost {
     /// loses is simply retried next frame.
     /// Keep keyboard focus on the plug-in's child window. It starts on our host
     /// window, and VSTGUI/other editors only run their idle timers when their
-    /// own window has focus — which is why a right-click on the title bar used
+    /// own window has focus â€” which is why a right-click on the title bar used
     /// to bring the meters to life.
     fn ensure_child_focus(&mut self) {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
@@ -567,12 +567,31 @@ impl EditorHost {
     /// hands a timer message out when the queue is otherwise empty. Our own
     /// event loop keeps the queue busy, so editors sat there with dead meters
     /// until something forced a modal loop (right-clicking the title bar).
-    /// The caller must not hold the VST slot lock: draining the queue pumps
-    /// audio-thread work through this thread.
-    pub fn pump_messages() {
+    ///
+    /// Only messages destined for this editor window (or its children) are
+    /// drained. Draining the whole thread queue also dispatched messages for
+    /// the mixer's own OpenGL window from inside `update()`, re-entering
+    /// painting through `wglWndProc -> SwapBuffers`: with vsync on that blocked
+    /// on vertical blank, and with vsync off it recycled messages and spun a
+    /// core while the mixer stopped painting. A message for another window is
+    /// left in the queue for winit to handle.
+    pub fn pump_messages(root: isize) {
+        if root == 0 {
+            return;
+        }
+        let root = root as HWND;
         let mut msg: MSG = unsafe { std::mem::zeroed() };
         unsafe {
-            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            loop {
+                if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE) == 0 {
+                    break;
+                }
+                if GetAncestor(msg.hwnd, GA_ROOT) != root {
+                    break;
+                }
+                if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) == 0 {
+                    break;
+                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }

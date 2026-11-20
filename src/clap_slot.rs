@@ -1,7 +1,7 @@
 //! CLAP hosting.
 //!
 //! P1: enumerate a `.clap` library, instantiate one plug-in, activate it and
-//! process audio. The lifecycle here is single-threaded on purpose — it is the
+//! process audio. The lifecycle here is single-threaded on purpose â€” it is the
 //! same sequence the mixer will run across its two threads (instance on the UI
 //! thread, audio processor on the render thread).
 
@@ -487,7 +487,7 @@ pub fn gui_selftest(path: &Path) -> SelftestReport {
     // Pump this thread's queue so the plug-in's window actually paints.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
-        crate::host_window::pump_messages();
+        crate::host_window::pump_messages(window.hwnd());
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
     // Capture before tearing down, so the GUI can be inspected.

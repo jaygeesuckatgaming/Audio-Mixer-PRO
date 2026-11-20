@@ -417,9 +417,15 @@ impl VstChain {
     pub fn service_editor(&self) {
         // Queue drain happens before the slot lock is taken: doing it while the
         // lock is held starves the audio callback (measured ~3% of blocks
-        // passing through dry).
+        // passing through dry). Only this editor's window is pumped.
         if self.editor_open.load(Ordering::Relaxed) {
-            crate::editor_host::EditorHost::pump_messages();
+            let hwnd = self
+                .inner
+                .lock()
+                .ok()
+                .and_then(|inner| inner.editor.as_ref().map(|window| window.0.hwnd()))
+                .unwrap_or(0);
+            crate::editor_host::EditorHost::pump_messages(hwnd);
         }
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,

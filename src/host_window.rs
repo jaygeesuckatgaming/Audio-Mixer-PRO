@@ -8,11 +8,11 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetWindowLongPtrW, IsIconic, PeekMessageW, RegisterClassExW,
+    GetAncestor, GetClientRect, GetWindowLongPtrW, IsIconic, PeekMessageW, RegisterClassExW,
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, SW_SHOW, WM_CLOSE,
-    WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    CS_VREDRAW, CW_USEDEFAULT, GA_ROOT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, PM_NOREMOVE,
+    PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
+    SW_SHOW, WM_CLOSE, WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 
 const CLASS_NAME: &str = "MusicRemoverHostWindow";
@@ -250,14 +250,30 @@ impl Drop for HostWindow {
     }
 }
 
-/// Drain this thread's message queue.
+/// Drain messages destined for this host window (and its children).
 ///
 /// Plug-in GUIs paint and animate from window messages, and a host that never
-/// dispatches them leaves the window blank or frozen.
-pub fn pump_messages() {
+/// dispatches them leaves the window blank or frozen. Only this window's
+/// messages are dispatched: draining the whole thread queue also fed messages
+/// to the mixer's own OpenGL window from inside `update()`, re-entering
+/// painting through `wglWndProc -> SwapBuffers`, which froze or spun the mixer.
+pub fn pump_messages(root: isize) {
+    if root == 0 {
+        return;
+    }
+    let root = root as HWND;
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     unsafe {
-        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+        loop {
+            if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE) == 0 {
+                break;
+            }
+            if GetAncestor(msg.hwnd, GA_ROOT) != root {
+                break;
+            }
+            if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) == 0 {
+                break;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

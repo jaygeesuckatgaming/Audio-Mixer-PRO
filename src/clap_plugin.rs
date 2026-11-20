@@ -560,27 +560,27 @@ impl ClapSlot {
         if !self.gui_open.load(Ordering::Relaxed) {
             return;
         }
-        let Ok(mut slot) = self.main.lock() else {
-            return;
-        };
-        let Some(main) = slot.as_mut() else {
-            return;
-        };
-        let Some(window) = main.window.as_mut() else {
-            return;
-        };
-        if window.is_closed() {
-            drop(window);
-            main.window = None;
-            main.gui_created = false;
-            self.gui_open.store(false, Ordering::Relaxed);
-            {
-                let mut handle = main.instance.plugin_handle();
-                if let Some(gui) = handle.get_extension::<PluginGui>() {
-                    gui.destroy(&handle);
-                }
+        // Take the handle, release the lock, then pump only this window. The
+        // plug-in GUI had no pump of its own (it relied on the VST slot draining
+        // the whole thread queue), and that queue drain re-entered the mixer's
+        // own GL window from inside update().
+        let (hwnd, closed) = {
+            let Ok(slot) = self.main.lock() else {
+                return;
+            };
+            let Some(main) = slot.as_ref() else {
+                return;
+            };
+            match main.window.as_ref() {
+                Some(window) => (window.hwnd(), window.is_closed()),
+                None => return,
             }
+        };
+        if closed {
+            self.close_editor();
+            return;
         }
+        crate::host_window::pump_messages(hwnd);
     }
 
     pub fn editor_is_open(&self) -> bool {
