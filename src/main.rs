@@ -6707,8 +6707,11 @@ impl MixerApp {
             }
         }
         let (latency_ms, latency_detail) = self.latency_report();
+        // Fixed-width fields. The backdrop is sized from this text, so any change
+        // in digit count or in STOPPED/PLAYING/RECORDING used to resize it every
+        // few seconds; padding makes the string the same length in every state.
         let engine_text = format!(
-            "{} kHz  |  buffer {}  |  engine {}  |  {}  |  latency ~{:.0} ms",
+            "{:>5.1} kHz  |  buffer {:>4}  |  engine {:<6}  |  {:<9}  |  latency ~{:>4.0} ms",
             self.sample_rate as f32 / 1000.0,
             self.buffer,
             if self.engine_mode == 0 { "Normal" } else { "Swift" },
@@ -6740,7 +6743,7 @@ impl MixerApp {
         // The latency figure is painted text, so it had no widget to hover:
         // give it an invisible interact rect right over the phrase and hang the
         // breakdown on that.
-        let latency_text = format!("latency ~{latency_ms:.0} ms");
+        let latency_text = format!("latency ~{latency_ms:>4.0} ms");
         let latency_w = p
             .layout_no_wrap(latency_text, FontId::proportional(7.0), DIM)
             .size()
