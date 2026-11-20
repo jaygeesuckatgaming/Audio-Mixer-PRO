@@ -2661,6 +2661,19 @@ impl MixerApp {
         // turns "it glitched when app X started" into a log line that names the
         // cause: a late mixer block (scheduling) or a dry bus ring (output).
         let (late_blocks, bus_underruns) = self.audio.take_stream_stats();
+        // A plug-in block that had to pass dry (slot busy) is an audible switch
+        // between processed and unprocessed audio, so it belongs in the log.
+        let dry_blocks: u64 = self
+            .vsts
+            .iter()
+            .take(self.active_strips)
+            .map(|slot| slot.chain.take_dry_blocks())
+            .sum();
+        if dry_blocks > 0 {
+            diag_log(format!(
+                "audio: {dry_blocks} plug-in block(s) passed dry in the last second"
+            ));
+        }
         let underrun_total: u64 = bus_underruns.iter().sum();
         if late_blocks > 0 || underrun_total > 0 {
             let detail = bus_underruns

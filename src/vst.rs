@@ -206,6 +206,26 @@ pub struct VstChain {
     in_peak: AtomicU32,
 }
 
+/// Take a mutex for up to `budget`, spinning briefly. The audio path uses this so
+/// a UI frame lock (microseconds) never becomes a dry block, while a genuinely
+/// long hold (plug-in load, state restore) still falls back instead of stalling
+/// the mixer for its whole duration.
+fn lock_briefly<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    budget: std::time::Duration,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Ok(guard) = mutex.try_lock() {
+            return Some(guard);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::hint::spin_loop();
+    }
+}
+
 impl VstChain {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -277,6 +297,11 @@ impl VstChain {
     }
 
     /// Processing latency the plug-in reports (samples) and its tail length.
+    /// Dry blocks (plug-in skipped) since the previous call.
+    pub fn take_dry_blocks(&self) -> u64 {
+        self.dry_blocks.swap(0, Ordering::Relaxed)
+    }
+
     pub fn latency(&self) -> (u32, u32) {
         self.inner
             .lock()
@@ -634,9 +659,14 @@ impl VstChain {
         if frames == 0 {
             return false;
         }
-        // Never block the real-time callback behind the editor or a plug-in
-        // load. A busy slot passes dry audio for this block.
-        let Ok(mut inner) = self.inner.try_lock() else {
+        // Wait briefly for the slot instead of skipping the plug-in. The UI takes
+        // this lock every frame to service the editor, and `try_lock` then passed
+        // dry audio for that block: switching between processed and dry signal is
+        // a click, and with a plug-in loaded it happened continuously. A UI frame
+        // lock lasts microseconds; a genuinely long hold (plug-in load, state
+        // restore) still falls back to dry after the budget instead of stalling
+        // the mixer for its whole duration.
+        let Some(mut inner) = lock_briefly(&self.inner, std::time::Duration::from_millis(2)) else {
             self.dry_blocks.fetch_add(1, Ordering::Relaxed);
             return false;
         };

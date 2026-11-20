@@ -116,6 +116,14 @@ impl PlugIn {
         }
     }
 
+    /// Dry blocks since the previous call, over all slots.
+    pub fn take_dry_blocks(&self) -> u64 {
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.take_dry_blocks(),
+            Backend::Clap(_) => 0,
+        }
+    }
+
     pub fn latency(&self) -> (u32, u32) {
         match &*self.backend() {
             Backend::Vst3(chain) => chain.latency(),
