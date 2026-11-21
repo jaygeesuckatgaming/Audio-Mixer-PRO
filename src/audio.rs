@@ -678,6 +678,9 @@ struct Shared {
     /// application's audio as it reaches the driver, with no second engine
     /// stream and no second clock.
     tap_inputs: [Mutex<Option<Arc<Device>>>; MAX_STRIPS],
+    /// Frames each tap delivered since the last report, for the once-a-second
+    /// line that proves whether the tap is keeping up.
+    tap_frames: [AtomicU64; MAX_STRIPS],
     /// A1/A2/A3 output rings. The internal mixer writes each bus mix here and
     /// the per-bus output streams replay it on their own devices.
     bus_out_rings: [Mutex<VecDeque<(f32, f32)>>; MAX_BUSES],
@@ -779,6 +782,7 @@ impl Shared {
             bus_eq_gain: std::array::from_fn(|_| std::array::from_fn(|_| f32_atomic(0.0))),
             virtual_outputs: Mutex::new([None, None]),
             tap_inputs: std::array::from_fn(|_| Mutex::new(None)),
+            tap_frames: std::array::from_fn(|_| AtomicU64::new(0)),
             bus_out_rings: std::array::from_fn(|_| {
                 Mutex::new(VecDeque::with_capacity(BUS_RING_FRAMES))
             }),
@@ -1898,6 +1902,22 @@ impl AudioEngine {
             self.shared.mixer_late.swap(0, Ordering::Relaxed),
             std::array::from_fn(|bus| self.shared.bus_underruns[bus].swap(0, Ordering::Relaxed)),
         )
+    }
+
+    /// Frames each strip's direct tap delivered since the last call.
+    pub fn take_tap_frames(&self) -> [u64; MAX_STRIPS] {
+        std::array::from_fn(|strip| self.shared.tap_frames[strip].swap(0, Ordering::Relaxed))
+    }
+
+    /// Frames currently queued for a strip's reader.
+    pub fn strip_fill_frames(&self, strip: usize) -> usize {
+        self.shared
+            .inputs
+            .lock()
+            .ok()
+            .and_then(|inputs| inputs.get(strip).cloned().flatten())
+            .and_then(|input| input.ring.lock().ok().map(|ring| ring.fill()))
+            .unwrap_or(0)
     }
 
     /// Frames each bus had to fill by holding the last sample since the previous
@@ -3638,9 +3658,9 @@ fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
         }
         input.peak.store(peak.to_bits(), Ordering::Relaxed);
         input.rate.store(rate.max(1), Ordering::Relaxed);
-        input
-            .frames
-            .fetch_add(whole / frame_bytes, Ordering::Relaxed);
+        let frames = whole / frame_bytes;
+        input.frames.fetch_add(frames, Ordering::Relaxed);
+        shared.tap_frames[strip].fetch_add(frames as u64, Ordering::Relaxed);
     }
 }
 

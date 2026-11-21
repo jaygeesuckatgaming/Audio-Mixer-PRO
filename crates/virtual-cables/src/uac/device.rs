@@ -93,6 +93,9 @@ pub struct Device {
     /// virtual input driver handing its buffer to the mixer.
     tap: Ring,
     tap_enabled: AtomicBool,
+    /// Bytes per frame of the playback stream, so the tap only ever writes or
+    /// drops whole frames.
+    tap_frame_bytes: AtomicUsize,
     state: Mutex<State>,
 }
 
@@ -145,6 +148,7 @@ impl Device {
             inject_ms,
             tap: Ring::new(tap_capacity),
             tap_enabled: AtomicBool::new(false),
+            tap_frame_bytes: AtomicUsize::new(8),
             state: Mutex::new(State {
                 configuration: 0,
                 alt_setting: [0; 3],
@@ -503,8 +507,21 @@ impl Device {
         if self.tap_enabled.load(Ordering::Relaxed) {
             // Copy the incoming PCM before any loopback/resample handling: the
             // strip wants what the application just played, at the playback
-            // format, with no extra delay.
-            self.tap.write(p);
+            // format, with no extra delay. Everything here is frame-aligned:
+            // dropping an odd number of bytes would shift every later stereo
+            // frame and turn the tap into noise.
+            let frame_bytes = self.tap_frame_bytes.load(Ordering::Relaxed).max(1);
+            let whole = (p.len() / frame_bytes) * frame_bytes;
+            if whole > 0 {
+                let capacity = self.tap.capacity();
+                let available = self.tap.available();
+                if available + whole > capacity {
+                    let excess = available + whole - capacity;
+                    let drop = ((excess + frame_bytes - 1) / frame_bytes) * frame_bytes;
+                    self.tap.discard_front(drop);
+                }
+                self.tap.write(&p[..whole]);
+            }
         }
         if bypass {
             self.buffer.write(p)
@@ -519,8 +536,10 @@ impl Device {
     /// samples whenever a transfer is late.
     pub fn enable_tap(&self, enabled: bool) {
         self.tap.reset();
+        let (bytes, rate) = self.tap_format();
+        self.tap_frame_bytes
+            .store((bytes as usize * AUDIO_CHANNELS).max(1), Ordering::Relaxed);
         if enabled {
-            let (bytes, rate) = self.tap_format();
             let frame_bytes = bytes as usize * AUDIO_CHANNELS;
             if frame_bytes > 0 && rate > 0 {
                 let frames = (rate as usize / 50).max(1);
@@ -528,6 +547,11 @@ impl Device {
             }
         }
         self.tap_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// (queued bytes, bytes dropped, bytes read short) of the tap.
+    pub fn tap_stats(&self) -> (usize, u64, u64) {
+        self.tap.stats()
     }
 
     /// Drain the tap. Returns the bytes copied (0 when nothing is queued).

@@ -102,6 +102,17 @@ impl Ring {
         read
     }
 
+    /// Drop `bytes` bytes from the read side (used to make room in whole frames,
+    /// so a full ring never shifts the frame boundary).
+    pub fn discard_front(&self, bytes: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        let capacity = inner.buf.len();
+        let drop = bytes.min(inner.size);
+        inner.read = (inner.read + drop) % capacity;
+        inner.size -= drop;
+        inner.dropped += drop as u64;
+    }
+
     pub fn reset(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.read = 0;

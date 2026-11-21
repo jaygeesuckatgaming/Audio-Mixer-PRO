@@ -1552,7 +1552,7 @@ impl MixerApp {
             pending_auto_assign: Vec::new(),
             buses: (0..audio::MAX_BUSES).map(Bus::new).collect(),
             captures,
-            strip_direct: [true; MAX_STRIPS],
+            strip_direct: [false; MAX_STRIPS],
             tape: Tape::new(),
             audio,
             sample_rate,
@@ -2825,6 +2825,36 @@ impl MixerApp {
             } else {
                 diag_log(format!(
                     "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s) in the last second: {detail}"
+                ));
+            }
+        }
+        // Direct taps: prove whether the cable's copy is keeping up. `dropped`
+        // counts bytes the device had to throw away (frame-aligned), `fill` is
+        // the strip's own backlog and `pushed` is what arrived this second.
+        let tap_frames = self.audio.take_tap_frames();
+        for i in 0..self.active_strips.min(self.strips.len()) {
+            let direct = self
+                .captures
+                .get(i)
+                .and_then(|capture| capture.as_ref())
+                .map(|capture| capture.direct())
+                .unwrap_or(false);
+            if !direct {
+                continue;
+            }
+            let Some(cable) = cable_number(&self.strips[i].device).and_then(|n| u8::try_from(n).ok())
+            else {
+                continue;
+            };
+            if let Some(device) = self.vc.device(cable) {
+                let (bytes, rate) = device.tap_format();
+                let (queued, dropped, short) = device.tap_stats();
+                diag_log(format!(
+                    "tap: strip[{i}] rate={rate} {}B/sample pushed={} queued={queued}B dropped={dropped}B short={short}B fill={} peak={:.3}",
+                    bytes,
+                    tap_frames[i],
+                    self.audio.strip_fill_frames(i),
+                    self.strips[i].peak
                 ));
             }
         }
