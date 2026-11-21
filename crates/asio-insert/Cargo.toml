@@ -1,0 +1,23 @@
+[package]
+name = "asio-insert"
+version = "0.1.0"
+edition = "2021"
+
+# A DLL a DAW loads as its audio device, plus its own test client. The client
+# loads the DLL dynamically, exactly like a host, so it is not linked to it.
+[lib]
+name = "asio_insert"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "asio_probe"
+path = "src/bin/asio_probe.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+] }
