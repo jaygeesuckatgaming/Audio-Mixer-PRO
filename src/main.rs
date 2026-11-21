@@ -1967,21 +1967,24 @@ impl MixerApp {
         (total, detail)
     }
 
-/// Lag in milliseconds at which `b` most closely follows `a` (positive = `b`
-/// lags), plus the correlation at that lag.
+/// Lag in milliseconds at which `b` most closely follows `a`, plus the
+/// correlation there and the runner-up lag/score.
+///
+/// Only lags at or after zero are searched: the direct tap copies the audio the
+/// moment the driver receives it, so the Windows capture can only ever be later.
+/// A "negative lag" is therefore not a candidate, which removes the nonsense
+/// "-10.7 ms ahead" answers.
 ///
 /// Periodic material - a music loop, a steady beat - correlates well at several
-/// lags, so the global maximum can be a multiple of the real delay (a quarter of
-/// a second looked plausible only because the beat repeated there). The earliest
-/// lag whose score is within a few percent of the best is the one that describes
-/// the actual path.
+/// lags, so the strongest match can be a multiple of the real delay. The caller
+/// names the runner-up instead of presenting one figure as fact.
 fn path_delay_ms(
     a: &[f32],
     b: &[f32],
     bucket_frames: usize,
     rate: u32,
     max_ms: f32,
-) -> Option<(f32, f32, f32)> {
+) -> Option<(f32, f32, f32, f32)> {
     let n = a.len().min(b.len());
     if n < 32 || rate == 0 || bucket_frames == 0 {
         return None;
@@ -1990,9 +1993,8 @@ fn path_delay_ms(
     let max_lag = ((max_ms / bucket_ms).round() as isize).clamp(0, n as isize - 8);
     let a = &a[a.len() - n..];
     let b = &b[b.len() - n..];
-    let mut scores: Vec<(isize, f32)> = Vec::with_capacity((2 * max_lag + 1) as usize);
-    let mut best = f32::MIN;
-    for lag in -max_lag..=max_lag {
+    let mut scores: Vec<(isize, f32)> = Vec::with_capacity(max_lag as usize + 1);
+    for lag in 0..=max_lag {
         let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
         for (i, x) in a.iter().enumerate() {
             let j = i as isize + lag;
@@ -2005,26 +2007,49 @@ fn path_delay_ms(
             nb += y * y;
         }
         let score = dot / (na.sqrt() * nb.sqrt()).max(1e-6);
-        if score > best {
-            best = score;
-        }
         scores.push((lag, score));
     }
-    let threshold = (best * 0.97).max(0.85);
-    let chosen = scores
+    let (strongest_lag, strongest) = scores
         .iter()
+        .copied()
+        .fold((0isize, f32::MIN), |acc, entry| {
+            if entry.1 > acc.1 {
+                entry
+            } else {
+                acc
+            }
+        });
+    if strongest < 0.5 {
+        // Nothing correlates: silence, or two unrelated signals.
+        return None;
+    }
+    // Among the lags that match well, the earliest is the physical one: a beat
+    // repeats, but the first alignment after zero delay is where the capture
+    // path actually sits.
+    let threshold = (strongest * 0.97).max(0.85);
+    let (best_lag, best) = scores
+        .iter()
+        .copied()
         .filter(|(_, score)| *score >= threshold)
-        .min_by_key(|(lag, _)| lag.abs())?;
-    // How strong is the best match *elsewhere*? A music loop correlates about as
-    // well at multiples of its beat as at the real delay, which is how a steady
-    // track produced 250 ms and then -197 ms. When a distant lag is nearly as
-    // good, the number must not be presented as fact.
-    let runner_up = scores
+        .min_by_key(|(lag, _)| *lag)
+        .unwrap_or((strongest_lag, strongest));
+    let (alt_lag, alt) = scores
         .iter()
-        .filter(|(lag, _)| (lag - chosen.0).abs() > 8)
-        .map(|(_, score)| *score)
-        .fold(f32::MIN, f32::max);
-    Some((chosen.0 as f32 * bucket_ms, chosen.1, runner_up))
+        .copied()
+        .filter(|(lag, _)| (lag - best_lag).abs() > 8)
+        .fold((0isize, f32::MIN), |acc, entry| {
+            if entry.1 > acc.1 {
+                entry
+            } else {
+                acc
+            }
+        });
+    Some((
+        best_lag as f32 * bucket_ms,
+        best,
+        alt_lag as f32 * bucket_ms,
+        alt,
+    ))
 }
 
 
@@ -2053,9 +2078,15 @@ fn path_delay_ms(
             }
         }
         let Some((direct, capture)) = pair else {
-            return "Needs two strips on the same cable, one on direct and one on Windows capture."
-                .to_string();
+            return "Measure path delay needs two strips on the same cable, one on direct and one on Windows capture.".to_string();
         };
+        // Every answer names the two strips being compared, so a figure is never
+        // ambiguous about what it measured.
+        let pair_label = format!(
+            "{} (direct) vs {} (capture)",
+            self.strip_label(direct),
+            self.strip_label(capture)
+        );
         let a = self.audio.strip_envelope(direct);
         let b = self.audio.strip_envelope(capture);
         let rate_direct = self.captures[direct]
@@ -2071,16 +2102,13 @@ fn path_delay_ms(
             // different rates would stretch one timeline against the other and
             // the answer would be meaningless.
             return format!(
-                "Both strips must run at the same rate: {} is {} Hz and {} is {} Hz.",
-                self.strip_label(direct),
-                rate_direct,
-                self.strip_label(capture),
-                rate_capture
+                "{pair_label}: both strips must run at the same rate ({} Hz vs {} Hz).",
+                rate_direct, rate_capture
             );
         }
         if a.len().min(b.len()) < 96 {
             return format!(
-                "Collecting {}/96 blocks - let it play for a couple of seconds and press again.",
+                "{pair_label}: collecting {}/96 blocks - let it play for a couple of seconds and press again.",
                 a.len().min(b.len())
             );
         }
@@ -2091,49 +2119,41 @@ fn path_delay_ms(
         let recent = a.len().min(b.len()).min(192);
         let a = &a[a.len() - recent..];
         let b = &b[b.len() - recent..];
-        let Some((ms, score, runner_up)) = Self::path_delay_ms(
+        let Some((ms, score, alt_ms, alt_score)) = Self::path_delay_ms(
             a,
             b,
             audio::ENV_BUCKET_FRAMES,
             self.sample_rate.max(1),
             300.0,
         ) else {
-            return "Not enough variation to measure - use something with speech or transients."
-                .to_string();
+            return format!("{pair_label}: not enough variation - use speech or transients.");
         };
-        if runner_up > score - 0.03 {
+        if score < 0.85 {
             let text = format!(
-                "Inconclusive: lags {:.1} ms ({:.2}) and another one ({:.2}) match almost equally - a steady beat does this. Use speech or a source with clear transients.",
-                ms, score, runner_up
+                "{pair_label}: no clear match ({score:.2}) - use speech or a source with clear transients."
             );
             diag_log(format!("path delay: {text}"));
             return text;
         }
-        if ms.abs() > 150.0 {
+        if alt_score > score - 0.03 {
+            // A steady beat matches almost as well at a multiple of its period.
+            // Name both candidates rather than pick one and be wrong.
             let text = format!(
-                "Inconclusive: the best match is {:.1} ms away, which is too far for this path - likely periodic material.",
-                ms
+                "{pair_label}: about {ms:.1} ms, but music matches two lags similarly ({ms:.1} ms at {score:.2}, {alt_ms:.1} ms at {alt_score:.2}) - use speech for a clean reading."
             );
             diag_log(format!("path delay: {text}"));
             return text;
         }
-        let text = if ms >= 0.0 {
-            format!(
-                "{} (direct) vs {} (capture): capture is {:.1} ms behind (correlation {:.2})",
-                self.strip_label(direct),
-                self.strip_label(capture),
-                ms,
-                score
-            )
-        } else {
-            format!(
-                "{} (direct) vs {} (capture): capture is {:.1} ms *ahead*, which should not happen - try again with speech playing (correlation {:.2})",
-                self.strip_label(direct),
-                self.strip_label(capture),
-                -ms,
-                score
-            )
-        };
+        if ms > 150.0 {
+            let text = format!(
+                "{pair_label}: the best match is {ms:.1} ms away, which is too far for this path - likely periodic material."
+            );
+            diag_log(format!("path delay: {text}"));
+            return text;
+        }
+        let text = format!(
+            "{pair_label}: capture is {ms:.1} ms behind (correlation {score:.2})"
+        );
         diag_log(format!("path delay: {text}"));
         text
     }
@@ -11979,12 +11999,12 @@ mod tests {
     fn path_delay_finds_a_small_delay() {
         let a = noise(400);
         let b = delayed(&a, 7);
-        let (ms, score, runner_up) =
+        let (ms, score, alt_ms, alt_score) =
             MixerApp::path_delay_ms(&a, &b, 128, 48_000, 300.0).unwrap();
         assert!((ms - 7.0 * bucket_ms(128)).abs() < 0.2, "{ms} {score}");
         assert!(score > 0.99, "{score}");
         // A non-periodic signal has one clear answer.
-        assert!(runner_up < score - 0.03, "{score} vs {runner_up}");
+        assert!(alt_score < score - 0.03, "{score} vs {alt_score} at {alt_ms}");
     }
 
     #[test]
@@ -11997,10 +12017,10 @@ mod tests {
             a[i] = 1.0;
         }
         let b = delayed(&a, 5);
-        let (ms, score, runner_up) =
+        let (ms, score, alt_ms, alt_score) =
             MixerApp::path_delay_ms(&a, &b, 128, 48_000, 300.0).unwrap();
         assert!((ms - 5.0 * bucket_ms(128)).abs() < 0.3, "{ms}");
-        assert!(runner_up > score - 0.03, "{score} vs {runner_up}");
+        assert!(alt_score > score - 0.03, "{score} vs {alt_score} at {alt_ms}");
     }
 
     #[test]
