@@ -9,7 +9,7 @@
 #![allow(non_snake_case, dead_code)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use asio_insert::abi::*;
@@ -30,12 +30,54 @@ static OUT_ADDR: [AtomicUsize; CHANNELS] = [const { AtomicUsize::new(0) }; CHANN
 
 /// The host side: a DAW would process the input and write the output. Here the
 /// output is a straight copy, so the round trip must be sample-identical.
+/// The ASIO object, so the asynchronous host can call `outputReady` on it.
+static ASIO: AtomicUsize = AtomicUsize::new(0);
+/// `AMI_PROBE_ASYNC=1`: behave like JUCE - leave the outputs alone in
+/// `bufferSwitch`, write them a moment later on another thread and then call
+/// `outputReady`. `AMI_PROBE_ADDITIVE=1`: mix into the output buffers instead of
+/// overwriting them, which is legal and what Waveform appears to do.
+static ASYNC: AtomicBool = AtomicBool::new(false);
+static ADDITIVE: AtomicBool = AtomicBool::new(false);
+
 unsafe extern "system" fn buffer_switch(_index: i32, _direct: ASIOBool) {
+    if ASYNC.load(Ordering::Relaxed) {
+        // JUCE-style: the graph finishes after the callback returns.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_micros(
+                std::env::var("AMI_PROBE_DELAY_US")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(300),
+            ));
+            write_outputs();
+            let asio = ASIO.load(Ordering::Relaxed) as *mut c_void;
+            if !asio.is_null() {
+                let vtbl = unsafe { *(asio as *const *const IASIOVtbl) };
+                unsafe { ((*vtbl).output_ready)(asio) };
+            }
+        });
+        return;
+    }
+    write_outputs();
+}
+
+/// Copy (or add) the planar inputs into the planar outputs.
+fn write_outputs() {
+    let additive = ADDITIVE.load(Ordering::Relaxed);
     for channel in 0..CHANNELS {
         let source = IN_ADDR[channel].load(Ordering::Relaxed) as *const f32;
         let target = OUT_ADDR[channel].load(Ordering::Relaxed) as *mut f32;
-        if !source.is_null() && !target.is_null() {
-            std::ptr::copy_nonoverlapping(source, target, BLOCK_FRAMES);
+        if source.is_null() || target.is_null() {
+            continue;
+        }
+        for frame in 0..BLOCK_FRAMES {
+            unsafe {
+                if additive {
+                    *target.add(frame) += *source.add(frame);
+                } else {
+                    *target.add(frame) = *source.add(frame);
+                }
+            }
         }
     }
 }
@@ -50,6 +92,14 @@ fn main() {
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(5.0);
 
+    ASYNC.store(
+        std::env::var("AMI_PROBE_ASYNC").map(|v| v != "0").unwrap_or(false),
+        Ordering::Relaxed,
+    );
+    ADDITIVE.store(
+        std::env::var("AMI_PROBE_ADDITIVE").map(|v| v != "0").unwrap_or(false),
+        Ordering::Relaxed,
+    );
     // ---- the mixer side -------------------------------------------------
     let mut shared = Shared::open_or_create(48_000).expect("could not open the insert section");
     println!(
@@ -89,6 +139,7 @@ fn main() {
     assert_eq!(hr, S_OK, "CreateInstance returned {hr:#x}");
     assert!(!asio.is_null());
     let vtbl = unsafe { *(asio as *const *const IASIOVtbl) };
+    ASIO.store(asio as usize, Ordering::Relaxed);
 
     // ---- IASIO surface --------------------------------------------------
     let ok = unsafe { ((*vtbl).init)(asio, std::ptr::null_mut()) };

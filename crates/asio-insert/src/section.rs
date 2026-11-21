@@ -33,9 +33,18 @@ const BLOCK_BYTES: usize = BLOCK_FRAMES * 2 * 4;
 const DIRECTION_BYTES: usize = PAIRS * BLOCKS * BLOCK_BYTES;
 pub const SECTION_BYTES: usize = HEADER_BYTES + DIRECTION_BYTES * 2;
 
-const SECTION_NAME: &str = "Local\\AudioMixerProInsert_v2";
-const BLOCK_EVENT: &str = "Local\\AudioMixerProInsert_v2_block";
-const READY_EVENT: &str = "Local\\AudioMixerProInsert_v2_ready";
+const SECTION_BASE: &str = "Local\\AudioMixerProInsert_v2";
+
+/// The probe sets `AMI_SECTION_SUFFIX` so it can run while the mixer has a live
+/// insert without the two publishing into the same ring.
+fn names() -> (String, String, String) {
+    let suffix = std::env::var("AMI_SECTION_SUFFIX").unwrap_or_default();
+    (
+        format!("{SECTION_BASE}{suffix}"),
+        format!("{SECTION_BASE}_block{suffix}"),
+        format!("{SECTION_BASE}_ready{suffix}"),
+    )
+}
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -58,7 +67,8 @@ impl Shared {
     /// driver both call this; the first one initialises the header.
     pub fn open_or_create(rate: u32) -> Result<Self, String> {
         unsafe {
-            let section = wide(SECTION_NAME);
+            let (section_name, block_name, ready_name) = names();
+            let section = wide(&section_name);
             let mapping = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
@@ -76,8 +86,8 @@ impl Shared {
                 let _ = CloseHandle(mapping);
                 return Err("could not map the insert section".to_string());
             }
-            let block_event = CreateEventW(std::ptr::null(), 0, 0, wide(BLOCK_EVENT).as_ptr());
-            let ready_event = CreateEventW(std::ptr::null(), 0, 0, wide(READY_EVENT).as_ptr());
+            let block_event = CreateEventW(std::ptr::null(), 0, 0, wide(&block_name).as_ptr());
+            let ready_event = CreateEventW(std::ptr::null(), 0, 0, wide(&ready_name).as_ptr());
             if block_event.is_null() || ready_event.is_null() {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: base as *mut c_void,

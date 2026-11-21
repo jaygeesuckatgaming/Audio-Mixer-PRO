@@ -6,7 +6,7 @@
 //! way, no resampling, and the DAW follows our timer.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::abi::*;
 use crate::section::{Shared, BLOCK_FRAMES, PAIRS};
@@ -15,11 +15,22 @@ use crate::section::{Shared, BLOCK_FRAMES, PAIRS};
 /// four input and four output channels.
 const CHANNELS: usize = PAIRS * 2;
 
+/// Frames per host callback. The section block is 512; JUCE (Waveform) runs
+/// its graph in 256-frame blocks, so the host is advertised and called at this
+/// size, twice per section block.
+const HOST_BLOCK_FRAMES: usize = BLOCK_FRAMES;
+
 struct DriverState {
     shared: Option<Shared>,
     callbacks: ASIOCallbacks,
     in_ptrs: [*mut f32; CHANNELS],
     out_ptrs: [*mut f32; CHANNELS],
+    /// Second buffer slot of each channel. A host that runs half-size blocks
+    /// writes the second half here in the same callback (JUCE does this), so a
+    /// 512-frame section block is two planes of 256.
+    in_ptrs2: [*mut f32; CHANNELS],
+    out_ptrs2: [*mut f32; CHANNELS],
+    split_buffers: AtomicBool,
     /// Buffers this driver allocated because the host left `ASIOBufferInfo.buffers`
     /// empty. JUCE (Waveform's audio layer) does exactly that: it passes the
     /// array with null pointers and expects `createBuffers` to supply them.
@@ -27,6 +38,36 @@ struct DriverState {
     running: AtomicBool,
     stop: AtomicBool,
     sample_pos: AtomicU64,
+    /// Block the host is currently working on. `outputReady` arrives after
+    /// `bufferSwitch` on hosts whose graph runs asynchronously (JUCE does), and
+    /// only then are the output buffers valid.
+    current_seq: AtomicU64,
+    /// Block the host last reported `outputReady` for. The block is only
+    /// published to the mixer once this matches, so the mixer never reads a
+    /// block the host is still writing.
+    out_ready_seq: AtomicU64,
+    /// Block the pump is waiting on. A signal for any other block is stale and
+    /// must not be copied, or it would land in the wrong output slot.
+    waiting: AtomicU64,
+    /// 0 = not known yet, 1 = host uses outputReady, 2 = host fills the buffers
+    /// inside bufferSwitch.
+    ready_host: AtomicU8,
+    /// Consecutive blocks with no outputReady, used to decide `ready_host`.
+    no_signal: AtomicU8,
+    /// Blocks a known outputReady host failed to finish in time (published as
+    /// silence rather than as half-written audio).
+    late_blocks: AtomicU64,
+    /// Block the host signalled as written but which has not been copied yet.
+    /// The copy happens one callback later, so a host whose engine is still
+    /// filling the buffers cannot be read half-written.
+    pending_copy: AtomicU64,
+    /// outputReady signals seen for the block being dispatched (one per host
+    /// call: two when the host runs half-size blocks).
+    signals: AtomicU8,
+    /// Peaks since the last one-second trace, to show which side is silent.
+    in_peak: AtomicU32,
+    out_peak: AtomicU32,
+    ready_calls: AtomicU64,
     rate: f64,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -42,11 +83,25 @@ impl DriverState {
                 buffer_switch_time_info: None,
             },
             in_ptrs: [std::ptr::null_mut(); CHANNELS],
+            in_ptrs2: [std::ptr::null_mut(); CHANNELS],
+            out_ptrs2: [std::ptr::null_mut(); CHANNELS],
+            split_buffers: AtomicBool::new(false),
             out_ptrs: [std::ptr::null_mut(); CHANNELS],
             owned: Vec::new(),
             running: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             sample_pos: AtomicU64::new(0),
+            current_seq: AtomicU64::new(0),
+            out_ready_seq: AtomicU64::new(u64::MAX),
+            waiting: AtomicU64::new(u64::MAX),
+            ready_host: AtomicU8::new(0),
+            no_signal: AtomicU8::new(0),
+            late_blocks: AtomicU64::new(0),
+            pending_copy: AtomicU64::new(u64::MAX),
+            signals: AtomicU8::new(0),
+            in_peak: AtomicU32::new(0),
+            out_peak: AtomicU32::new(0),
+            ready_calls: AtomicU64::new(0),
             rate: 48_000.0,
             thread: None,
         }
@@ -272,10 +327,10 @@ unsafe extern "system" fn asio_get_latencies(
     output: *mut i32,
 ) -> ASIOError {
     if !input.is_null() {
-        *input = BLOCK_FRAMES as i32;
+        *input = HOST_BLOCK_FRAMES as i32;
     }
     if !output.is_null() {
-        *output = BLOCK_FRAMES as i32;
+        *output = HOST_BLOCK_FRAMES as i32;
     }
     ASE_OK
 }
@@ -288,9 +343,9 @@ unsafe extern "system" fn asio_get_buffer_size(
     granularity: *mut i32,
 ) -> ASIOError {
     for (target, value) in [
-        (min, BLOCK_FRAMES as i32),
-        (max, BLOCK_FRAMES as i32),
-        (preferred, BLOCK_FRAMES as i32),
+        (min, HOST_BLOCK_FRAMES as i32),
+        (max, HOST_BLOCK_FRAMES as i32),
+        (preferred, HOST_BLOCK_FRAMES as i32),
         (granularity, 0),
     ] {
         if !target.is_null() {
@@ -298,7 +353,7 @@ unsafe extern "system" fn asio_get_buffer_size(
         }
     }
     trace(&format!(
-        "get_buffer_size -> min {BLOCK_FRAMES} max {BLOCK_FRAMES} preferred {BLOCK_FRAMES} granularity 0"
+        "get_buffer_size -> min {HOST_BLOCK_FRAMES} max {HOST_BLOCK_FRAMES} preferred {HOST_BLOCK_FRAMES} granularity 0"
     ));
     ASE_OK
 }
@@ -403,7 +458,7 @@ unsafe extern "system" fn asio_get_sample_position(
 
 unsafe extern "system" fn asio_get_block_size(_this: *mut c_void, size: *mut i32) -> ASIOError {
     if !size.is_null() {
-        *size = BLOCK_FRAMES as i32;
+        *size = HOST_BLOCK_FRAMES as i32;
     }
     ASE_OK
 }
@@ -423,13 +478,14 @@ unsafe extern "system" fn asio_create_buffers(
     if infos.is_null()
         || callbacks.is_null()
         || num_channels != (CHANNELS * 2) as i32
-        || buffer_size != BLOCK_FRAMES as i32
+        || (buffer_size != BLOCK_FRAMES as i32 && buffer_size != HOST_BLOCK_FRAMES as i32)
     {
         trace("create_buffers -> NotPresent (unsupported shape)");
         return ASE_NotPresent;
     }
     let state = state(this);
     state.callbacks = *callbacks;
+    state.split_buffers.store(false, Ordering::Relaxed);
     // Keep buffers from an earlier createBuffers call alive: a host may still
     // hold the pointers it was given, and a few 2 KB vectors are cheap.
     let mut missing = 0usize;
@@ -468,10 +524,20 @@ unsafe extern "system" fn asio_create_buffers(
             missing += 1;
             continue;
         }
+        // JUCE runs the graph in half-size blocks and puts the second half in
+        // buffers[1] of the same callback. Keep both, and note whether they are
+        // actually distinct (a host may pass one pointer twice).
+        let second = info.buffers[1] as *mut f32;
+        let split = !second.is_null() && second != pointer;
+        if split {
+            state.split_buffers.store(true, Ordering::Relaxed);
+        }
         if info.is_input != 0 {
             state.in_ptrs[channel] = pointer;
+            state.in_ptrs2[channel] = if split { second } else { pointer };
         } else {
             state.out_ptrs[channel] = pointer;
+            state.out_ptrs2[channel] = if split { second } else { pointer };
         }
     }
     if supplied > 0 {
@@ -493,6 +559,9 @@ unsafe extern "system" fn asio_dispose_buffers(this: *mut c_void) -> ASIOError {
     let state = state(this);
     state.in_ptrs = [std::ptr::null_mut(); CHANNELS];
     state.out_ptrs = [std::ptr::null_mut(); CHANNELS];
+    state.in_ptrs2 = [std::ptr::null_mut(); CHANNELS];
+    state.out_ptrs2 = [std::ptr::null_mut(); CHANNELS];
+    state.split_buffers.store(false, Ordering::Relaxed);
     state.callbacks = ASIOCallbacks {
         buffer_switch: None,
         sample_rate_did_change: None,
@@ -558,9 +627,19 @@ unsafe extern "system" fn asio_future(
     }
 }
 
-unsafe extern "system" fn asio_output_ready(_this: *mut c_void) -> ASIOError {
-    // The pump copies the host's outputs back after bufferSwitch returns, so
-    // there is nothing left to do here; some hosts still call it.
+unsafe extern "system" fn asio_output_ready(this: *mut c_void) -> ASIOError {
+    // The host says it has written the outputs for the block we handed it. Do not
+    // read them here: Waveform's engine can still be filling the buffers at this
+    // point, and reading then produced blocks whose tails were zeros. Record the
+    // block and let the pump copy it on its next callback, a full block later.
+    let state = state(this);
+    let seq = state.current_seq.load(Ordering::Relaxed);
+    if state.waiting.load(Ordering::Relaxed) == seq {
+        state.pending_copy.store(seq, Ordering::Relaxed);
+        state.out_ready_seq.store(seq, Ordering::Relaxed);
+        state.signals.fetch_add(1, Ordering::Relaxed);
+        state.ready_calls.fetch_add(1, Ordering::Relaxed);
+    }
     ASE_OK
 }
 
@@ -614,8 +693,197 @@ fn pump(ptr: StatePtr) {
     let mut reported_silent = false;
     let mut reported_audio = false;
     let mut last_block = std::time::Instant::now();
+    let mut trace_at = std::time::Instant::now();
 
     while !state.stop.load(Ordering::SeqCst) {
+        if trace_at.elapsed() >= std::time::Duration::from_secs(1) {
+            trace_at = std::time::Instant::now();
+            trace(&format!(
+                "stats: blocks {} in_peak {:.3} out_peak {:.3} outputReady {} seq_in {} seq_out {}",
+                state.sample_pos.load(Ordering::Relaxed) / BLOCK_FRAMES as u64,
+                f32::from_bits(state.in_peak.swap(0, Ordering::Relaxed)),
+                f32::from_bits(state.out_peak.swap(0, Ordering::Relaxed)),
+                state.ready_calls.swap(0, Ordering::Relaxed),
+                shared.seq_in(),
+                shared.seq_out()
+            ));
+            // Per-channel detail for the first pair: tells a genuine gain apart
+            // from a pointer/channel mix-up or garbage.
+            let detail = |ptrs: &[*mut f32; CHANNELS]| {
+                let mut text = String::new();
+                for channel in 0..PAIRS * 2 {
+                    let buffer = ptrs[channel];
+                    if buffer.is_null() {
+                        text.push_str(" null");
+                        continue;
+                    }
+                    let mut peak = 0.0f32;
+                    for frame in 0..BLOCK_FRAMES {
+                        unsafe {
+                            peak = peak.max((*buffer.add(frame)).abs());
+                        }
+                    }
+                    text.push_str(&format!(" {peak:.3}"));
+                }
+                text
+            };
+            let head = |buffer: *mut f32| {
+                if buffer.is_null() {
+                    "null".to_string()
+                } else {
+                    let mut text = String::new();
+                    for frame in 0..4 {
+                        unsafe {
+                            text.push_str(&format!(" {:.3}", *buffer.add(frame)));
+                        }
+                    }
+                    text
+                }
+            };
+            let head6 = |buffer: *mut f32| {
+                if buffer.is_null() {
+                    "null".to_string()
+                } else {
+                    let mut text = String::new();
+                    for frame in 0..6 {
+                        unsafe {
+                            text.push_str(&format!(" {:.3}", *buffer.add(frame)));
+                        }
+                    }
+                    text
+                }
+            };
+            // Is the host's output even related to what it was given? A scaled
+            // copy correlates near 1; an oscillator or unrelated data near 0.
+            let corr = |a: *mut f32, b: *mut f32| {
+                if a.is_null() || b.is_null() {
+                    return 0.0;
+                }
+                let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+                for frame in 0..BLOCK_FRAMES {
+                    unsafe {
+                        let x = *a.add(frame);
+                        let y = *b.add(frame);
+                        dot += x * y;
+                        na += x * x;
+                        nb += y * y;
+                    }
+                }
+                dot / (na.sqrt() * nb.sqrt()).max(1e-9)
+            };
+            // Where is the loudest sample? A spike in the host's output that is
+            // not in its input is generated by the host; one at the same place
+            // came from the mixer.
+            let peak_at = |buffer: *mut f32| {
+                if buffer.is_null() {
+                    return (0usize, 0.0f32);
+                }
+                let (mut index, mut value) = (0usize, 0.0f32);
+                for frame in 0..BLOCK_FRAMES {
+                    unsafe {
+                        let sample = *buffer.add(frame);
+                        if sample.abs() > value.abs() {
+                            value = sample;
+                            index = frame;
+                        }
+                    }
+                }
+                (index, value)
+            };
+            let (in_at, in_value) = peak_at(state.in_ptrs[0]);
+            let (out_at, out_value) = peak_at(state.out_ptrs[0]);
+            // First two and last two samples: a boundary discontinuity shows up
+            // there, a mid-block spike elsewhere.
+            let ends = |buffer: *mut f32| {
+                if buffer.is_null() {
+                    "null".to_string()
+                } else {
+                    unsafe {
+                        format!(
+                            " {} {} ... {} {}",
+                            *buffer,
+                            *buffer.add(1),
+                            *buffer.add(BLOCK_FRAMES - 2),
+                            *buffer.add(BLOCK_FRAMES - 1)
+                        )
+                    }
+                }
+            };
+            trace(&format!(
+                "  in per channel{}  out per channel{}  corr {:.2}/{:.2}  in0[0..4]{}  out0[0..6]{}",
+                detail(&state.in_ptrs),
+                detail(&state.out_ptrs),
+                corr(state.in_ptrs[0], state.out_ptrs[0]),
+                corr(state.in_ptrs[1], state.out_ptrs[1]),
+                head(state.in_ptrs[0]),
+                head6(state.out_ptrs[0])
+            ));
+            trace(&format!(
+                "  peak at in[{in_at}]={in_value:.3} out[{out_at}]={out_value:.3}  in ends{}  out ends{}",
+                ends(state.in_ptrs[0]),
+                ends(state.out_ptrs[0])
+            ));
+            // How many samples of the returned block differ from what was sent,
+            // and where the first one is. One differing sample at index 0 is a
+            // boundary discontinuity; many means real processing.
+            let (mut differences, mut first) = (0usize, usize::MAX);
+            if !state.in_ptrs[0].is_null() && !state.out_ptrs[0].is_null() {
+                for frame in 0..BLOCK_FRAMES {
+                    unsafe {
+                        let delta =
+                            (*state.in_ptrs[0].add(frame) - *state.out_ptrs[0].add(frame)).abs();
+                        if delta > 1e-4 {
+                            differences += 1;
+                            if first == usize::MAX {
+                                first = frame;
+                            }
+                        }
+                    }
+                }
+            }
+            trace(&format!(
+                "  differing samples: {differences} first at {}",
+                if first == usize::MAX {
+                    "-".to_string()
+                } else {
+                    first.to_string()
+                }
+            ));
+            // Where does the host stop writing? A block that is only partly
+            // filled (zeros to the end) means it thinks the buffer is smaller
+            // than the 512 frames we advertised.
+            let filled = |buffer: *mut f32| {
+                if buffer.is_null() {
+                    return (usize::MAX, 0usize);
+                }
+                let (mut last, mut zeros) = (usize::MAX, 0usize);
+                for frame in 0..BLOCK_FRAMES {
+                    unsafe {
+                        if *buffer.add(frame) == 0.0 {
+                            zeros += 1;
+                        } else {
+                            last = frame;
+                        }
+                    }
+                }
+                (last, zeros)
+            };
+            let (out_last, out_zeros) = filled(state.out_ptrs[0]);
+            let (in_last, in_zeros) = filled(state.in_ptrs[0]);
+            trace(&format!(
+                "  last nonzero: out {} (zeros {out_zeros})  in {} (zeros {in_zeros})",
+                if out_last == usize::MAX {
+                    "-".to_string()
+                } else {
+                    out_last.to_string()
+                },
+                if in_last == usize::MAX {
+                    "-".to_string()
+                } else {
+                    in_last.to_string()
+                }
+            ));
+        }
         // Wait up to one block for the mixer. A wake-up that does not carry a
         // new block is ignored; only if nothing has arrived for a whole block
         // does the driver generate a silent one, so a running mixer alone sets
@@ -649,7 +917,6 @@ fn pump(ptr: StatePtr) {
                 }
             }
             call_host(&state, &shared, rate, target_seq);
-            shared.set_seq_out(target_seq);
             last_block = std::time::Instant::now();
             continue;
         }
@@ -660,17 +927,26 @@ fn pump(ptr: StatePtr) {
             seq += 1;
             for pair in 0..PAIRS {
                 let source = shared.input_block(pair, seq);
-                let left = state.in_ptrs[pair * 2];
-                let right = state.in_ptrs[pair * 2 + 1];
-                for frame in 0..BLOCK_FRAMES {
-                    unsafe {
-                        let l = *source.add(frame * 2);
-                        let r = *source.add(frame * 2 + 1);
-                        if !left.is_null() {
-                            *left.add(frame) = l;
-                        }
-                        if !right.is_null() {
-                            *right.add(frame) = r;
+                let split = state.split_buffers.load(Ordering::Relaxed);
+                for channel in 0..2 {
+                    let first = state.in_ptrs[pair * 2 + channel];
+                    let second = state.in_ptrs2[pair * 2 + channel];
+                    if first.is_null() {
+                        continue;
+                    }
+                    for frame in 0..BLOCK_FRAMES {
+                        let value = unsafe { *source.add(frame * 2 + channel) };
+                        unsafe {
+                            if split {
+                                let half = BLOCK_FRAMES / 2;
+                                if frame < half {
+                                    *first.add(frame) = value;
+                                } else if !second.is_null() {
+                                    *second.add(frame - half) = value;
+                                }
+                            } else {
+                                *first.add(frame) = value;
+                            }
                         }
                     }
                 }
@@ -682,55 +958,212 @@ fn pump(ptr: StatePtr) {
             }
         }
         last_seq = target_seq;
-        shared.set_seq_out(target_seq);
         last_block = std::time::Instant::now();
     }
     shared.set_host_attached(false);
 }
 
-/// One host callback for block `seq`: run the graph, then copy the host's
-/// outputs back into that block's output slot.
+/// One host callback for block `seq`. The block is published to the mixer only
+/// once its outputs are final: a synchronous host has them when `bufferSwitch`
+/// returns, an asynchronous one (JUCE) after it calls `outputReady`. Publishing
+/// a block the host is still writing is what turns the return into noise, so a
+/// host that misses the deadline gets a silent block instead.
 fn call_host(state: &DriverState, shared: &Shared, rate: u32, seq: u64) {
     let callbacks = state.callbacks;
     let position = state.sample_pos.load(Ordering::Relaxed);
-    // JUCE provides both callbacks; if only the time-info form was given we must
-    // use it or the host never runs its graph.
-    if let Some(time_info) = callbacks.buffer_switch_time_info {
-        let mut time: ASIOTime = unsafe { std::mem::zeroed() };
-        time.time_info.sample_rate = rate as f64;
-        time.time_info.sample_position = ASIOSamples {
-            hi: (position >> 32) as u32,
-            lo: position as u32,
-        };
-        time.time_info.speed = 1.0;
-        unsafe { time_info(&mut time, 0, ASIO_FALSE) };
-    } else if let Some(buffer_switch) = callbacks.buffer_switch {
-        unsafe { buffer_switch(0, ASIO_FALSE) };
+    // Publish what the host finished during the previous callback. A full block
+    // has passed since it signalled, so its engine cannot still be writing.
+    let pending = state.pending_copy.swap(u64::MAX, Ordering::Relaxed);
+    if pending != u64::MAX {
+        copy_outputs(state, shared, pending);
+        shared.set_seq_out(pending);
     }
-    for pair in 0..PAIRS {
-        let target = shared.output_block(pair, seq);
-        let left = state.out_ptrs[pair * 2];
-        let right = state.out_ptrs[pair * 2 + 1];
-        for frame in 0..BLOCK_FRAMES {
-            unsafe {
-                let l = if left.is_null() {
-                    0.0
-                } else {
-                    *left.add(frame)
-                };
-                let r = if right.is_null() {
-                    0.0
-                } else {
-                    *right.add(frame)
-                };
-                *target.add(frame * 2) = l;
-                *target.add(frame * 2 + 1) = r;
+    state.current_seq.store(seq, Ordering::Relaxed);
+    state.out_ready_seq.store(u64::MAX, Ordering::Relaxed);
+    state.waiting.store(seq, Ordering::Relaxed);
+    state
+        .in_peak
+        .fetch_max(input_peak(state).to_bits(), Ordering::Relaxed);
+    // The output buffers belong to the driver and some hosts mix into them
+    // rather than overwrite. Left uncleared, every block would sum with the
+    // previous one - a comb filter that saturates.
+    let split = state.split_buffers.load(Ordering::Relaxed);
+    let clear = if split {
+        BLOCK_FRAMES / 2
+    } else {
+        BLOCK_FRAMES
+    };
+    for channel in 0..CHANNELS {
+        let first = state.out_ptrs[channel];
+        if !first.is_null() {
+            unsafe { std::ptr::write_bytes(first, 0u8, clear) };
+        }
+        if split {
+            let second = state.out_ptrs2[channel];
+            if !second.is_null() {
+                unsafe { std::ptr::write_bytes(second, 0u8, clear) };
             }
         }
     }
+
+    // A host whose graph runs in half-size blocks (JUCE) must be called once per
+    // half, with the buffer slot for that half: its buffers[0] carries the first
+    // 256 frames and buffers[1] the second, and it only fills the one it is
+    // called with. Calling it once would drop half of every block.
+    let split = state.split_buffers.load(Ordering::Relaxed);
+    state.signals.store(0, Ordering::Relaxed);
+    let calls: i32 = if split { 2 } else { 1 };
+    for chunk in 0..calls {
+        let clear = if split {
+            BLOCK_FRAMES / 2
+        } else {
+            BLOCK_FRAMES
+        };
+        let pointers = if split && chunk == 1 {
+            state.out_ptrs2
+        } else {
+            state.out_ptrs
+        };
+        for channel in 0..CHANNELS {
+            let buffer = pointers[channel];
+            if !buffer.is_null() {
+                unsafe { std::ptr::write_bytes(buffer, 0u8, clear) };
+            }
+        }
+        if let Some(time_info) = callbacks.buffer_switch_time_info {
+            let mut time: ASIOTime = unsafe { std::mem::zeroed() };
+            time.time_info.sample_rate = rate as f64;
+            time.time_info.sample_position = ASIOSamples {
+                hi: (position >> 32) as u32,
+                lo: position as u32,
+            };
+            // kSystemTimeValid | kSamplePositionValid | kSampleRateValid.
+            time.time_info.flags = 1 | 2 | 4;
+            let nanos = ((position as f64 / rate.max(1) as f64) * 1_000_000_000.0) as u64;
+            time.time_info.system_time = ASIOTimeStamp {
+                hi: (nanos >> 32) as u32,
+                lo: nanos as u32,
+            };
+            time.time_info.speed = 1.0;
+            unsafe { time_info(&mut time, chunk, ASIO_FALSE) };
+        } else if let Some(buffer_switch) = callbacks.buffer_switch {
+            unsafe { buffer_switch(chunk, ASIO_FALSE) };
+        }
+    }
+
+    let period =
+        std::time::Duration::from_micros((BLOCK_FRAMES as u64 * 1_000_000) / rate.max(1) as u64);
+    let mode = state.ready_host.load(Ordering::Relaxed);
+    let budget = if mode == 2 {
+        std::time::Duration::from_millis(1)
+    } else {
+        period
+    };
+    let deadline = std::time::Instant::now() + budget;
+    while (state.signals.load(Ordering::Relaxed) as i32) < calls
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    let signalled = state.signals.load(Ordering::Relaxed) as i32 >= calls;
+
+    if signalled {
+        // `output_ready` recorded this block for the next callback's copy; it is
+        // published then, not now.
+        state.ready_host.store(1, Ordering::Relaxed);
+        state.no_signal.store(0, Ordering::Relaxed);
+    } else if mode == 1 {
+        // A host that uses outputReady did not finish in time: publish silence
+        // rather than half-written audio.
+        for pair in 0..PAIRS {
+            let target = shared.output_block(pair, seq);
+            unsafe { std::ptr::write_bytes(target, 0u8, BLOCK_FRAMES * 2) };
+        }
+        state.late_blocks.fetch_add(1, Ordering::Relaxed);
+        shared.set_seq_out(seq);
+    } else {
+        // Synchronous so far: the host wrote the buffers inside bufferSwitch.
+        copy_outputs(state, shared, seq);
+        if mode == 0 {
+            let misses = state.no_signal.fetch_add(1, Ordering::Relaxed) + 1;
+            if misses >= 3 {
+                state.ready_host.store(2, Ordering::Relaxed);
+            }
+        }
+        shared.set_seq_out(seq);
+    }
+    state.waiting.store(u64::MAX, Ordering::Relaxed);
     state
         .sample_pos
         .fetch_add(BLOCK_FRAMES as u64, Ordering::Relaxed);
+}
+
+/// Interleave the host's planar output buffers into the section block `seq`.
+fn copy_outputs(state: &DriverState, shared: &Shared, seq: u64) {
+    let mut peak = 0.0f32;
+    let split = state.split_buffers.load(Ordering::Relaxed);
+    let half = BLOCK_FRAMES / 2;
+    for pair in 0..PAIRS {
+        let target = shared.output_block(pair, seq);
+        for channel in 0..2 {
+            let first = state.out_ptrs[pair * 2 + channel];
+            let second = state.out_ptrs2[pair * 2 + channel];
+            for frame in 0..BLOCK_FRAMES {
+                let value = unsafe {
+                    if split {
+                        if frame < half {
+                            if first.is_null() {
+                                0.0
+                            } else {
+                                *first.add(frame)
+                            }
+                        } else if second.is_null() {
+                            0.0
+                        } else {
+                            *second.add(frame - half)
+                        }
+                    } else if first.is_null() {
+                        0.0
+                    } else {
+                        *first.add(frame)
+                    }
+                };
+                peak = peak.max(value.abs());
+                unsafe { *target.add(frame * 2 + channel) = value };
+            }
+        }
+    }
+    state.out_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
+}
+
+/// Highest absolute sample in the buffers the driver is about to hand the host.
+fn input_peak(state: &DriverState) -> f32 {
+    let mut peak = 0.0f32;
+    let half = BLOCK_FRAMES / 2;
+    let split = state.split_buffers.load(Ordering::Relaxed);
+    for channel in 0..CHANNELS {
+        let first = state.in_ptrs[channel];
+        if first.is_null() {
+            continue;
+        }
+        let frames = if split { half } else { BLOCK_FRAMES };
+        for frame in 0..frames {
+            unsafe {
+                peak = peak.max((*first.add(frame)).abs());
+            }
+        }
+        if split {
+            let second = state.in_ptrs2[channel];
+            if !second.is_null() {
+                for frame in 0..half {
+                    unsafe {
+                        peak = peak.max((*second.add(frame)).abs());
+                    }
+                }
+            }
+        }
+    }
+    peak
 }
 
 // ---------------------------------------------------------------------------
