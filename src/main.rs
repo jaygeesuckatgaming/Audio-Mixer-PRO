@@ -5,6 +5,7 @@ mod clap_host;
 mod clap_plugin;
 mod clap_slot;
 mod editor_host;
+mod endpoint_format;
 mod host_window;
 mod plugin;
 mod sessions;
@@ -1030,6 +1031,9 @@ struct MixerApp {
     apps_open: [bool; MAX_STRIPS],
     apps_scroll: [usize; MAX_STRIPS],
     apps_targets: Vec<String>,
+    /// Bit depth and sample rate Windows has configured for each endpoint, so
+    /// a strip can name the format of the cable it listens to.
+    endpoint_formats: endpoint_format::EndpointFormats,
     /// One VST3 insert per input strip (rebuild extension, see vst.rs).
     vsts: Vec<VstSlot>,
     /// Which strip's VST selector is open, if any.
@@ -1601,6 +1605,7 @@ impl MixerApp {
             apps_open: [true; MAX_STRIPS],
             apps_scroll: [0; MAX_STRIPS],
             apps_targets: Vec::new(),
+            endpoint_formats: endpoint_format::EndpointFormats::new(),
             vsts: vst_chains.into_iter().map(VstSlot::new).collect(),
             vst_panel: None,
             vst_scan: None,
@@ -5505,12 +5510,19 @@ impl MixerApp {
         let mut y = inner.top();
         let w = inner.width();
 
+        // The endpoint's configured format ("24-bit · 48 kHz"), from the
+        // background property-store scan. It gets a line of its own under the
+        // cable name, so the VST chip moves into the top corner and stops
+        // eating the width of the device line.
+        let endpoint_format = self.endpoint_formats.get(&self.strips[idx].device);
+        let header_h = if endpoint_format.is_some() { 35.0 } else { 26.0 };
+
         // header (click = choose device, right click = strip menu)
-        let header = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, 26.0));
+        let header = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, header_h));
         let hresp = ui.interact(header, Id::new(("strip_head", idx)), Sense::click());
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let vst_btn = Rect::from_min_size(
-            Pos2::new(header.right() - 25.0, header.top() + 7.5),
+            Pos2::new(header.right() - 25.0, header.top() + 1.0),
             Vec2::new(24.0, 11.0),
         );
         let mut over_vst = false;
@@ -5566,16 +5578,41 @@ impl MixerApp {
         ui.painter().text(
             Pos2::new(header.left(), header.top() + 13.0),
             Align2::LEFT_TOP,
-            fit_text(ui.painter(), &device_label, 7.3, w - 27.0),
+            fit_text(ui.painter(), &device_label, 7.3, w),
             FontId::proportional(7.3),
             DIM,
         );
+        if let Some(format) = endpoint_format {
+            // Full "24-bit · 48 kHz" when the strip is wide enough, otherwise
+            // the narrow form so the number is never cut in half.
+            let full = format.label();
+            let measured = ui
+                .painter()
+                .layout_no_wrap(full.clone(), FontId::proportional(6.6), FAINT)
+                .size()
+                .x;
+            let text = if measured <= w { full } else { format.compact() };
+            ui.painter().text(
+                Pos2::new(header.left(), header.top() + 22.0),
+                Align2::LEFT_TOP,
+                fit_text(ui.painter(), &text, 6.6, w),
+                FontId::proportional(6.6),
+                FAINT,
+            );
+        }
         if hresp.clicked() && enabled && !over_vst {
             self.picker = Some(Picker::Strip(idx));
         }
         let _ = hresp.clone().on_hover_text(format!(
-            "{}\nClick to choose the input device, right click for the strip menu",
-            self.strips[idx].device
+            "{}{}\nClick to choose the input device, right click for the strip menu",
+            self.strips[idx].device,
+            match endpoint_format {
+                Some(format) => format!(
+                    "\nFormat: {} (Windows Sound > Advanced)",
+                    format.label()
+                ),
+                None => String::new(),
+            }
         ));
         if !self.lock_gui {
             let mut open_label = false;
@@ -5697,12 +5734,12 @@ impl MixerApp {
                 return;
             }
         }
-        y += 29.0;
+        y += header_h + 3.0;
 
         // Plug-in insert panel. The built-in pan/comp/gate/3-band EQ controls are
         // gone: every strip runs a VST3 insert, so this space names the plug-in
         // that is actually in the chain and opens its own screen.
-        let insert = Rect::from_min_size(Pos2::new(inner.left(), y + 2.0), Vec2::new(w, 92.0));
+        let insert = Rect::from_min_size(Pos2::new(inner.left(), y + 2.0), Vec2::new(w, 84.0));
         let insert_resp = ui.interact(insert, Id::new(("insert_panel", idx)), Sense::click());
         {
             let loaded = self.vsts[idx].loaded();
@@ -5896,7 +5933,7 @@ impl MixerApp {
                 FAINT,
             );
         }
-        y += 96.0;
+        y += 88.0;
 
         // Applications rendering into this strip's virtual cable. The block is
         // only there for virtual strips bound to a Virtual Cable endpoint.
@@ -6172,7 +6209,31 @@ impl MixerApp {
         let w = inner.width();
         let mut y = inner.top();
 
-        let header = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, 26.0));
+        // Format Windows configured for this bus's endpoint. An unset B1/B2
+        // resolves through its automatic cable, so the line is there before the
+        // bus is pointed at a device by hand.
+        let bus_format = {
+            let name = if !self.buses[idx].device.trim().is_empty() {
+                self.buses[idx].device.clone()
+            } else if let Some(cable) = self.bus_cable_number(idx) {
+                let label = format!(
+                    "{} Cable {:02}",
+                    if self.driver_mode { "Virtual" } else { "USB" },
+                    cable
+                );
+                cable_render_device(&self.last_outputs, &label)
+            } else {
+                String::new()
+            };
+            if name.is_empty() {
+                None
+            } else {
+                self.endpoint_formats.get(&name)
+            }
+        };
+        let header_h = if bus_format.is_some() { 35.0 } else { 26.0 };
+
+        let header = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, header_h));
         let hresp = ui.interact(header, Id::new(("bus_head", idx)), Sense::click());
         // Status stripe on the card's left edge: green while the stream runs,
         // amber while it is being opened, red after a failed open (retried
@@ -6230,6 +6291,22 @@ impl MixerApp {
             FontId::proportional(7.3),
             if looping { RED } else { DIM },
         );
+        if let Some(format) = bus_format {
+            let full = format.label();
+            let measured = ui
+                .painter()
+                .layout_no_wrap(full.clone(), FontId::proportional(6.6), FAINT)
+                .size()
+                .x;
+            let text = if measured <= w { full } else { format.compact() };
+            ui.painter().text(
+                Pos2::new(header.left(), header.top() + 22.0),
+                Align2::LEFT_TOP,
+                fit_text(ui.painter(), &text, 6.6, w),
+                FontId::proportional(6.6),
+                FAINT,
+            );
+        }
         // A bus that would hear its own output gets a red badge next to REF;
         // hovering the card explains which input closes the ring.
         if looping {
@@ -6313,8 +6390,14 @@ impl MixerApp {
         };
         hover.push_str("\n\n");
         hover.push_str(&state_text);
+        if let Some(format) = bus_format {
+            hover.push_str(&format!(
+                "\nFormat: {} (Windows Sound > Advanced)",
+                format.label()
+            ));
+        }
         let _ = hresp.on_hover_text(hover);
-        y += 29.0;
+        y += header_h + 3.0;
 
         // bus mode selector
         let mode_rect = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, 18.0));
@@ -7680,6 +7763,24 @@ impl MixerApp {
                                 device.capture_rate(),
                                 if device.capture_active() { "" } else { " (idle)" }
                             ));
+                        }
+                    }
+                    if !self.endpoint_formats.is_empty() {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("ENDPOINT FORMATS")
+                                .strong()
+                                .color(AMBER),
+                        );
+                        for idx in 0..self.active_strips.min(self.strips.len()) {
+                            let name = &self.strips[idx].device;
+                            if let Some(format) = self.endpoint_formats.get(name) {
+                                ui.label(format!(
+                                    "{}: {} ({name})",
+                                    self.strips[idx].name,
+                                    format.label()
+                                ));
+                            }
                         }
                     }
                     ui.separator();
@@ -10722,7 +10823,11 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     if raw_args.iter().any(|arg| arg == "--apps-selftest") {
-        let report = sessions::self_test();
+        let report = format!(
+            "{}{}",
+            sessions::self_test(),
+            endpoint_format::self_test()
+        );
         let path = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("apps_selftest.txt");
