@@ -8346,22 +8346,30 @@ Right click > Source to use the Windows capture stream instead."
                         }
                     }
                     let mut measure = false;
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button("Measure path delay")
-                            .on_hover_text(
-                                "Cross-correlates two strips on the same cable: one direct, one Windows capture",
-                            )
-                            .clicked()
-                        {
-                            measure = true;
-                        }
-                        if let Some(text) = &self.path_delay {
-                            ui.label(text);
-                        }
-                    });
+                    if ui
+                        .button("Measure path delay")
+                        .on_hover_text(
+                            "Cross-correlates two strips on the same cable: one direct, one Windows capture",
+                        )
+                        .clicked()
+                    {
+                        measure = true;
+                    }
                     if measure {
                         self.path_delay = Some(self.measure_path_delay());
+                    }
+                    if let Some(text) = &self.path_delay {
+                        // On its own line and wrapped: in the same row as the
+                        // button, a narrow Audio Stats panel clipped the answer -
+                        // which is where the comparison text had gone.
+                        let colour = if text.starts_with("Inconclusive")
+                            || text.contains("*ahead*")
+                        {
+                            AMBER
+                        } else {
+                            GREEN
+                        };
+                        ui.label(egui::RichText::new(text).size(10.0).color(colour));
                     }
                     ui.separator();
                     ui.label(egui::RichText::new("VST LATENCY").strong().color(AMBER));
