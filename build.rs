@@ -19,26 +19,42 @@ fn main() {
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=icons/Icon_2_48_48_1.ico");
     println!("cargo:rerun-if-changed=REV");
+    println!("cargo:rerun-if-changed=CHANNEL");
     println!("cargo:rerun-if-changed=.git/HEAD");
 
-    // The window title shows this. `REV` is the release number kept in step with
-    // VERSION.txt; the short hash makes a build identifiable even between
-    // releases. Building from a source zip without .git still works.
+    // The window shows this. `CHANNEL` is the release line ("Beta 6") and `REV`
+    // the build number, both kept in step with VERSION.txt; the short hash goes
+    // in the tooltip and identifies a build even between releases. Building from
+    // a source zip without .git still works.
     let rev = std::fs::read_to_string("REV")
         .ok()
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
+    let channel = std::fs::read_to_string("CHANNEL")
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
     let mut parts = Vec::new();
+    if let Some(channel) = channel {
+        parts.push(channel);
+    }
     if let Some(rev) = rev {
         parts.push(format!("rev {rev}"));
     }
-    if let Some(hash) = git(&["rev-parse", "--short", "HEAD"]) {
-        parts.push(hash);
-    }
-    let build = if parts.is_empty() {
+    let short = if parts.is_empty() {
         "development build".to_string()
     } else {
         parts.join(" \u{b7} ")
     };
-    println!("cargo:rustc-env=APP_BUILD={build}");
+    let mut full = parts;
+    if let Some(hash) = git(&["rev-parse", "--short", "HEAD"]) {
+        full.push(hash);
+    }
+    let full = if full.is_empty() {
+        short.clone()
+    } else {
+        full.join(" \u{b7} ")
+    };
+    println!("cargo:rustc-env=APP_BUILD={short}");
+    println!("cargo:rustc-env=APP_BUILD_FULL={full}");
 }

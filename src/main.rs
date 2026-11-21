@@ -34,10 +34,11 @@ const LINE: Color32 = Color32::from_rgb(47, 54, 65);
 const TEXT: Color32 = Color32::from_rgb(216, 222, 231);
 const DIM: Color32 = Color32::from_rgb(124, 134, 150);
 const FAINT: Color32 = Color32::from_rgb(83, 92, 106);
-/// Release number from `REV` plus the short git hash, stamped by build.rs. Shown
-/// in the top bar so a screenshot or a user report says exactly which build it
-/// is.
+/// Release line and build number from `CHANNEL` and `REV`, stamped by build.rs.
+/// Shown in the top bar so a screenshot or a user report says exactly which build
+/// it is; `BUILD_FULL` adds the commit for the tooltip.
 const BUILD: &str = env!("APP_BUILD");
+const BUILD_FULL: &str = env!("APP_BUILD_FULL");
 const AMBER: Color32 = Color32::from_rgb(224, 158, 55);
 const BLUE: Color32 = Color32::from_rgb(76, 158, 214);
 const TEAL: Color32 = Color32::from_rgb(70, 176, 154);
@@ -1980,7 +1981,7 @@ fn path_delay_ms(
     bucket_frames: usize,
     rate: u32,
     max_ms: f32,
-) -> Option<(f32, f32)> {
+) -> Option<(f32, f32, f32)> {
     let n = a.len().min(b.len());
     if n < 32 || rate == 0 || bucket_frames == 0 {
         return None;
@@ -2014,7 +2015,16 @@ fn path_delay_ms(
         .iter()
         .filter(|(_, score)| *score >= threshold)
         .min_by_key(|(lag, _)| lag.abs())?;
-    Some((chosen.0 as f32 * bucket_ms, chosen.1))
+    // How strong is the best match *elsewhere*? A music loop correlates about as
+    // well at multiples of its beat as at the real delay, which is how a steady
+    // track produced 250 ms and then -197 ms. When a distant lag is nearly as
+    // good, the number must not be presented as fact.
+    let runner_up = scores
+        .iter()
+        .filter(|(lag, _)| (lag - chosen.0).abs() > 8)
+        .map(|(_, score)| *score)
+        .fold(f32::MIN, f32::max);
+    Some((chosen.0 as f32 * bucket_ms, chosen.1, runner_up))
 }
 
 
@@ -2081,7 +2091,7 @@ fn path_delay_ms(
         let recent = a.len().min(b.len()).min(192);
         let a = &a[a.len() - recent..];
         let b = &b[b.len() - recent..];
-        let Some((ms, score)) = Self::path_delay_ms(
+        let Some((ms, score, runner_up)) = Self::path_delay_ms(
             a,
             b,
             audio::ENV_BUCKET_FRAMES,
@@ -2091,13 +2101,39 @@ fn path_delay_ms(
             return "Not enough variation to measure - use something with speech or transients."
                 .to_string();
         };
-        let text = format!(
-            "{} (direct) vs {} (capture): capture is {:.1} ms behind (correlation {:.2})",
-            self.strip_label(direct),
-            self.strip_label(capture),
-            ms,
-            score
-        );
+        if runner_up > score - 0.03 {
+            let text = format!(
+                "Inconclusive: lags {:.1} ms ({:.2}) and another one ({:.2}) match almost equally - a steady beat does this. Use speech or a source with clear transients.",
+                ms, score, runner_up
+            );
+            diag_log(format!("path delay: {text}"));
+            return text;
+        }
+        if ms.abs() > 150.0 {
+            let text = format!(
+                "Inconclusive: the best match is {:.1} ms away, which is too far for this path - likely periodic material.",
+                ms
+            );
+            diag_log(format!("path delay: {text}"));
+            return text;
+        }
+        let text = if ms >= 0.0 {
+            format!(
+                "{} (direct) vs {} (capture): capture is {:.1} ms behind (correlation {:.2})",
+                self.strip_label(direct),
+                self.strip_label(capture),
+                ms,
+                score
+            )
+        } else {
+            format!(
+                "{} (direct) vs {} (capture): capture is {:.1} ms *ahead*, which should not happen - try again with speech playing (correlation {:.2})",
+                self.strip_label(direct),
+                self.strip_label(capture),
+                -ms,
+                score
+            )
+        };
         diag_log(format!("path delay: {text}"));
         text
     }
@@ -5612,7 +5648,7 @@ fn path_delay_ms(
             FontId::proportional(8.0),
             FAINT,
         );
-        let build_tip = format!("Audio Mixer PRO {BUILD}");
+        let build_tip = format!("Audio Mixer PRO {BUILD_FULL}");
         let _ = ui
             .interact(build_rect, Id::new("build_label"), Sense::hover())
             .on_hover_text(build_tip);
@@ -11916,30 +11952,47 @@ mod tests {
         out
     }
 
+    /// Deterministic noise: a signal whose envelope has one answer, unlike music.
+    fn noise(len: usize) -> Vec<f32> {
+        let mut state = 0x1234_5678u32;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
     fn bucket_ms(frames: usize) -> f32 {
         frames as f32 / 48_000.0 * 1000.0
     }
 
     #[test]
     fn path_delay_finds_a_small_delay() {
-        let a: Vec<f32> = (0..400).map(|i| ((i * 37) % 19) as f32 / 19.0).collect();
+        let a = noise(400);
         let b = delayed(&a, 7);
-        let (ms, score) = MixerApp::path_delay_ms(&a, &b, 128, 48_000, 300.0).unwrap();
+        let (ms, score, runner_up) =
+            MixerApp::path_delay_ms(&a, &b, 128, 48_000, 300.0).unwrap();
         assert!((ms - 7.0 * bucket_ms(128)).abs() < 0.2, "{ms} {score}");
         assert!(score > 0.99, "{score}");
+        // A non-periodic signal has one clear answer.
+        assert!(runner_up < score - 0.03, "{score} vs {runner_up}");
     }
 
     #[test]
-    fn path_delay_prefers_the_first_strong_peak_on_periodic_material() {
+    fn path_delay_flags_ambiguous_periodic_material() {
         // A pulse every 40 buckets: the correlation is just as strong at 45, 85,
-        // ... as at the real delay of 5, which is what reported 250 ms.
+        // ... as at the real delay of 5, which is what reported 250 ms and then
+        // -197 ms. The caller refuses to publish a number when this is the case.
         let mut a = vec![0.0f32; 400];
         for i in (0..400).step_by(40) {
             a[i] = 1.0;
         }
         let b = delayed(&a, 5);
-        let (ms, _) = MixerApp::path_delay_ms(&a, &b, 128, 48_000, 300.0).unwrap();
+        let (ms, score, runner_up) =
+            MixerApp::path_delay_ms(&a, &b, 128, 48_000, 300.0).unwrap();
         assert!((ms - 5.0 * bucket_ms(128)).abs() < 0.3, "{ms}");
+        assert!(runner_up > score - 0.03, "{score} vs {runner_up}");
     }
 
     #[test]
