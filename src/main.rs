@@ -942,9 +942,8 @@ struct MixerApp {
     /// One real capture stream per hardware strip (None until a device opens).
     captures: Vec<Option<StripInput>>,
     /// Per strip: read a USB cable's own buffer ("direct") instead of a Windows
-    /// capture stream on its microphone endpoint. Off by default while the tap
-    /// is being proven: the strip menu enables it per session, and a strip that
-    /// sounds wrong can always be switched back.
+    /// capture stream on its microphone endpoint. On by default; the strip menu
+    /// switches it per session and the choice is saved with the scene.
     strip_direct: [bool; MAX_STRIPS],
     tape: Tape,
     audio: AudioEngine,
@@ -1553,7 +1552,7 @@ impl MixerApp {
             pending_auto_assign: Vec::new(),
             buses: (0..audio::MAX_BUSES).map(Bus::new).collect(),
             captures,
-            strip_direct: [false; MAX_STRIPS],
+            strip_direct: [true; MAX_STRIPS],
             tape: Tape::new(),
             audio,
             sample_rate,
@@ -3281,7 +3280,7 @@ impl MixerApp {
                 flags |= 0x4000_0000;
             }
             text.push_str(&format!(
-                "\t<Strip index='{}' mute='{}' vaio='{}' solo='{}' mono='{}' muc='{}' prg_c='{}' prg_g='{}' busa='{}' busa2='{}' busa3='{}' busb='{}' busb2='{}' busb3='{}' karaoke='{}' dblevel='{:.2}' dblimit='{:.2}' />\n",
+                "\t<Strip index='{}' mute='{}' vaio='{}' solo='{}' mono='{}' muc='{}' prg_c='{}' prg_g='{}' busa='{}' busa2='{}' busa3='{}' busb='{}' busb2='{}' busb3='{}' karaoke='{}' dblevel='{:.2}' dblimit='{:.2}' direct='{}' />\n",
                 i + 1,
                 flags & 1,
                 (flags >> 30) & 1,
@@ -3298,7 +3297,12 @@ impl MixerApp {
                 (flags >> 18) & 1,
                 s.karaoke,
                 s.gain_db,
-                s.limit
+                s.limit,
+                if self.strip_direct.get(i).copied().unwrap_or(true) {
+                    1
+                } else {
+                    0
+                }
             ));
             text.push_str(&format!(
                 "\t<StripComp index='{}' gainin='{:.2}' attack='{:.1}' release='{:.1}' knee='{:.2}' comprate='{:.3}' threshold='{:.2}' automakeup='{}' gainout='{:.2}' />\n",
@@ -5155,6 +5159,13 @@ impl MixerApp {
                     // FUN_0052b490 clamps the loaded karaoke value to 0..4.
                     "k" => s.karaoke = value.parse().unwrap_or(s.karaoke).min(4),
                     "device" => s.device = value.to_string(),
+                    // Source choice for a USB cable strip: 1 = read the cable's
+                    // own buffer, 0 = Windows capture of its microphone endpoint.
+                    "direct" => {
+                        if idx < MAX_STRIPS {
+                            self.strip_direct[idx] = value != "0";
+                        }
+                    }
                     "eq" => {
                         let vals: Vec<f32> = value.split(',').filter_map(|p| p.parse().ok()).collect();
                         if vals.len() == 3 {
