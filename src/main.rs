@@ -5,8 +5,7 @@ mod clap_host;
 mod clap_plugin;
 mod clap_slot;
 mod diagnostics;
-mod editor_host;
-mod endpoint_format;
+mod editor_host;mod endpoint_format;
 mod host_window;
 mod plugin;
 mod sessions;
@@ -35,6 +34,10 @@ const LINE: Color32 = Color32::from_rgb(47, 54, 65);
 const TEXT: Color32 = Color32::from_rgb(216, 222, 231);
 const DIM: Color32 = Color32::from_rgb(124, 134, 150);
 const FAINT: Color32 = Color32::from_rgb(83, 92, 106);
+/// Release number from `REV` plus the short git hash, stamped by build.rs. Shown
+/// in the top bar so a screenshot or a user report says exactly which build it
+/// is.
+const BUILD: &str = env!("APP_BUILD");
 const AMBER: Color32 = Color32::from_rgb(224, 158, 55);
 const BLUE: Color32 = Color32::from_rgb(76, 158, 214);
 const TEAL: Color32 = Color32::from_rgb(70, 176, 154);
@@ -5595,6 +5598,24 @@ fn path_delay_ms(
         if top_button(ui, ducking_hit, "DUCKING", self.show_ducking, AMBER) {
             self.show_ducking = true;
         }
+
+        // Build identity, left of the seven window-control buttons (each 24 wide
+        // with a 28 gap): clear of the A / R buttons.
+        let build_rect = Rect::from_min_size(
+            Pos2::new(rect.right() - 318.0, rect.top() + 7.0),
+            Vec2::new(80.0, 24.0),
+        );
+        p.text(
+            Pos2::new(build_rect.right(), rect.top() + 12.0),
+            Align2::RIGHT_TOP,
+            BUILD,
+            FontId::proportional(8.0),
+            FAINT,
+        );
+        let build_tip = format!("Audio Mixer PRO {BUILD}");
+        let _ = ui
+            .interact(build_rect, Id::new("build_label"), Sense::hover())
+            .on_hover_text(build_tip);
 
         // right-hand status boxes
         let mut x = rect.right() - 8.0;
