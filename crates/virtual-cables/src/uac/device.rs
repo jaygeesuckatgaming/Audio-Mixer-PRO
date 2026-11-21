@@ -465,9 +465,12 @@ impl Device {
     }
 
     fn refresh_audio_path(&self, state: &mut State) {
-        // The tap holds wire bytes at the playback format; a rate or interface
-        // change makes whatever is queued stale, so drop it.
-        self.tap.reset();
+        // Do NOT touch the tap here. This runs from set_playback_rate, which the
+        // server calls on every isochronous transfer: resetting the tap here
+        // wiped it about a thousand times a second, so only the frames that
+        // arrived since the previous transfer survived and the strip heard the
+        // audio chopped into 1-3 ms fragments. Stale bytes are dropped where they
+        // can actually change - see write_playback's frame-size check.
         let playback_bytes = bytes_per_sample_for_alt(state.alt_setting[1]);
         let capture_bytes = bytes_per_sample_for_alt(state.alt_setting[2]);
         if playback_bytes == 0
@@ -494,11 +497,12 @@ impl Device {
     }
 
     pub fn write_playback(&self, p: &[u8]) -> usize {
-        let (active, bypass) = {
+        let (active, bypass, bytes) = {
             let state = self.state.lock().unwrap();
             (
                 state.configuration == 1 && state.alt_setting[1] > 0,
                 state.bypass,
+                bytes_per_sample_for_alt(state.alt_setting[1]),
             )
         };
         if !active {
@@ -510,7 +514,11 @@ impl Device {
             // format, with no extra delay. Everything here is frame-aligned:
             // dropping an odd number of bytes would shift every later stereo
             // frame and turn the tap into noise.
-            let frame_bytes = self.tap_frame_bytes.load(Ordering::Relaxed).max(1);
+            let frame_bytes = (bytes * AUDIO_CHANNELS).max(1);
+            if self.tap_frame_bytes.swap(frame_bytes, Ordering::Relaxed) != frame_bytes {
+                // The interface really did change width; queued bytes are stale.
+                self.tap.reset();
+            }
             let whole = (p.len() / frame_bytes) * frame_bytes;
             if whole > 0 {
                 let capacity = self.tap.capacity();

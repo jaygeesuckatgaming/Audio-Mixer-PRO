@@ -1552,7 +1552,7 @@ impl MixerApp {
             pending_auto_assign: Vec::new(),
             buses: (0..audio::MAX_BUSES).map(Bus::new).collect(),
             captures,
-            strip_direct: [false; MAX_STRIPS],
+            strip_direct: [true; MAX_STRIPS],
             tape: Tape::new(),
             audio,
             sample_rate,
@@ -8134,10 +8134,15 @@ Right click > Source to use the Windows capture stream instead."
                                 || self.strips[i].route[3]
                                 || self.strips[i].route[4];
                             ui.label(format!(
-                                "{}: {} | {} Hz | ring {:.1} ms | last {} frames{}",
+                                "{}: {} | {} Hz | {} | ring {:.1} ms | last {} frames{}",
                                 self.strips[i].name,
                                 cap.device(),
                                 cap.sample_rate(),
+                                if cap.direct() {
+                                    "direct from the cable"
+                                } else {
+                                    "windows capture"
+                                },
                                 cap.ring_fill_ms(),
                                 cap.last_frames(),
                                 if mixed { "" } else { " (not mixed to A1/B1/B2)" }
