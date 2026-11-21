@@ -945,6 +945,8 @@ struct MixerApp {
     /// capture stream on its microphone endpoint. On by default; the strip menu
     /// switches it per session and the choice is saved with the scene.
     strip_direct: [bool; MAX_STRIPS],
+    /// Result of the last direct-vs-capture path measurement.
+    path_delay: Option<String>,
     tape: Tape,
     audio: AudioEngine,
     sample_rate: u32,
@@ -1553,6 +1555,7 @@ impl MixerApp {
             buses: (0..audio::MAX_BUSES).map(Bus::new).collect(),
             captures,
             strip_direct: [true; MAX_STRIPS],
+            path_delay: None,
             tape: Tape::new(),
             audio,
             sample_rate,
@@ -1958,6 +1961,142 @@ impl MixerApp {
             self.main_buffer, self.main_buffer
         );
         (total, detail)
+    }
+
+/// Lag in milliseconds at which `b` most closely follows `a` (positive = `b`
+/// lags), plus the correlation at that lag.
+///
+/// Periodic material - a music loop, a steady beat - correlates well at several
+/// lags, so the global maximum can be a multiple of the real delay (a quarter of
+/// a second looked plausible only because the beat repeated there). The earliest
+/// lag whose score is within a few percent of the best is the one that describes
+/// the actual path.
+fn path_delay_ms(
+    a: &[f32],
+    b: &[f32],
+    bucket_frames: usize,
+    rate: u32,
+    max_ms: f32,
+) -> Option<(f32, f32)> {
+    let n = a.len().min(b.len());
+    if n < 32 || rate == 0 || bucket_frames == 0 {
+        return None;
+    }
+    let bucket_ms = bucket_frames as f32 / rate as f32 * 1000.0;
+    let max_lag = ((max_ms / bucket_ms).round() as isize).clamp(0, n as isize - 8);
+    let a = &a[a.len() - n..];
+    let b = &b[b.len() - n..];
+    let mut scores: Vec<(isize, f32)> = Vec::with_capacity((2 * max_lag + 1) as usize);
+    let mut best = f32::MIN;
+    for lag in -max_lag..=max_lag {
+        let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+        for (i, x) in a.iter().enumerate() {
+            let j = i as isize + lag;
+            if j < 0 || j >= n as isize {
+                continue;
+            }
+            let y = b[j as usize];
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        let score = dot / (na.sqrt() * nb.sqrt()).max(1e-6);
+        if score > best {
+            best = score;
+        }
+        scores.push((lag, score));
+    }
+    let threshold = (best * 0.97).max(0.85);
+    let chosen = scores
+        .iter()
+        .filter(|(_, score)| *score >= threshold)
+        .min_by_key(|(lag, _)| lag.abs())?;
+    Some((chosen.0 as f32 * bucket_ms, chosen.1))
+}
+
+
+    /// Cross-correlate two strips that listen to the same cable, one direct and
+    /// one on Windows capture, and report how far the capture path lags. This is
+    /// the only honest way to show the tap's benefit: the status-bar figure is a
+    /// model of buffers the mixer can see, and the capture engine's buffering
+    /// happens before our ring, so it cannot appear there.
+    fn measure_path_delay(&self) -> String {
+        let active = self.active_strips.min(self.strips.len());
+        let mut pair: Option<(usize, usize)> = None;
+        for i in 0..active {
+            for j in (i + 1)..active {
+                let (Some(ci), Some(cj)) =
+                    (self.captures[i].as_ref(), self.captures[j].as_ref())
+                else {
+                    continue;
+                };
+                if cable_label(&self.strips[i].device) != cable_label(&self.strips[j].device) {
+                    continue;
+                }
+                if ci.direct() == cj.direct() {
+                    continue;
+                }
+                pair = Some(if ci.direct() { (i, j) } else { (j, i) });
+            }
+        }
+        let Some((direct, capture)) = pair else {
+            return "Needs two strips on the same cable, one on direct and one on Windows capture."
+                .to_string();
+        };
+        let a = self.audio.strip_envelope(direct);
+        let b = self.audio.strip_envelope(capture);
+        let rate_direct = self.captures[direct]
+            .as_ref()
+            .map(|capture| capture.sample_rate())
+            .unwrap_or(0);
+        let rate_capture = self.captures[capture]
+            .as_ref()
+            .map(|capture| capture.sample_rate())
+            .unwrap_or(0);
+        if rate_direct == 0 || rate_capture == 0 || rate_direct != rate_capture {
+            // The lag is counted in buckets of each stream's own frames, so two
+            // different rates would stretch one timeline against the other and
+            // the answer would be meaningless.
+            return format!(
+                "Both strips must run at the same rate: {} is {} Hz and {} is {} Hz.",
+                self.strip_label(direct),
+                rate_direct,
+                self.strip_label(capture),
+                rate_capture
+            );
+        }
+        if a.len().min(b.len()) < 96 {
+            return format!(
+                "Collecting {}/96 blocks - let it play for a couple of seconds and press again.",
+                a.len().min(b.len())
+            );
+        }
+        // Only the most recent ~0.5 s: a capture stream's initial buffer (the
+        // cable's loopback ring plus engine priming) is a one-off that would
+        // otherwise dominate the alignment and report a delay that is not there
+        // any more.
+        let recent = a.len().min(b.len()).min(192);
+        let a = &a[a.len() - recent..];
+        let b = &b[b.len() - recent..];
+        let Some((ms, score)) = Self::path_delay_ms(
+            a,
+            b,
+            audio::ENV_BUCKET_FRAMES,
+            self.sample_rate.max(1),
+            300.0,
+        ) else {
+            return "Not enough variation to measure - use something with speech or transients."
+                .to_string();
+        };
+        let text = format!(
+            "{} (direct) vs {} (capture): capture is {:.1} ms behind (correlation {:.2})",
+            self.strip_label(direct),
+            self.strip_label(capture),
+            ms,
+            score
+        );
+        diag_log(format!("path delay: {text}"));
+        text
     }
 
     fn strip_label(&self, slot: usize) -> String {
@@ -8149,6 +8288,24 @@ Right click > Source to use the Windows capture stream instead."
                             ));
                         }
                     }
+                    let mut measure = false;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Measure path delay")
+                            .on_hover_text(
+                                "Cross-correlates two strips on the same cable: one direct, one Windows capture",
+                            )
+                            .clicked()
+                        {
+                            measure = true;
+                        }
+                        if let Some(text) = &self.path_delay {
+                            ui.label(text);
+                        }
+                    });
+                    if measure {
+                        self.path_delay = Some(self.measure_path_delay());
+                    }
                     ui.separator();
                     ui.label(egui::RichText::new("VST LATENCY").strong().color(AMBER));
                     for i in 0..self.active_strips {
@@ -11728,6 +11885,47 @@ mod tests {
         let inputs = vec!["Microphone (Virtual Cable 03)".to_string()];
         let used = vec!["microphone (virtual cable 03)".to_string()];
         assert!(MixerApp::next_free_virtual_cable_from(&inputs, &used).is_none());
+    }
+
+    fn delayed(source: &[f32], delay: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; source.len()];
+        for i in 0..source.len().saturating_sub(delay) {
+            out[i + delay] = source[i];
+        }
+        out
+    }
+
+    fn bucket_ms(frames: usize) -> f32 {
+        frames as f32 / 48_000.0 * 1000.0
+    }
+
+    #[test]
+    fn path_delay_finds_a_small_delay() {
+        let a: Vec<f32> = (0..400).map(|i| ((i * 37) % 19) as f32 / 19.0).collect();
+        let b = delayed(&a, 7);
+        let (ms, score) = MixerApp::path_delay_ms(&a, &b, 128, 48_000, 300.0).unwrap();
+        assert!((ms - 7.0 * bucket_ms(128)).abs() < 0.2, "{ms} {score}");
+        assert!(score > 0.99, "{score}");
+    }
+
+    #[test]
+    fn path_delay_prefers_the_first_strong_peak_on_periodic_material() {
+        // A pulse every 40 buckets: the correlation is just as strong at 45, 85,
+        // ... as at the real delay of 5, which is what reported 250 ms.
+        let mut a = vec![0.0f32; 400];
+        for i in (0..400).step_by(40) {
+            a[i] = 1.0;
+        }
+        let b = delayed(&a, 5);
+        let (ms, _) = MixerApp::path_delay_ms(&a, &b, 128, 48_000, 300.0).unwrap();
+        assert!((ms - 5.0 * bucket_ms(128)).abs() < 0.3, "{ms}");
+    }
+
+    #[test]
+    fn path_delay_rejects_silence() {
+        let a = vec![0.0f32; 400];
+        let b = vec![0.0f32; 400];
+        assert!(MixerApp::path_delay_ms(&a, &b, 128, 48_000, 300.0).is_none());
     }
 }
 

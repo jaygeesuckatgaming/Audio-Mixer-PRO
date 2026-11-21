@@ -1909,6 +1909,17 @@ impl AudioEngine {
         std::array::from_fn(|strip| self.shared.tap_frames[strip].swap(0, Ordering::Relaxed))
     }
 
+    /// Peak envelope of one strip's input (oldest first).
+    pub fn strip_envelope(&self, strip: usize) -> Vec<f32> {
+        self.shared
+            .inputs
+            .lock()
+            .ok()
+            .and_then(|inputs| inputs.get(strip).cloned().flatten())
+            .map(|input| lock_source(&input.envelope).ordered())
+            .unwrap_or_default()
+    }
+
     /// Frames currently queued for a strip's reader.
     pub fn strip_fill_frames(&self, strip: usize) -> usize {
         self.shared
@@ -2906,6 +2917,63 @@ pub(crate) struct InputShared {
     /// Frames in the last capture callback.
     frames: AtomicUsize,
     error: Mutex<Option<String>>,
+    /// Short envelope (peak per 128 frames) of what this strip receives. Two
+    /// strips listening to the same cable can be cross-correlated with it to
+    /// measure the real difference between the direct tap and a Windows
+    /// capture, which the latency figure cannot show because the capture
+    /// engine's buffering happens before this ring.
+    envelope: Mutex<Envelope>,
+}
+
+/// Peak per 128 frames, 512 buckets: about 1.4 s at 48 kHz.
+pub const ENV_BUCKET_FRAMES: usize = 128;
+const ENV_BUCKETS: usize = 512;
+/// Frames the envelope remembers in total.
+pub const ENV_FRAMES: usize = ENV_BUCKET_FRAMES * ENV_BUCKETS;
+
+struct Envelope {
+    buckets: Vec<f32>,
+    pos: usize,
+    filled: usize,
+    acc: f32,
+    frames: usize,
+}
+
+impl Envelope {
+    fn new() -> Self {
+        Self {
+            buckets: vec![0.0; ENV_BUCKETS],
+            pos: 0,
+            filled: 0,
+            acc: 0.0,
+            frames: 0,
+        }
+    }
+
+    fn push(&mut self, frame: [f32; 2]) {
+        let a = frame[0].abs().max(frame[1].abs());
+        if a > self.acc {
+            self.acc = a;
+        }
+        self.frames += 1;
+        if self.frames >= ENV_BUCKET_FRAMES {
+            self.buckets[self.pos] = self.acc;
+            self.pos = (self.pos + 1) % ENV_BUCKETS;
+            self.filled = (self.filled + 1).min(ENV_BUCKETS);
+            self.acc = 0.0;
+            self.frames = 0;
+        }
+    }
+
+    /// Oldest to newest, so index arithmetic is ordinary.
+    fn ordered(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.filled);
+        let start = (self.pos + ENV_BUCKETS - self.filled) % ENV_BUCKETS;
+        for i in 0..self.filled {
+            out.push(self.buckets[(start + i) % ENV_BUCKETS]);
+        }
+        out
+    }
 }
 
 impl InputShared {
@@ -2916,6 +2984,7 @@ impl InputShared {
             peak: f32_atomic(0.0),
             frames: AtomicUsize::new(0),
             error: Mutex::new(None),
+            envelope: Mutex::new(Envelope::new()),
         }
     }
 
@@ -3246,6 +3315,13 @@ impl InputCapture {
         self.shared.frames.load(Ordering::Relaxed)
     }
 
+    /// Peak envelope of what this strip receives (one value per 128 frames,
+    /// oldest first). Used to measure the delay between two strips listening to
+    /// the same cable.
+    pub fn envelope(&self) -> Vec<f32> {
+        lock_source(&self.shared.envelope).ordered()
+    }
+
     /// Frames currently waiting in the capture ring, expressed in milliseconds
     /// at the device rate.
     pub fn ring_fill_ms(&self) -> f32 {
@@ -3312,6 +3388,7 @@ where
             move |data: &[T], _info: &cpal::InputCallbackInfo| {
                 let mut peak = 0.0f32;
                 let mut ring = lock_source(&shared.ring);
+                let mut envelope = lock_source(&shared.envelope);
                 for frame in data.chunks(channels.max(1)) {
                     let mut l = 0.0f32;
                     let mut r = 0.0f32;
@@ -3332,6 +3409,7 @@ where
                         r = l;
                     }
                     ring.push([l, r]);
+                    envelope.push([l, r]);
                 }
                 shared.peak.store(peak.to_bits(), Ordering::Relaxed);
                 shared
@@ -3636,6 +3714,7 @@ fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
         let mut peak = 0.0f32;
         {
             let mut ring = lock_source(&input.ring);
+            let mut envelope = lock_source(&input.envelope);
             for frame in tap_buf[..whole].chunks_exact(frame_bytes) {
                 let (l, r) = match bytes {
                     2 => (
@@ -3654,6 +3733,7 @@ fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
                 let (l, r) = (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0));
                 peak = peak.max(l.abs()).max(r.abs());
                 ring.push([l, r]);
+                envelope.push([l, r]);
             }
         }
         input.peak.store(peak.to_bits(), Ordering::Relaxed);
