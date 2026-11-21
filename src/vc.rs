@@ -35,6 +35,13 @@ impl Default for Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagAction {
+    Save,
+    Copy,
+    OpenFolder,
+}
+
 pub struct VirtualCables {
     tx: Sender<Command>,
     status: Arc<Mutex<Status>>,
@@ -43,6 +50,9 @@ pub struct VirtualCables {
     /// directly so their mix reaches the cable capture endpoints.
     devices: Arc<Mutex<Vec<Arc<Device>>>>,
     cfg: Config,
+    /// Set by the DIAGNOSTICS row; the app performs it, because only the app has
+    /// the strip and device state a report needs.
+    pub diag_request: Option<DiagAction>,
 }
 
 enum Command {
@@ -71,6 +81,7 @@ impl VirtualCables {
             log,
             devices,
             cfg,
+            diag_request: None,
         }
     }
 
@@ -302,6 +313,48 @@ impl VirtualCables {
             ui.label(
                 egui::RichText::new(
                     "Cables need the administrator helper. Press Install once; afterwards the                      mixer attaches with no UAC prompt.",
+                )
+                .size(9.0)
+                .color(FAINT),
+            );
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("DIAGNOSTICS")
+                        .size(9.0)
+                        .strong()
+                        .color(FAINT),
+                );
+                if ui
+                    .button("Save report")
+                    .on_hover_text(
+                        "Write one text file with the build, devices, plug-ins and the last logs",
+                    )
+                    .clicked()
+                {
+                    self.diag_request = Some(DiagAction::Save);
+                }
+                if ui
+                    .button("Copy")
+                    .on_hover_text("Copy the same text to the clipboard")
+                    .clicked()
+                {
+                    self.diag_request = Some(DiagAction::Copy);
+                }
+                if ui
+                    .button("Open folder")
+                    .on_hover_text("Show the folder the logs are written to")
+                    .clicked()
+                {
+                    self.diag_request = Some(DiagAction::OpenFolder);
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "A support report lists device, application and plug-in names and the \
+                     last few hundred log lines. It contains no audio.",
                 )
                 .size(9.0)
                 .color(FAINT),

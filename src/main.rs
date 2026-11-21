@@ -4,6 +4,7 @@ mod audio;
 mod clap_host;
 mod clap_plugin;
 mod clap_slot;
+mod diagnostics;
 mod editor_host;
 mod endpoint_format;
 mod host_window;
@@ -602,6 +603,14 @@ impl StripInput {
         }
     }
 
+    /// True when the audio comes from a cable's own device buffer.
+    fn direct(&self) -> bool {
+        match self {
+            Self::Cpal(capture) => capture.direct,
+            Self::Vban(_) => false,
+        }
+    }
+
     fn channels(&self) -> u16 {
         match self {
             Self::Cpal(capture) => capture.channels,
@@ -932,6 +941,10 @@ struct MixerApp {
     buses: Vec<Bus>,
     /// One real capture stream per hardware strip (None until a device opens).
     captures: Vec<Option<StripInput>>,
+    /// Per strip: prefer reading a USB cable's own buffer ("direct") over a
+    /// Windows capture stream on its microphone endpoint. The menu flips it for
+    /// the current session when a cable misbehaves.
+    strip_direct: [bool; MAX_STRIPS],
     tape: Tape,
     audio: AudioEngine,
     sample_rate: u32,
@@ -1539,6 +1552,7 @@ impl MixerApp {
             pending_auto_assign: Vec::new(),
             buses: (0..audio::MAX_BUSES).map(Bus::new).collect(),
             captures,
+            strip_direct: [true; MAX_STRIPS],
             tape: Tape::new(),
             audio,
             sample_rate,
@@ -2170,6 +2184,27 @@ impl MixerApp {
             self.toast(format!("{name} is no longer routed to {bus_name}"));
             return;
         }
+        // A direct tap is only one mixer block behind the cable, so a strip that
+        // is routed back into the cable it listens to would howl almost
+        // instantly. Give up the tap for that strip and use the Windows capture
+        // stream, which has enough delay to be survivable (and the bus card
+        // already warns about the ring).
+        if self.strip_direct[strip] && self.strip_feeds_own_cable(strip) {
+            let tapped = self
+                .captures
+                .get(strip)
+                .and_then(|capture| capture.as_ref())
+                .map(|capture| capture.direct())
+                .unwrap_or(false);
+            if tapped {
+                self.strip_direct[strip] = false;
+                let device = self.strips[strip].device.clone();
+                self.spawn_capture_open(strip, device);
+                self.toast(format!(
+                    "{name} would feed its own cable - switched to the Windows capture stream"
+                ));
+            }
+        }
         if strip < 3 {
             if self.captures.get(strip).and_then(|c| c.as_ref()).is_none() {
                 self.toast(format!(
@@ -2520,6 +2555,9 @@ impl MixerApp {
     /// Open a capture device on a worker so a wedged endpoint cannot freeze
     /// the console; the result is applied on a later frame.
     fn spawn_capture_open(&mut self, slot: usize, name: String) {
+        if self.open_cable_tap(slot, &name) {
+            return;
+        }
         let (sender, receiver) = std::sync::mpsc::channel();
         if std::thread::Builder::new()
             .name("capture-open".to_string())
@@ -2530,6 +2568,59 @@ impl MixerApp {
         {
             self.capture_jobs.push((slot, receiver));
         }
+    }
+
+    /// Bind a strip to a USB cable's own device buffer instead of opening a
+    /// Windows capture stream on the cable's microphone endpoint. The audio is
+    /// the same as the endpoint carries, but the strip hears it as the driver
+    /// receives it: no capture engine buffer, no second clock, no URB pacing.
+    fn open_cable_tap(&mut self, slot: usize, name: &str) -> bool {
+        if slot >= self.strips.len() || !self.strip_direct[slot] {
+            return false;
+        }
+        if !is_usb_cable_endpoint(name) {
+            return false;
+        }
+        let lower = name.to_ascii_lowercase();
+        if !lower.starts_with("microphone") {
+            return false;
+        }
+        let Some(cable) = cable_number(name) else {
+            return false;
+        };
+        let Ok(cable) = u8::try_from(cable) else {
+            return false;
+        };
+        if self.strip_feeds_own_cable(slot) {
+            diag_log(format!(
+                "tap: strip[{slot}] on {name} not tapped (it feeds that cable)"
+            ));
+            return false;
+        }
+        let Some(device) = self.vc.device(cable) else {
+            return false;
+        };
+        // One tap per cable: a second strip listening to the same cable would
+        // split the audio between them, so it takes the Windows capture path.
+        let label = cable_label(name);
+        for (i, capture) in self.captures.iter().enumerate() {
+            if i == slot || !capture.as_ref().map(|c| c.direct()).unwrap_or(false) {
+                continue;
+            }
+            if cable_label(&self.strips[i].device) == label {
+                diag_log(format!(
+                    "tap: strip[{slot}] on {name} falls back to Windows capture (strip[{i}] already taps it)"
+                ));
+                return false;
+            }
+        }
+        let rate = device.tap_format().1;
+        diag_log(format!("tap: strip[{slot}] on {name} ({rate} Hz, direct)"));
+        let tap_device = device.clone();
+        let capture = audio::InputCapture::tap(device, name.to_string(), rate);
+        self.apply_opened_capture(slot, capture);
+        self.audio.set_strip_tap(slot, Some(tap_device));
+        true
     }
 
     /// Apply capture opens that finished since the last frame.
@@ -2550,6 +2641,8 @@ impl MixerApp {
 
     /// Shared post-open handling for the picker and the watchdog.
     fn apply_opened_capture(&mut self, i: usize, capture: audio::InputCapture) {
+        // Any previous tap belongs to the capture being replaced.
+        self.audio.set_strip_tap(i, None);
         if capture.available {
             self.vban.unbind(i);
             self.strips[i].device = capture.device.clone();
@@ -3492,6 +3585,113 @@ impl MixerApp {
             self.streamer_speed.clamp(1.0, 30.0)
         ));
         text.push_str("</AudioMixerProSettings>\n");
+        text
+    }
+
+    /// Perform a DIAGNOSTICS button: write the report, copy it, or open the log
+    /// folder. Building the report is a handful of file reads, so the UI thread
+    /// is fine and nothing audio-related is touched.
+    fn run_diag_action(&mut self, ctx: &egui::Context, action: vc::DiagAction) {
+        match action {
+            vc::DiagAction::Save => {
+                let text = self.diagnostics_text();
+                match diagnostics::write_report(&text) {
+                    Ok(path) => self.toast(format!("Support report saved to {}", path.display())),
+                    Err(err) => self.toast(err),
+                }
+            }
+            vc::DiagAction::Copy => {
+                let text = self.diagnostics_text();
+                ctx.copy_text(text);
+                self.toast("Support report copied to the clipboard");
+            }
+            vc::DiagAction::OpenFolder => {
+                if let Some(dir) = diagnostics::app_dir() {
+                    let _ = std::process::Command::new("explorer.exe")
+                        .arg(dir.as_os_str())
+                        .spawn();
+                }
+            }
+        }
+    }
+
+    /// Everything a support report needs: what the mixer is wired to right now,
+    /// plus the build identity and log tails from `diagnostics`.
+    fn diagnostics_text(&self) -> String {
+        let mut text = diagnostics::base_report();
+        let cfg = self.vc.config();
+        let status = self.vc.status();
+        text.push_str("\n---- virtual cables ----\n");
+        text.push_str(&format!(
+            "enabled={} cables={} buffer_ms={} max_rate={} mode={} attached={} helper={} driver_mode={}\n",
+            cfg.enabled,
+            cfg.cables,
+            cfg.buffer_ms,
+            cfg.max_rate,
+            cfg.uac_mode.as_str(),
+            status.attached,
+            status.helper,
+            self.driver_mode
+        ));
+        for strip in self.strips.iter().take(self.active_strips) {
+            if let Some(format) = self.endpoint_formats.get(&strip.device) {
+                text.push_str(&format!("{} = {}\n", strip.device, format.label()));
+            }
+        }
+
+        text.push_str("\n---- devices ----\n");
+        text.push_str(&format!("outputs ({}):\n", self.last_outputs.len()));
+        for name in &self.last_outputs {
+            text.push_str(&format!("  {name}\n"));
+        }
+        text.push_str(&format!("inputs ({}):\n", self.last_inputs.len()));
+        for name in &self.last_inputs {
+            text.push_str(&format!("  {name}\n"));
+        }
+
+        text.push_str("\n---- buses ----\n");
+        text.push_str(&self.audio.group_report());
+        text.push('\n');
+
+        text.push_str("\n---- strips ----\n");
+        for (i, strip) in self.strips.iter().take(self.active_strips).enumerate() {
+            let capture = self
+                .captures
+                .get(i)
+                .and_then(|capture| capture.as_ref())
+                .map(|capture| {
+                    format!(
+                        "{} {}Hz {}ch",
+                        if capture.direct() { "direct" } else { "capture" },
+                        capture.sample_rate(),
+                        capture.channels()
+                    )
+                })
+                .unwrap_or_else(|| "no input".to_string());
+            let plugin = self.vsts[i]
+                .info
+                .as_ref()
+                .map(|info| format!("{} {} {}", info.name, info.vendor, info.version))
+                .unwrap_or_else(|| "none".to_string());
+            text.push_str(&format!(
+                "[{}] name='{}' device='{}' source={} gain={:.1} pan={:.2} mute={} solo={} route={:?} plugin='{}' failed={}\n",
+                i,
+                strip.name,
+                strip.device,
+                capture,
+                strip.gain_db,
+                strip.pan,
+                strip.mute,
+                strip.solo,
+                strip.route,
+                plugin,
+                self.vsts[i].chain.failed()
+            ));
+        }
+
+        let (latency, detail) = self.latency_report();
+        text.push_str("\n---- latency ----\n");
+        text.push_str(&format!("~{latency:.0} ms\n{detail}\n"));
         text
     }
 
@@ -4659,6 +4859,10 @@ impl MixerApp {
         self.strip_bank = Self::bank_for_strip(idx);
 
         if let Some(cable) = self.next_free_virtual_cable() {
+            if self.open_cable_tap(idx, &cable) {
+                self.toast(format!("Virtual {} added - direct from {cable}", idx - 2));
+                return;
+            }
             let capture = InputCapture::open(Some(&cable));
             if capture.available {
                 self.strips[idx].device = capture.device.clone();
@@ -4686,6 +4890,9 @@ impl MixerApp {
         });
         for idx in pending {
             if let Some(cable) = self.next_free_virtual_cable() {
+                if self.open_cable_tap(idx, &cable) {
+                    continue;
+                }
                 let capture = InputCapture::open(Some(&cable));
                 if capture.available {
                     self.strips[idx].device = capture.device.clone();
@@ -4827,6 +5034,10 @@ impl MixerApp {
                 && cable_label(&name).is_some()
                 && !self.vc.status().attached
             {
+                continue;
+            }
+            if self.open_cable_tap(i, &name) {
+                diag_log(format!("input {}: direct from '{}'", i + 1, name));
                 continue;
             }
             let capture = InputCapture::open(Some(&name));
@@ -5605,8 +5816,18 @@ impl MixerApp {
         // A cable endpoint's full name ("Microphone (Virtual Cable 03)") never
         // fits the strip, so show the cable itself: that is the part the person
         // needs to know. The complete name stays in the hover text.
-        let device_label = cable_label(&self.strips[idx].device)
+        let mut device_label = cable_label(&self.strips[idx].device)
             .unwrap_or_else(|| self.strips[idx].device.clone());
+        if self
+            .captures
+            .get(idx)
+            .and_then(|capture| capture.as_ref())
+            .map(|capture| capture.direct())
+            .unwrap_or(false)
+        {
+            // Marks the strips reading the cable's own buffer.
+            device_label.push_str("  direct");
+        }
         ui.painter().text(
             Pos2::new(header.left(), header.top() + 13.0),
             Align2::LEFT_TOP,
@@ -5657,6 +5878,7 @@ impl MixerApp {
             let mut copy_all = false;
             let mut paste = false;
             let mut toggle_apps = false;
+            let mut toggle_source = false;
             let mut remove_last = false;
             let has_clip = self.strip_clip.is_some();
             hresp.context_menu(|ui| {
@@ -5681,6 +5903,17 @@ impl MixerApp {
                     if ui.button(label).clicked() {
                         toggle_apps = true;
                         ui.close_menu();
+                    }
+                    if is_usb_cable_endpoint(&self.strips[idx].device) {
+                        let label = if self.strip_direct[idx] {
+                            "Source: direct cable (tap) - click for Windows capture"
+                        } else {
+                            "Source: Windows capture - click for the direct cable"
+                        };
+                        if ui.button(label).clicked() {
+                            toggle_source = true;
+                            ui.close_menu();
+                        }
                     }
                 }
                 ui.separator();
@@ -5710,6 +5943,16 @@ impl MixerApp {
             }
             if toggle_apps {
                 self.apps_open[idx] = !self.apps_open[idx];
+            }
+            if toggle_source {
+                self.strip_direct[idx] = !self.strip_direct[idx];
+                let name = self.strips[idx].device.clone();
+                self.spawn_capture_open(idx, name);
+                self.toast(if self.strip_direct[idx] {
+                    "Reading the cable's own buffer (direct tap)"
+                } else {
+                    "Reading the cable's microphone endpoint (Windows capture)"
+                });
             }
             if reset_all {
                 // FUN_00538b20 command 600: hardware resets the panel, the
@@ -6197,11 +6440,22 @@ impl MixerApp {
         }
     }
 
+    /// True when this strip is routed to a bus that plays into the same cable it
+    /// listens to. For a direct tap the round trip is one mixer block, so this
+    /// is checked before the tap is opened and again whenever a route changes.
+    fn strip_feeds_own_cable(&self, idx: usize) -> bool {
+        let Some(cable) = cable_number(&self.strips[idx].device) else {
+            return false;
+        };
+        (0..audio::MAX_BUSES).any(|bus| {
+            self.strips[idx].route[bus] && self.bus_cable_number(bus) == Some(cable)
+        })
+    }
+
     /// Strips that would hear their own bus: a strip capturing cable N that is
     /// routed to a bus playing into cable N closes the ring, which is what
     /// turns into echo and then howl.
-    fn feedback_loops(&self) -> [Vec<usize>; audio::MAX_BUSES] {
-        let bus_cables: [Option<u32>; audio::MAX_BUSES] =
+    fn feedback_loops(&self) -> [Vec<usize>; audio::MAX_BUSES] {        let bus_cables: [Option<u32>; audio::MAX_BUSES] =
             std::array::from_fn(|bus| self.bus_cable_number(bus));
         let active = self.strips.len().min(self.active_strips);
         let strip_cables: Vec<Option<u32>> = self.strips[..active]
@@ -7286,6 +7540,9 @@ impl MixerApp {
             let mut open = self.show_vc;
             self.vc.draw(ctx, &mut open, self.driver_mode);
             self.show_vc = open;
+            if let Some(action) = self.vc.diag_request.take() {
+                self.run_diag_action(ctx, action);
+            }
         }
         if self.show_system {
             let mut open = self.show_system;
@@ -9223,7 +9480,7 @@ impl eframe::App for MixerApp {
         }
         if !self.hooks_logged && self.time >= 3.0 {
             self.hooks_logged = true;
-            let hooks = injected_hook_modules();
+            let hooks = hooked_modules();
             if !hooks.is_empty() {
                 diag_log(format!(
                     "main: injected hook module(s): {} (OBS game capture / NVIDIA overlay)",
@@ -10718,56 +10975,11 @@ fn diag_path(name: &str) -> PathBuf {
     settings_canonical_path().with_file_name(name)
 }
 
-/// DLLs other programs have injected into this process. OBS "Game Capture" hooks
-/// the mixer's OpenGL output (`graphics-hook64.dll`) and the NVIDIA overlay does
-/// the same (`nvspcap64.dll`); both use NVAPI, and the crashes on 20-21/11 were
-/// inside `nvapi64` while a Game Capture source was on this process. Logging the
-/// names makes a reintroduced hook visible instead of mysterious.
-#[cfg(windows)]
-fn injected_hook_modules() -> Vec<String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
-    };
-
-    let mut out = Vec::new();
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, std::process::id());
-        if snapshot == INVALID_HANDLE_VALUE {
-            return out;
-        }
-        let mut entry: MODULEENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
-        if Module32FirstW(snapshot, &mut entry) != 0 {
-            loop {
-                let end = entry
-                    .szModule
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szModule.len());
-                let name = String::from_utf16_lossy(&entry.szModule[..end]);
-                let lower = name.to_ascii_lowercase();
-                if lower.contains("graphics-hook")
-                    || lower.starts_with("obs")
-                    || lower == "nvspcap64.dll"
-                {
-                    out.push(name);
-                }
-                if Module32NextW(snapshot, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snapshot);
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-#[cfg(not(windows))]
-fn injected_hook_modules() -> Vec<String> {
-    Vec::new()
+/// DLLs another program has injected into this process (OBS game capture, the
+/// NVIDIA overlay); the scan lives in `diagnostics` so the support report can
+/// list them too.
+fn hooked_modules() -> Vec<String> {
+    diagnostics::injected_hook_modules()
 }
 
 fn diag_log(message: impl AsRef<str>) {
@@ -10776,11 +10988,9 @@ fn diag_log(message: impl AsRef<str>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > 512 * 1024 {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
+    // Keep one previous generation instead of deleting the history: a support
+    // report is only useful if the interesting session is still on disk.
+    let _ = diagnostics::rotate_log(&path, 512 * 1024);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -10929,6 +11139,24 @@ fn main() -> eframe::Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("ducking_selftest.txt");
         audio::ducking_selftest(&path);
+        return Ok(());
+    }
+    if let Some(index) = raw_args.iter().position(|arg| arg == "--diagnostics") {
+        // Works without a window: the mixer may be exactly what will not start.
+        let path = raw_args
+            .get(index + 1)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join("diagnostics.txt")
+            });
+        let text = diagnostics::base_report();
+        if let Err(err) = std::fs::write(&path, &text) {
+            eprintln!("could not write {}: {err}", path.display());
+        } else {
+            println!("{}", path.display());
+        }
         return Ok(());
     }
     if raw_args.iter().any(|arg| arg == "--apps-selftest") {
@@ -11446,6 +11674,9 @@ fn vc_file_logger() -> virtual_cables::LogFn {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
+            // The helper log was unbounded; keep one generation so a support
+            // report never has to ship megabytes.
+            let _ = diagnostics::rotate_log(path, 512 * 1024);
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)

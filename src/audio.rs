@@ -672,6 +672,12 @@ struct Shared {
     /// B1 and B2 feed the capture endpoint of two USB cables. The console
     /// binds cables 1 and 2 when the virtual-cable server is running.
     virtual_outputs: Mutex<[Option<Arc<Device>>; 2]>,
+    /// Strips that read a virtual cable's playback straight from its device
+    /// instead of opening a Windows capture stream. This is the in-process
+    /// equivalent of Voicemeeter's virtual input driver: the strip hears the
+    /// application's audio as it reaches the driver, with no second engine
+    /// stream and no second clock.
+    tap_inputs: [Mutex<Option<Arc<Device>>>; MAX_STRIPS],
     /// A1/A2/A3 output rings. The internal mixer writes each bus mix here and
     /// the per-bus output streams replay it on their own devices.
     bus_out_rings: [Mutex<VecDeque<(f32, f32)>>; MAX_BUSES],
@@ -772,6 +778,7 @@ impl Shared {
             bus_eq_on: std::array::from_fn(|_| AtomicBool::new(false)),
             bus_eq_gain: std::array::from_fn(|_| std::array::from_fn(|_| f32_atomic(0.0))),
             virtual_outputs: Mutex::new([None, None]),
+            tap_inputs: std::array::from_fn(|_| Mutex::new(None)),
             bus_out_rings: std::array::from_fn(|_| {
                 Mutex::new(VecDeque::with_capacity(BUS_RING_FRAMES))
             }),
@@ -2609,6 +2616,34 @@ impl AudioEngine {
         self.shared.strip_peak[index].store(0.0f32.to_bits(), Ordering::Relaxed);
     }
 
+    /// Point a strip at a virtual cable's device buffer (direct) or back at a
+    /// Windows capture stream (None). Enabling a tap on a second strip of the
+    /// same cable would split the audio, so the caller keeps it one per cable.
+    pub fn set_strip_tap(&self, index: usize, device: Option<Arc<Device>>) {
+        if index >= MAX_STRIPS {
+            return;
+        }
+        let previous = self.shared.tap_inputs[index]
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(old) = &previous {
+            let reuse = match (device.as_ref(), Some(old)) {
+                (Some(new), Some(old)) => Arc::ptr_eq(new, old),
+                _ => false,
+            };
+            if !reuse {
+                old.enable_tap(false);
+            }
+        }
+        if let Some(device) = device {
+            device.enable_tap(true);
+            if let Ok(mut slot) = self.shared.tap_inputs[index].lock() {
+                *slot = Some(device);
+            }
+        }
+    }
+
     /// The strip-level half of the console: fader, pan, mute/solo/mono and
     /// the five routing buttons. A1 is bit 0, then A2, A3, B1, B2.
     /// Virtual-strip 3-band EQ gains in dB (low shelf, mid bell, high shelf).
@@ -2999,6 +3034,9 @@ pub struct InputCapture {
     pub channels: u16,
     pub available: bool,
     pub status: String,
+    /// True when the audio comes from a virtual cable's device buffer rather
+    /// than a Windows capture stream.
+    pub direct: bool,
 }
 
 fn _assert_send<T: Send>() {}
@@ -3096,6 +3134,31 @@ impl InputCapture {
             channels: 0,
             available: false,
             status,
+            direct: false,
+        }
+    }
+
+    /// A strip fed from a virtual cable's own device buffer. No Windows capture
+    /// stream is opened: `mixer_loop` drains `Device::read_tap` into this
+    /// stream's ring, so `InputReader` and everything after it are unchanged.
+    pub fn tap(device: Arc<Device>, name: String, sample_rate: u32) -> Self {
+        let shared = Arc::new(InputShared::new());
+        let rate = if sample_rate == 0 {
+            48_000
+        } else {
+            sample_rate
+        };
+        shared.rate.store(rate, Ordering::Relaxed);
+        device.enable_tap(true);
+        Self {
+            shared,
+            _stream: None,
+            device: name,
+            sample_rate: rate,
+            channels: 2,
+            available: true,
+            status: "Direct cable tap".to_string(),
+            direct: true,
         }
     }
 
@@ -3130,7 +3193,8 @@ impl InputCapture {
             sample_rate: config.sample_rate.0,
             channels: config.channels,
             available: true,
-            status: "Input open".to_string(),
+            status: String::new(),
+            direct: false,
         })
     }
 
@@ -3490,9 +3554,82 @@ impl Drop for MixerTimer {
 /// The console clock. Renders the DSP on a fixed schedule, independent of any
 /// audio device, and publishes every active bus ring. This is what lets A1 be
 /// switched off without silencing A2/A3.
+/// Decode a packed 24-bit little-endian PCM sample to -1..1.
+fn pcm24(bytes: &[u8]) -> f32 {
+    let v = (bytes[0] as i32) | ((bytes[1] as i32) << 8) | ((bytes[2] as i32) << 16);
+    (v << 8) as f32 / 2_147_483_648.0
+}
+
+/// Move whatever a tapped cable device has received since the last block into
+/// the strip's input ring. Runs on the mixer thread, once per block, so there is
+/// no extra thread, no polling and no second clock: the strip sees the audio at
+/// the moment the driver does.
+fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
+    for strip in 0..MAX_STRIPS {
+        let device = match shared.tap_inputs[strip].lock() {
+            Ok(slot) => slot.clone(),
+            Err(_) => None,
+        };
+        let Some(device) = device else {
+            continue;
+        };
+        let input = match shared.inputs.lock() {
+            Ok(inputs) => inputs[strip].clone(),
+            Err(_) => None,
+        };
+        let Some(input) = input else {
+            continue;
+        };
+        let (bytes, rate) = device.tap_format();
+        let frame_bytes = bytes as usize * 2;
+        if frame_bytes == 0 {
+            continue;
+        }
+        let capacity = (tap_buf.len() / frame_bytes) * frame_bytes;
+        if capacity == 0 {
+            continue;
+        }
+        let got = device.read_tap(&mut tap_buf[..capacity]);
+        let whole = (got / frame_bytes) * frame_bytes;
+        if whole == 0 {
+            continue;
+        }
+        let mut peak = 0.0f32;
+        {
+            let mut ring = lock_source(&input.ring);
+            for frame in tap_buf[..whole].chunks_exact(frame_bytes) {
+                let (l, r) = match bytes {
+                    2 => (
+                        i16::from_le_bytes([frame[0], frame[1]]) as f32 / 32_768.0,
+                        i16::from_le_bytes([frame[2], frame[3]]) as f32 / 32_768.0,
+                    ),
+                    3 => (pcm24(&frame[0..3]), pcm24(&frame[3..6])),
+                    4 => (
+                        i32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as f32
+                            / 2_147_483_648.0,
+                        i32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]) as f32
+                            / 2_147_483_648.0,
+                    ),
+                    _ => (0.0, 0.0),
+                };
+                let (l, r) = (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0));
+                peak = peak.max(l.abs()).max(r.abs());
+                ring.push([l, r]);
+            }
+        }
+        input.peak.store(peak.to_bits(), Ordering::Relaxed);
+        input.rate.store(rate.max(1), Ordering::Relaxed);
+        input
+            .frames
+            .fetch_add(whole / frame_bytes, Ordering::Relaxed);
+    }
+}
+
 fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u32) {
     let mut dsp = Dsp::new();
     let mut buffer = vec![0.0f32; block.max(1) * 2];
+    // Large enough for a whole tap drain at 32-bit stereo (16 KB = 2048 frames).
+    let mut tap_buf = vec![0u8; 16_384];
     let period =
         std::time::Duration::from_nanos(((block.max(1) as f64 / rate.max(1) as f64) * 1e9) as u64);
 
@@ -3522,6 +3659,8 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        // Taps first: the strip's reader must see this block's audio already.
+        pump_taps(&shared, &mut tap_buf);
         dsp.render(&mut buffer, 2, &shared);
         next += period;
         let now = std::time::Instant::now();

@@ -86,6 +86,13 @@ pub struct Device {
     max_rate: u32,
     buffer_ms: u32,
     inject_ms: u32,
+    /// A copy of the incoming playback PCM for the mixer's own strips. Taken at
+    /// write time, so a strip hears audio as it arrives instead of after the
+    /// loopback buffer, and the microphone endpoint other applications record
+    /// from is unaffected. This is the in-process equivalent of Voicemeeter's
+    /// virtual input driver handing its buffer to the mixer.
+    tap: Ring,
+    tap_enabled: AtomicBool,
     state: Mutex<State>,
 }
 
@@ -118,6 +125,10 @@ impl Device {
         let floor = min_latency_ms.clamp(5, 40).min(latency_ms.max(5));
         let inject_ms = latency_ms.clamp(floor, 40);
         let inject_capacity = (bytes_per_second * inject_ms / 1000).max(1) as usize;
+        // The tap is drained by the mixer every block. Thirty milliseconds is
+        // enough for a stalled mixer and small enough that the delay cannot grow
+        // past it (the ring keeps the newest audio).
+        let tap_capacity = (bytes_per_second * 30 / 1000).max(1) as usize;
         let resampler_frames = (MAX_SAMPLE_RATE * latency_ms / 1000).max(256) as usize;
         Ok(Self {
             number,
@@ -132,6 +143,8 @@ impl Device {
             max_rate,
             buffer_ms: latency_ms,
             inject_ms,
+            tap: Ring::new(tap_capacity),
+            tap_enabled: AtomicBool::new(false),
             state: Mutex::new(State {
                 configuration: 0,
                 alt_setting: [0; 3],
@@ -448,6 +461,9 @@ impl Device {
     }
 
     fn refresh_audio_path(&self, state: &mut State) {
+        // The tap holds wire bytes at the playback format; a rate or interface
+        // change makes whatever is queued stale, so drop it.
+        self.tap.reset();
         let playback_bytes = bytes_per_sample_for_alt(state.alt_setting[1]);
         let capture_bytes = bytes_per_sample_for_alt(state.alt_setting[2]);
         if playback_bytes == 0
@@ -484,11 +500,47 @@ impl Device {
         if !active {
             return 0;
         }
+        if self.tap_enabled.load(Ordering::Relaxed) {
+            // Copy the incoming PCM before any loopback/resample handling: the
+            // strip wants what the application just played, at the playback
+            // format, with no extra delay.
+            self.tap.write(p);
+        }
         if bypass {
             self.buffer.write(p)
         } else {
             self.resampler.write(p)
         }
+    }
+
+    /// Start (or stop) keeping a copy of the incoming playback for the mixer.
+    pub fn enable_tap(&self, enabled: bool) {
+        if !enabled {
+            self.tap.reset();
+        }
+        self.tap_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Drain the tap. Returns the bytes copied (0 when nothing is queued).
+    pub fn read_tap(&self, out: &mut [u8]) -> usize {
+        self.tap.read(out)
+    }
+
+    /// Format of the tap: bytes per sample and the measured playback rate.
+    pub fn tap_format(&self) -> (u32, u32) {
+        let state = self.state.lock().unwrap();
+        let bytes = bytes_per_sample_for_alt(state.alt_setting[1]) as u32;
+        let rate = if state.playback_rate == 0 {
+            DEFAULT_SAMPLE_RATE
+        } else {
+            state.playback_rate
+        };
+        (bytes, rate)
+    }
+
+    /// Drop the queued tap audio (a format change makes the queued bytes stale).
+    pub fn reset_tap(&self) {
+        self.tap.reset();
     }
 
     pub fn read_capture(&self, p: &mut [u8]) -> usize {

@@ -62,6 +62,25 @@ impl Ring {
         p.len()
     }
 
+    /// Read up to `p.len()` bytes without padding the rest with silence.
+    /// Returns how many bytes were copied; the caller decides what to do with a
+    /// short read.
+    pub fn read(&self, p: &mut [u8]) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let capacity = inner.buf.len();
+        let mut read = 0usize;
+        for out in p.iter_mut() {
+            if inner.size == 0 {
+                break;
+            }
+            *out = inner.buf[inner.read];
+            inner.read = (inner.read + 1) % capacity;
+            inner.size -= 1;
+            read += 1;
+        }
+        read
+    }
+
     /// Read `p.len()` bytes; missing audio becomes digital silence.
     pub fn read_silence(&self, p: &mut [u8]) -> usize {
         let mut inner = self.inner.lock().unwrap();
