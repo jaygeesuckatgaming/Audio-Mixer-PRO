@@ -124,6 +124,13 @@ impl PlugIn {
         }
     }
 
+    /// Clear a sticky processing failure so the insert is retried.
+    pub fn clear_failure(&self) {
+        if let Backend::Vst3(chain) = &*self.backend() {
+            chain.clear_failure();
+        }
+    }
+
     /// Dry blocks since the previous call, over all slots.
     pub fn take_dry_blocks(&self) -> u64 {
         match &*self.backend() {

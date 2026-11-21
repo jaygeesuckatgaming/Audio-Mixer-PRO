@@ -1101,6 +1101,9 @@ struct MixerApp {
     /// Last output-queue depth written to the log, so growth is visible without
     /// hovering the status bar.
     last_ring_logged: usize,
+    /// Last set of open output groups. A change means the device set moved (a
+    /// cable re-enumerated), which is when a sticky insert failure is cleared.
+    last_group_report: String,
     /// In-flight `output_devices()` probe. Enumeration blocks when the audio
     /// service is wedged, so it never runs on the UI thread.
     devices_probe: Option<std::sync::mpsc::Receiver<Vec<String>>>,
@@ -1649,6 +1652,7 @@ impl MixerApp {
             latency_detail_shown: String::new(),
             latency_tick: 1.0,
             last_ring_logged: 0,
+            last_group_report: String::new(),
             devices_probe: None,
             inputs_probe: None,
             devices_probe_at: 0.0,
@@ -2720,6 +2724,28 @@ impl MixerApp {
                 "audio: output queue {ring_frames} frames ({:.1} ms)",
                 ring_frames as f32 / self.sample_rate.max(1) as f32 * 1000.0
             ));
+        }
+        // A change in the set of open output groups means the device set moved
+        // (typically a cable re-enumerating). A processing error during that
+        // churn used to leave an insert bypassed for the whole session, so retry
+        // any failed slot once the outputs settle.
+        let groups = self.audio.group_report();
+        if groups != self.last_group_report {
+            if !self.last_group_report.is_empty() {
+                let mut retried = 0;
+                for vst in self.vsts.iter().take(self.active_strips) {
+                    if vst.chain.failed() {
+                        retried += 1;
+                    }
+                    vst.chain.clear_failure();
+                }
+                if retried > 0 {
+                    diag_log(format!(
+                        "audio: output devices changed, retried {retried} failed insert(s)"
+                    ));
+                }
+            }
+            self.last_group_report = groups;
         }
         let (sender, receiver) = std::sync::mpsc::channel();
         if std::thread::Builder::new()

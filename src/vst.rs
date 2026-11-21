@@ -301,6 +301,20 @@ impl VstChain {
     pub fn take_dry_blocks(&self) -> u64 {
         self.dry_blocks.swap(0, Ordering::Relaxed)
     }
+    /// Clear a sticky failure so the insert is tried again. Used when the output
+    /// devices change (the cables re-enumerating was what set it) and when the
+    /// person opens the plug-in: a transient error must not bypass an insert for
+    /// the rest of the session.
+    pub fn clear_failure(&self) {
+        if let Ok(mut inner) = self.inner.try_lock() {
+            if inner.failed {
+                crate::diag_log("vst: clearing a failed slot so the insert is retried");
+            }
+            inner.failed = false;
+            inner.error = None;
+        }
+    }
+
     /// True when the slot gave up on the plug-in after a processing error.
     pub fn failed(&self) -> bool {
         self.inner
@@ -308,7 +322,6 @@ impl VstChain {
             .map(|inner| inner.failed)
             .unwrap_or(false)
     }
-
 
     pub fn latency(&self) -> (u32, u32) {
         self.inner
@@ -398,10 +411,14 @@ impl VstChain {
     /// plug-in's settings itself.
     pub fn open_editor(&self, mixer_hwnd: isize) -> Result<(), String> {
         let (plugin, name) = {
-            let inner = self
+            let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| "The VST slot is unavailable".to_string())?;
+            // Opening the plug-in is the person asking for it back: a sticky
+            // processing failure must not keep the insert bypassed.
+            inner.failed = false;
+            inner.error = None;
             let Some(loaded) = inner.loaded.as_ref() else {
                 return Err("No VST plug-in is loaded".to_string());
             };
