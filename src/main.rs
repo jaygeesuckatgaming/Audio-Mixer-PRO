@@ -5857,7 +5857,7 @@ impl MixerApp {
             self.picker = Some(Picker::Strip(idx));
         }
         let _ = hresp.clone().on_hover_text(format!(
-            "{}{}\nClick to choose the input device, right click for the strip menu",
+            "{}{}\n{}\nClick to choose the input device, right click for the strip menu",
             self.strips[idx].device,
             match endpoint_format {
                 Some(format) => format!(
@@ -5865,6 +5865,18 @@ impl MixerApp {
                     format.label()
                 ),
                 None => String::new(),
+            },
+            if self
+                .captures
+                .get(idx)
+                .and_then(|capture| capture.as_ref())
+                .map(|capture| capture.direct())
+                .unwrap_or(false)
+            {
+                "Source: the cable's own buffer (direct tap, no Windows capture stream).\n\
+Right click > Source to use the Windows capture stream instead."
+            } else {
+                "Source: Windows capture of this endpoint."
             }
         ));
         if !self.lock_gui {
@@ -8899,13 +8911,20 @@ impl MixerApp {
             egui::Window::new(title)
                 .open(&mut open)
                 .collapsible(false)
-                .resizable(false)
-                .default_width(300.0)
-                .max_height(520.0)
+                // Let the person drag it, but start at a size that fits a real
+                // device list instead of letting the window auto-size itself to
+                // whatever egui remembered (it could collapse to a few rows).
+                // The minimums also clamp a stale remembered size.
+                .resizable(true)
+                .default_size([380.0, 500.0])
+                .min_width(340.0)
+                .min_height(320.0)
+                .max_height(640.0)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical()
                         .max_height(430.0)
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                     if is_strip_picker {
                         let found = devices
