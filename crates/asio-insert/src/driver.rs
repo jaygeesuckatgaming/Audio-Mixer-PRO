@@ -603,7 +603,6 @@ fn pump(ptr: StatePtr) {
     let Some(shared) = state.shared.as_ref() else {
         return;
     };
-    let callbacks = state.callbacks;
     let rate = shared.rate().max(1);
     // One block of the host's time. When the mixer is not publishing (it is not
     // wired yet, or it was closed), the driver still runs its own clock and
@@ -628,8 +627,8 @@ fn pump(ptr: StatePtr) {
         if state.stop.load(Ordering::SeqCst) {
             break;
         }
-        let seq = shared.seq_in();
-        let fresh = woken && seq != last_seq;
+        let target_seq = shared.seq_in();
+        let fresh = woken && target_seq != last_seq;
         if !fresh {
             // Give the mixer three blocks of grace: publish jitter must not make
             // the driver slip a silent block between real ones, which would put
@@ -637,24 +636,30 @@ fn pump(ptr: StatePtr) {
             if last_block.elapsed() < period * 3 {
                 continue;
             }
-            // No mixer: present silence and keep time.
-            for channel in 0..CHANNELS {
-                let target = state.in_ptrs[channel];
-                if !target.is_null() {
-                    unsafe { std::ptr::write_bytes(target, 0u8, BLOCK_FRAMES) };
-                }
-            }
             if !reported_silent {
                 reported_silent = true;
                 trace("pump: running without the mixer (silent clock)");
             }
-        } else {
-            last_seq = seq;
-            // The section stores stereo pairs interleaved; ASIO wants one planar
-            // buffer per channel, so split on the way in and interleave on the
-            // way back.
+            last_seq = target_seq;
+            // Present silence for this period and return it as block `target_seq`.
+            for channel in 0..CHANNELS {
+                let input = state.in_ptrs[channel];
+                if !input.is_null() {
+                    unsafe { std::ptr::write_bytes(input, 0u8, BLOCK_FRAMES) };
+                }
+            }
+            call_host(&state, &shared, rate, target_seq);
+            shared.set_seq_out(target_seq);
+            last_block = std::time::Instant::now();
+            continue;
+        }
+
+        // One host callback per published block, so no audio is ever skipped.
+        let mut seq = last_seq;
+        while seq < target_seq {
+            seq += 1;
             for pair in 0..PAIRS {
-                let source = shared.input(pair);
+                let source = shared.input_block(pair, seq);
                 let left = state.in_ptrs[pair * 2];
                 let right = state.in_ptrs[pair * 2 + 1];
                 for frame in 0..BLOCK_FRAMES {
@@ -670,56 +675,62 @@ fn pump(ptr: StatePtr) {
                     }
                 }
             }
+            call_host(&state, &shared, rate, seq);
             if !reported_audio {
                 reported_audio = true;
                 trace("pump: first block from the mixer");
             }
         }
+        last_seq = target_seq;
+        shared.set_seq_out(target_seq);
         last_block = std::time::Instant::now();
-
-        // JUCE provides both callbacks; if only the time-info form was given we
-        // must use it or the host never runs its graph.
-        let position = state.sample_pos.load(Ordering::Relaxed);
-        if let Some(time_info) = callbacks.buffer_switch_time_info {
-            let mut time: ASIOTime = unsafe { std::mem::zeroed() };
-            time.time_info.sample_rate = rate as f64;
-            time.time_info.sample_position = ASIOSamples {
-                hi: (position >> 32) as u32,
-                lo: position as u32,
-            };
-            time.time_info.speed = 1.0;
-            unsafe { time_info(&mut time, 0, ASIO_FALSE) };
-        } else if let Some(buffer_switch) = callbacks.buffer_switch {
-            unsafe { buffer_switch(0, ASIO_FALSE) };
-        }
-
-        for pair in 0..PAIRS {
-            let target = shared.output(pair);
-            let left = state.out_ptrs[pair * 2];
-            let right = state.out_ptrs[pair * 2 + 1];
-            for frame in 0..BLOCK_FRAMES {
-                unsafe {
-                    let l = if left.is_null() {
-                        0.0
-                    } else {
-                        *left.add(frame)
-                    };
-                    let r = if right.is_null() {
-                        0.0
-                    } else {
-                        *right.add(frame)
-                    };
-                    *target.add(frame * 2) = l;
-                    *target.add(frame * 2 + 1) = r;
-                }
-            }
-        }
-        state
-            .sample_pos
-            .fetch_add(BLOCK_FRAMES as u64, Ordering::Relaxed);
-        shared.publish_return();
     }
     shared.set_host_attached(false);
+}
+
+/// One host callback for block `seq`: run the graph, then copy the host's
+/// outputs back into that block's output slot.
+fn call_host(state: &DriverState, shared: &Shared, rate: u32, seq: u64) {
+    let callbacks = state.callbacks;
+    let position = state.sample_pos.load(Ordering::Relaxed);
+    // JUCE provides both callbacks; if only the time-info form was given we must
+    // use it or the host never runs its graph.
+    if let Some(time_info) = callbacks.buffer_switch_time_info {
+        let mut time: ASIOTime = unsafe { std::mem::zeroed() };
+        time.time_info.sample_rate = rate as f64;
+        time.time_info.sample_position = ASIOSamples {
+            hi: (position >> 32) as u32,
+            lo: position as u32,
+        };
+        time.time_info.speed = 1.0;
+        unsafe { time_info(&mut time, 0, ASIO_FALSE) };
+    } else if let Some(buffer_switch) = callbacks.buffer_switch {
+        unsafe { buffer_switch(0, ASIO_FALSE) };
+    }
+    for pair in 0..PAIRS {
+        let target = shared.output_block(pair, seq);
+        let left = state.out_ptrs[pair * 2];
+        let right = state.out_ptrs[pair * 2 + 1];
+        for frame in 0..BLOCK_FRAMES {
+            unsafe {
+                let l = if left.is_null() {
+                    0.0
+                } else {
+                    *left.add(frame)
+                };
+                let r = if right.is_null() {
+                    0.0
+                } else {
+                    *right.add(frame)
+                };
+                *target.add(frame * 2) = l;
+                *target.add(frame * 2 + 1) = r;
+            }
+        }
+    }
+    state
+        .sample_pos
+        .fetch_add(BLOCK_FRAMES as u64, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------

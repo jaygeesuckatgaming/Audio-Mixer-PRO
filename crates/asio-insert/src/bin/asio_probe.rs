@@ -202,12 +202,14 @@ fn main() {
 
     let step = 2.0 * std::f64::consts::PI * 1000.0 / 48_000.0;
     let mut phase: f64 = 0.0;
+    let mut seq: u64 = 0;
     while started.elapsed() < Duration::from_secs_f64(seconds) {
         let now = Instant::now();
         if next > now {
             std::thread::sleep(next - now);
         }
         next += period;
+        seq += 1;
         // Mixer side: a 1 kHz tone on both channels of both pairs.
         let mut expected = [0.0f32; BLOCK_FRAMES];
         for value in expected.iter_mut() {
@@ -218,20 +220,28 @@ fn main() {
             }
         }
         for pair in 0..PAIRS {
-            let target =
-                unsafe { std::slice::from_raw_parts_mut(shared.input(pair), BLOCK_FRAMES * 2) };
+            let target = unsafe {
+                std::slice::from_raw_parts_mut(shared.input_block(pair, seq), BLOCK_FRAMES * 2)
+            };
             for frame in 0..BLOCK_FRAMES {
                 target[frame * 2] = expected[frame];
                 target[frame * 2 + 1] = expected[frame];
             }
         }
         shared.publish_block();
-        if !shared.wait_return(250) {
+        // Wait until the driver has returned this block.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while shared.seq_out() < seq && Instant::now() < deadline {
+            let _ = shared.wait_return(50);
+        }
+        if shared.seq_out() < seq {
             missed += 1;
             continue;
         }
         for pair in 0..PAIRS {
-            let out = unsafe { std::slice::from_raw_parts(shared.output(pair), BLOCK_FRAMES * 2) };
+            let out = unsafe {
+                std::slice::from_raw_parts(shared.output_block(pair, seq), BLOCK_FRAMES * 2)
+            };
             for frame in 0..BLOCK_FRAMES {
                 for channel in 0..2 {
                     let error = (out[frame * 2 + channel] - expected[frame]).abs();

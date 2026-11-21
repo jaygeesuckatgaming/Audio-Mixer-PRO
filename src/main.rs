@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod asio_insert;
 mod clap_host;
 mod clap_plugin;
 mod clap_slot;
@@ -6149,6 +6150,8 @@ Right click > Source to use the Windows capture stream instead."
             let mut paste = false;
             let mut toggle_apps = false;
             let mut toggle_source = false;
+            let mut insert_choice: Option<Option<usize>> = None;
+            let mut insert_post: Option<bool> = None;
             let mut remove_last = false;
             let has_clip = self.strip_clip.is_some();
             hresp.context_menu(|ui| {
@@ -6184,6 +6187,33 @@ Right click > Source to use the Windows capture stream instead."
                             toggle_source = true;
                             ui.close_menu();
                         }
+                    }
+                }
+                // External ASIO insert: two stereo pairs, pre- or post-FX.
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("EXTERNAL INSERT (ASIO)")
+                        .size(9.0)
+                        .color(FAINT),
+                );
+                let current = self.audio.strip_insert(idx);
+                for slot in 0..2 {
+                    let label = format!("Send to insert pair {}", slot + 1);
+                    let selected = matches!(current, Some((pair, _)) if pair == slot);
+                    if ui.selectable_label(selected, label).clicked() {
+                        insert_choice = Some(if selected { None } else { Some(slot) });
+                        ui.close_menu();
+                    }
+                }
+                if let Some((_, post)) = current {
+                    let label = if post {
+                        "Insert point: post-FX - click for pre-FX"
+                    } else {
+                        "Insert point: pre-FX - click for post-FX"
+                    };
+                    if ui.button(label).clicked() {
+                        insert_post = Some(!post);
+                        ui.close_menu();
                     }
                 }
                 ui.separator();
@@ -6223,6 +6253,47 @@ Right click > Source to use the Windows capture stream instead."
                 } else {
                     "Reading the cable's microphone endpoint (Windows capture)"
                 });
+            }
+            if let Some(choice) = insert_choice {
+                let post = self
+                    .audio
+                    .strip_insert(idx)
+                    .map(|(_, post)| post)
+                    .unwrap_or(false);
+                match choice {
+                    Some(slot) => {
+                        // One strip per pair: release any other strip on it.
+                        for other in 0..self.strips.len() {
+                            if other != idx
+                                && self.audio.strip_insert(other).map(|(pair, _)| pair)
+                                    == Some(slot)
+                            {
+                                self.audio.set_strip_insert(other, None, false);
+                            }
+                        }
+                        self.audio.set_strip_insert(idx, Some(slot), post);
+                        self.toast(format!(
+                            "{} sends to ASIO insert pair {} ({})",
+                            self.strips[idx].name,
+                            slot + 1,
+                            if post { "post-FX" } else { "pre-FX" }
+                        ));
+                    }
+                    None => {
+                        self.audio.set_strip_insert(idx, None, false);
+                        self.toast(format!("{}: external insert off", self.strips[idx].name));
+                    }
+                }
+            }
+            if let Some(post) = insert_post {
+                if let Some((pair, _)) = self.audio.strip_insert(idx) {
+                    self.audio.set_strip_insert(idx, Some(pair), post);
+                    self.toast(format!(
+                        "{} insert is now {}",
+                        self.strips[idx].name,
+                        if post { "post-FX" } else { "pre-FX" }
+                    ));
+                }
             }
             if reset_all {
                 // FUN_00538b20 command 600: hardware resets the panel, the

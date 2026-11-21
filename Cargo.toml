@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 # decodes all of those (WAV, MP3, AIFF, MP4/M4A AAC) in pure Rust.
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "aiff", "wav", "pcm", "adpcm"] }
 virtual-cables = { path = "crates/virtual-cables" }
+asio-insert = { path = "crates/asio-insert" }
 # VST3 hosting for the HW Input 1 insert slot. `default-features = false`
 # because the app already owns its CPAL output stream and does not need the
 # crate's playback/process-isolation helpers, only discovery + Plugin.

@@ -1,10 +1,13 @@
 //! The shared memory the mixer and the ASIO driver meet in.
 //!
-//! One fixed-size section per install (not per slot): two stereo pairs of
-//! 512 frames in each direction, plus a small header with sequence counters.
-//! Whoever starts first creates it; the other opens the same object, so the
-//! driver presents a silent device when the mixer is not running and the mixer
-//! can write into a section nobody is reading.
+//! One fixed-size section per install (not per slot): two stereo pairs, with a
+//! ring of four 512-frame blocks in each direction, plus a header with sequence
+//! counters. The ring is what makes it real-time safe: the mixer never waits for
+//! a return, it writes the next block into the next slot while the driver is
+//! still handing the previous one to the host. Whoever starts first creates the
+//! section; the other opens the same object, so the driver presents a silent
+//! device when the mixer is not running and the mixer can write into a section
+//! nobody is reading.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -19,16 +22,20 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
 pub const MAGIC: [u8; 4] = *b"AMPI";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const BLOCK_FRAMES: usize = 512;
 pub const PAIRS: usize = 2;
+/// Blocks in each direction. Four gives the driver room to be a block late
+/// without the mixer overwriting audio it has not copied yet.
+pub const BLOCKS: usize = 4;
 const HEADER_BYTES: usize = 64;
-const PLANE_BYTES: usize = PAIRS * BLOCK_FRAMES * 2 * 4;
-pub const SECTION_BYTES: usize = HEADER_BYTES + PLANE_BYTES * 2;
+const BLOCK_BYTES: usize = BLOCK_FRAMES * 2 * 4;
+const DIRECTION_BYTES: usize = PAIRS * BLOCKS * BLOCK_BYTES;
+pub const SECTION_BYTES: usize = HEADER_BYTES + DIRECTION_BYTES * 2;
 
-const SECTION_NAME: &str = "Local\\AudioMixerProInsert_v1";
-const BLOCK_EVENT: &str = "Local\\AudioMixerProInsert_v1_block";
-const READY_EVENT: &str = "Local\\AudioMixerProInsert_v1_ready";
+const SECTION_NAME: &str = "Local\\AudioMixerProInsert_v2";
+const BLOCK_EVENT: &str = "Local\\AudioMixerProInsert_v2_block";
+const READY_EVENT: &str = "Local\\AudioMixerProInsert_v2_ready";
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -142,10 +149,13 @@ impl Shared {
         }
     }
 
-    pub fn publish_return(&self) {
+    /// Record how many blocks the driver has returned. Stored rather than
+    /// incremented so a driver that starts late (or one that processed several
+    /// published blocks in one wake-up) publishes an exact count.
+    pub fn set_seq_out(&self, seq: u64) {
         let header = self.header();
-        header.blocks.fetch_add(1, Ordering::Relaxed);
-        header.seq_out.fetch_add(1, Ordering::Release);
+        header.seq_out.store(seq, Ordering::Release);
+        header.blocks.store(seq, Ordering::Relaxed);
         unsafe {
             SetEvent(self.ready_event);
         }
@@ -174,19 +184,22 @@ impl Shared {
     }
 
     /// Interleaved stereo input plane for a pair (the mixer writes here).
-    pub fn input(&self, pair: usize) -> *mut f32 {
+    /// Interleaved stereo input block for (`pair`, `seq`); the mixer writes here.
+    /// The slot is `seq % BLOCKS`, so a writer never touches the block the
+    /// driver is still handing to the host (up to BLOCKS blocks of slack).
+    pub fn input_block(&self, pair: usize, seq: u64) -> *mut f32 {
         let pair = pair.min(PAIRS - 1);
-        // Byte offset: `base` is *mut u8, and one stereo plane is
-        // BLOCK_FRAMES * 2 samples of f32.
-        let plane = BLOCK_FRAMES * 2 * std::mem::size_of::<f32>();
-        unsafe { self.base.add(HEADER_BYTES + pair * plane) as *mut f32 }
+        let slot = (seq as usize) % BLOCKS;
+        let offset = HEADER_BYTES + (pair * BLOCKS + slot) * BLOCK_BYTES;
+        unsafe { self.base.add(offset) as *mut f32 }
     }
 
-    /// Interleaved stereo output plane for a pair (the host writes here).
-    pub fn output(&self, pair: usize) -> *mut f32 {
+    /// Interleaved stereo output block for (`pair`, `seq`); the host writes here.
+    pub fn output_block(&self, pair: usize, seq: u64) -> *mut f32 {
         let pair = pair.min(PAIRS - 1);
-        let plane = BLOCK_FRAMES * 2 * std::mem::size_of::<f32>();
-        unsafe { self.base.add(HEADER_BYTES + PLANE_BYTES + pair * plane) as *mut f32 }
+        let slot = (seq as usize) % BLOCKS;
+        let offset = HEADER_BYTES + DIRECTION_BYTES + (pair * BLOCKS + slot) * BLOCK_BYTES;
+        unsafe { self.base.add(offset) as *mut f32 }
     }
 
     pub fn wait_block(&self, timeout_ms: u32) -> bool {

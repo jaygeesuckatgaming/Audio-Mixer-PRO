@@ -15,6 +15,9 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use virtual_cables::{Device, Mode};
 
+/// Stereo pairs the external ASIO insert exposes (one per shared section pair).
+use asio_insert::section::PAIRS as INSERT_PAIRS;
+
 pub const DEMO_LEN_SECS: f32 = 252.0;
 /// Frames held in each A2/A3 output ring. The master (A1) callback writes
 /// the bus mix; the secondary device streams consume it at their own rate.
@@ -757,6 +760,12 @@ struct Shared {
     /// Lowest ring fill seen since the last log tick. The servo targets a
     /// cushion; this shows whether the cushion is actually being held.
     bus_ring_min: [AtomicUsize; MAX_BUSES],
+    /// External ASIO insert assignments (strip -> stereo pair, pre/post FX).
+    pub inserts: crate::asio_insert::SharedInsertMap,
+    /// Diagnostics for the insert transport, written once per block.
+    insert_host: AtomicBool,
+    insert_blocks: AtomicU64,
+    insert_misses: AtomicU64,
     error: Mutex<Option<String>>,
 }
 
@@ -806,6 +815,10 @@ impl Shared {
             bus_step: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             bus_starve_frames: std::array::from_fn(|_| AtomicU64::new(0)),
             bus_ring_min: std::array::from_fn(|_| AtomicUsize::new(usize::MAX)),
+            inserts: crate::asio_insert::insert_map(),
+            insert_host: AtomicBool::new(false),
+            insert_blocks: AtomicU64::new(0),
+            insert_misses: AtomicU64::new(0),
             vsts: std::array::from_fn(|_| crate::plugin::PlugIn::new()),
             duck_enabled: AtomicBool::new(false),
             duck_source: AtomicUsize::new(usize::MAX),
@@ -948,6 +961,8 @@ struct Dsp {
     out_strip_l: [Vec<f32>; MAX_STRIPS],
     out_strip_r: [Vec<f32>; MAX_STRIPS],
     pcm: Vec<u8>,
+    /// External ASIO insert transport (one per engine run).
+    inserts: crate::asio_insert::Inserts,
     /// Ducking detector envelope (linear, smoothed) and current gain (linear).
     duck_env: f32,
     duck_gain: f32,
@@ -966,7 +981,7 @@ struct Dsp {
 }
 
 impl Dsp {
-    fn new() -> Self {
+    fn new(rate: f32) -> Self {
         Self {
             eq_l: std::array::from_fn(|_| [Biquad::identity(); 6]),
             eq_r: std::array::from_fn(|_| [Biquad::identity(); 6]),
@@ -989,6 +1004,7 @@ impl Dsp {
             out_strip_l: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             out_strip_r: std::array::from_fn(|_| vec![0.0; crate::vst::VST_MAX_BLOCK]),
             pcm: Vec::with_capacity(crate::vst::VST_MAX_BLOCK * 2 * 4),
+            inserts: crate::asio_insert::Inserts::new(rate.max(8000.0) as u32),
             duck_env: 0.0,
             duck_gain: 1.0,
             comp_env: [0.0; MAX_STRIPS],
@@ -1194,6 +1210,13 @@ impl Dsp {
         // the returned samples below exactly where the dry samples would have
         // gone. A strip without a plug-in (or with bypass on) stays dry.
         let frames = data.len() / channels.max(1);
+        // External ASIO insert: collect whatever the host returned since the
+        // previous block, then each assigned strip sends its block as it is read.
+        let insert_active = shared.inserts.active();
+        let mut insert_pairs = 0u32;
+        if insert_active {
+            self.inserts.pull();
+        }
         self.vst_ready = [false; MAX_STRIPS];
         for i in 0..strip_count {
             let duck_source_strip = duck_source == Some(i);
@@ -1219,6 +1242,25 @@ impl Dsp {
                 self.vst_in_l[i][frame] = s[0];
                 self.vst_in_r[i][frame] = s[1];
             }
+            // Pre-FX insert: send the dry block, then use the returned one in its
+            // place. The return belongs to an earlier block, so the strip is a
+            // block or two late — inherent to an external insert.
+            let insert = shared.inserts.get(i);
+            if insert_active {
+                if let Some((pair, false)) = insert {
+                    self.inserts
+                        .send_planar(pair, &self.vst_in_l[i], &self.vst_in_r[i], frames);
+                    if self.inserts.ready(pair) {
+                        self.inserts.take_return_planar(
+                            pair,
+                            &mut self.vst_in_l[i],
+                            &mut self.vst_in_r[i],
+                            frames,
+                        );
+                    }
+                    insert_pairs |= 1 << pair;
+                }
+            }
             if !shared.vsts[i].process(
                 &self.vst_in_l[i],
                 &self.vst_in_r[i],
@@ -1230,7 +1272,44 @@ impl Dsp {
                 self.vst_out_l[i].copy_from_slice(&self.vst_in_l[i]);
                 self.vst_out_r[i].copy_from_slice(&self.vst_in_r[i]);
             }
+            // Post-FX insert: send what our own insert produced and substitute
+            // the host's return.
+            if insert_active {
+                if let Some((pair, true)) = insert {
+                    self.inserts
+                        .send_planar(pair, &self.vst_out_l[i], &self.vst_out_r[i], frames);
+                    if self.inserts.ready(pair) {
+                        self.inserts.take_return_planar(
+                            pair,
+                            &mut self.vst_out_l[i],
+                            &mut self.vst_out_r[i],
+                            frames,
+                        );
+                    }
+                    insert_pairs |= 1 << pair;
+                }
+            }
             self.vst_ready[i] = true;
+        }
+
+        if insert_active {
+            // Pairs with no strip keep the host's input silent so it never sees
+            // stale audio, then the block is published.
+            for pair in 0..INSERT_PAIRS {
+                if insert_pairs & (1 << pair) == 0 {
+                    self.inserts.silence(pair);
+                }
+            }
+            self.inserts.publish();
+            shared
+                .insert_host
+                .store(self.inserts.host_attached(), Ordering::Relaxed);
+            shared
+                .insert_blocks
+                .store(self.inserts.blocks, Ordering::Relaxed);
+            shared
+                .insert_misses
+                .store(self.inserts.misses, Ordering::Relaxed);
         }
 
         {
@@ -2650,6 +2729,25 @@ impl AudioEngine {
     /// Point a strip at a virtual cable's device buffer (direct) or back at a
     /// Windows capture stream (None). Enabling a tap on a second strip of the
     /// same cable would split the audio, so the caller keeps it one per cable.
+    /// Assign a strip to an external ASIO insert pair (`None` = off) and choose
+    /// whether the host replaces the signal before or after our own VST chain.
+    pub fn set_strip_insert(&self, strip: usize, pair: Option<usize>, post: bool) {
+        self.shared.inserts.set(strip, pair, post);
+    }
+
+    pub fn strip_insert(&self, strip: usize) -> Option<(usize, bool)> {
+        self.shared.inserts.get(strip)
+    }
+
+    /// (host attached, blocks published, returns missed) for the status line.
+    pub fn insert_status(&self) -> (bool, u64, u64) {
+        (
+            self.shared.insert_host.load(Ordering::Relaxed),
+            self.shared.insert_blocks.load(Ordering::Relaxed),
+            self.shared.insert_misses.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn set_strip_tap(&self, index: usize, device: Option<Arc<Device>>) {
         if index >= MAX_STRIPS {
             return;
@@ -3745,7 +3843,7 @@ fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
 }
 
 fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u32) {
-    let mut dsp = Dsp::new();
+    let mut dsp = Dsp::new(rate as f32);
     let mut buffer = vec![0.0f32; block.max(1) * 2];
     // Large enough for a whole tap drain at 32-bit stereo (16 KB = 2048 frames).
     let mut tap_buf = vec![0u8; 16_384];
@@ -4027,7 +4125,7 @@ where
     T: cpal::SizedSample + cpal::FromSample<f32> + 'static,
 {
     let channels = config.channels as usize;
-    let mut dsp = Dsp::new();
+    let mut dsp = Dsp::new(48_000.0);
     let error_shared = shared.clone();
     device
         .build_output_stream(
@@ -4833,7 +4931,7 @@ pub fn routing_selftest() {
         shared.strips[i].route.store(0, Ordering::Relaxed);
     }
 
-    let mut dsp = Dsp::new();
+    let mut dsp = Dsp::new(48_000.0);
     let mut first = vec![0.0f32; 48_000 * 2];
     dsp.render(&mut first, 2, &shared);
     let on = first.iter().fold(0.0f32, |m, v| m.max(v.abs()));
@@ -4927,7 +5025,7 @@ fn run_virtual_bus(route: u32, slot: usize, number: u8) -> f32 {
     // Keep the block below the input reader's 25 ms target so the test does
     // not mistake the intentional startup trim for lost audio.
     let frames = 512usize;
-    let mut dsp = Dsp::new();
+    let mut dsp = Dsp::new(48_000.0);
     let mut out = vec![0.0f32; frames * 2];
     dsp.render(&mut out, 2, &shared);
     read_pcm_peak(&device, frames)
@@ -5020,7 +5118,7 @@ pub fn ducking_selftest(report_path: &Path) {
     }
 
     let mut report = String::new();
-    let mut dsp = Dsp::new();
+    let mut dsp = Dsp::new(48_000.0);
 
     let mut phase = |key_level: f32, target_level: f32, frames: usize| -> f32 {
         // Each phase starts from an unducked state and empty buffers, so no
@@ -5147,7 +5245,7 @@ pub fn dynamics_selftest(report_path: &Path) {
         inputs[3] = Some(virtuals.clone());
     }
 
-    let mut dsp = Dsp::new();
+    let mut dsp = Dsp::new(48_000.0);
     let mut run = |ring: &Arc<InputShared>,
                    strip: usize,
                    comp: f32,
@@ -5265,7 +5363,7 @@ pub fn strip_eq_selftest(report_path: &Path) {
         inputs[3] = Some(virtuals.clone());
     }
 
-    let mut dsp = Dsp::new();
+    let mut dsp = Dsp::new(48_000.0);
     let mut run =
         |ring: &Arc<InputShared>, strip: usize, eq: [f32; 3], freq: f32, frames: usize| -> f32 {
             for band in 0..3 {
@@ -5403,7 +5501,7 @@ pub fn vst_mix_selftest(path: &Path, report_path: &Path) {
                 peak
             }
 
-            let mut dsp = Dsp::new();
+            let mut dsp = Dsp::new(48_000.0);
             let mut buf = vec![0.0f32; 1024];
 
             // Let the bus fader reach 0 dB and the plug-in settle.
@@ -5525,7 +5623,7 @@ pub fn vst_multichannel_selftest(path: &Path, report_path: &Path) {
         peak
     }
 
-    let mut dsp = Dsp::new();
+    let mut dsp = Dsp::new(48_000.0);
     let mut buf = vec![0.0f32; 1024];
     let both = render_peak(&mut dsp, &shared, &mut buf, 80);
 
