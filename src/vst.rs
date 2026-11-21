@@ -677,7 +677,10 @@ impl VstChain {
         out_r: &mut [f32],
     ) -> bool {
         if !self.has_plugin.load(Ordering::Relaxed) || self.bypass.load(Ordering::Relaxed) {
-            self.dry_blocks.fetch_add(1, Ordering::Relaxed);
+            // Not a dry block: there is no insert to miss. Counting these made the
+            // once-a-second line report an empty slot on every block (measured:
+            // 110/s for 16 minutes on a strip with no plug-in), which buried the
+            // lock contention the line exists to show.
             return false;
         }
         let frames = in_l.len().min(in_r.len()).min(out_l.len()).min(out_r.len());

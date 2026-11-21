@@ -44,6 +44,11 @@ const BUS_DRAIN_FRAMES: usize = 2048;
 /// app feed; the status bar follows the monitoring bus, not this one.
 const USB_CABLE_CUSHION_FRAMES: usize = 2048;
 
+/// How much of the rate the output callback's servo is allowed to trim when a
+/// ring is away from its target fill. 0.4 % is about 7 cents, inaudible on
+/// program material, and it is enough to absorb a crystal mismatch of ±0.1 %.
+const SERVO_TRIM: f32 = 0.004;
+
 /// Ring depth the callback keeps queued for this endpoint.
 fn bus_cushion_frames(device: &str) -> usize {
     if device.to_ascii_lowercase().contains("usb cable") {
@@ -51,6 +56,16 @@ fn bus_cushion_frames(device: &str) -> usize {
     } else {
         BUS_DRAIN_FRAMES
     }
+}
+
+/// Consumption multiplier applied by an output callback's rate servo: below the
+/// target fill it reads a little slower so the mixer refills the cushion, above
+/// it a little faster. The trim is clamped to `±SERVO_TRIM`, so it can never be
+/// heard as a pitch shift.
+fn servo_step(base_step: f32, cushion: usize, fill: usize) -> f32 {
+    let target = (cushion as f32 * 0.75).max(1.0);
+    let error = ((target - fill as f32) / target).clamp(-1.0, 1.0);
+    base_step * (1.0 - error * SERVO_TRIM)
 }
 /// Longest track this build will hold in memory. The original streams from
 /// disk; this rebuild decodes to RAM, so it stops at 30 minutes with a clear
@@ -716,8 +731,16 @@ struct Shared {
     /// Frames the endpoint asked for in its last callback; the cable ring has to
     /// be at least this deep or the callback itself starves.
     bus_callback_frames: [AtomicUsize; MAX_BUSES],
-    /// Sample-rate ratio this bus stream consumes at (1.0 = matched).
+    /// Sample-rate ratio this bus stream consumes at (1.0 = matched, before the
+    /// servo trim is applied).
     bus_step: [AtomicU32; MAX_BUSES],
+    /// Frames a bus callback had to fill by holding the last sample because the
+    /// ring was empty. Distinct from an underrun (one per callback): this is how
+    /// much audio was actually missing, which is what is heard.
+    bus_starve_frames: [AtomicU64; MAX_BUSES],
+    /// Lowest ring fill seen since the last log tick. The servo targets a
+    /// cushion; this shows whether the cushion is actually being held.
+    bus_ring_min: [AtomicUsize; MAX_BUSES],
     error: Mutex<Option<String>>,
 }
 
@@ -763,6 +786,8 @@ impl Shared {
             bus_underruns: std::array::from_fn(|_| AtomicU64::new(0)),
             bus_callback_frames: std::array::from_fn(|_| AtomicUsize::new(0)),
             bus_step: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            bus_starve_frames: std::array::from_fn(|_| AtomicU64::new(0)),
+            bus_ring_min: std::array::from_fn(|_| AtomicUsize::new(usize::MAX)),
             vsts: std::array::from_fn(|_| crate::plugin::PlugIn::new()),
             duck_enabled: AtomicBool::new(false),
             duck_source: AtomicUsize::new(usize::MAX),
@@ -1857,6 +1882,20 @@ impl AudioEngine {
         (
             self.shared.mixer_late.swap(0, Ordering::Relaxed),
             std::array::from_fn(|bus| self.shared.bus_underruns[bus].swap(0, Ordering::Relaxed)),
+        )
+    }
+
+    /// Frames each bus had to fill by holding the last sample since the previous
+    /// call, and the lowest ring fill seen in the same period. `usize::MAX` for
+    /// the minimum means the bus had no output callback at all.
+    pub fn take_starve_report(&self) -> ([u64; MAX_BUSES], [usize; MAX_BUSES]) {
+        (
+            std::array::from_fn(|bus| {
+                self.shared.bus_starve_frames[bus].swap(0, Ordering::Relaxed)
+            }),
+            std::array::from_fn(|bus| {
+                self.shared.bus_ring_min[bus].swap(usize::MAX, Ordering::Relaxed)
+            }),
         )
     }
 
@@ -3591,12 +3630,8 @@ where
                     if let Some(slot) = shared.bus_callback_frames.get(owner) {
                         slot.store(data.len() / channels.max(1), Ordering::Relaxed);
                     }
-                    if let Some(slot) = shared.bus_step.get(owner) {
-                        let ratio = shared.sample_rate.load(Ordering::Relaxed) as f32
-                            / output_rate.max(1.0);
-                        slot.store(ratio.max(0.01).to_bits(), Ordering::Relaxed);
-                    }
                 }
+                let owner = buses.first().copied().unwrap_or(0);
                 let base_step = if output_rate > 0.0 {
                     (master_rate / output_rate).max(0.01)
                 } else {
@@ -3610,18 +3645,20 @@ where
                     .map(|&bus| lock_source(&shared.bus_out_rings[bus]))
                     .collect();
                 // Rate servo. The device clock and the mixer's timer never match
-                // exactly, so a fixed step slowly drains (or fills) the ring; that
-                // is why the clicks only began after the mixer had been running a
-                // while. An integrator trims the consumption rate toward the target
-                // fill, which nulls any steady mismatch; a proportional term alone
-                // saturated and kept draining. The range is 1%, inaudible as pitch.
-                let target = cushion as f32;
-                let fill = rings.iter().map(|ring| ring.len()).min().unwrap_or(0) as f32;
-                let _ = (fill, target);
-                let step = base_step;
+                // exactly, so a fixed step slowly drains (or fills) the ring and
+                // the pre-fill is eaten for good: measured on 21/11, 1,121 of
+                // 1,131 seconds had underruns and the cable rings held 12 ms of
+                // their 42 ms cushion. A proportional term trims consumption by
+                // at most 0.4 % - inaudible as pitch - and holds the fill at
+                // three quarters of the cushion, away from both empty and the
+                // 60 ms cap.
+                let fill = rings.iter().map(|ring| ring.len()).min().unwrap_or(0);
+                let step = servo_step(base_step, cushion, fill);
                 let mut accumulator = 0.0f32;
                 let mut starved = false;
-                for frame in data.chunks_mut(channels) {
+                let total = data.len() / channels.max(1);
+                let mut held = 0usize;
+                for (index, frame) in data.chunks_mut(channels).enumerate() {
                     accumulator += step;
                     while accumulator >= 1.0 {
                         if rings.iter().any(|ring| ring.is_empty()) {
@@ -3629,11 +3666,12 @@ where
                                 // Count once per callback: the mixer owed audio
                                 // here. The previous sample is held rather than
                                 // dropping to zero, so the gap is not a step in
-                                // the waveform.
+                                // the waveform. The frames that end up held are
+                                // counted separately: that is the audible part.
                                 starved = true;
-                                let owner = buses.first().copied().unwrap_or(0);
                                 shared.bus_underruns[owner].fetch_add(1, Ordering::Relaxed);
                             }
+                            held = held.max(total.saturating_sub(index));
                             accumulator = 0.0;
                             break;
                         }
@@ -3656,6 +3694,20 @@ where
                             *sample = T::from_sample(0.0f32);
                         }
                     }
+                }
+                if held > 0 {
+                    shared.bus_starve_frames[owner].fetch_add(held as u64, Ordering::Relaxed);
+                }
+                if let Some(slot) = shared.bus_step.get(owner) {
+                    slot.store(step.to_bits(), Ordering::Relaxed);
+                }
+                let min_fill = rings
+                    .iter()
+                    .map(|ring| ring.len())
+                    .min()
+                    .unwrap_or(usize::MAX);
+                if let Some(slot) = shared.bus_ring_min.get(owner) {
+                    slot.fetch_min(min_fill, Ordering::Relaxed);
                 }
                 for ring in rings.iter_mut() {
                     let excess = ring.len().saturating_sub(cushion);
@@ -4278,6 +4330,28 @@ pub fn wav_selftest() {
 #[cfg(test)]
 mod latency_tests {
     use super::*;
+
+    #[test]
+    fn servo_refills_a_low_ring_and_brakes_a_full_one() {
+        let cushion = USB_CABLE_CUSHION_FRAMES;
+        let target = (cushion as f32 * 0.75) as usize;
+        // Empty ring: read slower than the mixer writes, so the cushion grows.
+        assert!(servo_step(1.0, cushion, 0) < 1.0);
+        // At the target: no trim at all.
+        assert!((servo_step(1.0, cushion, target) - 1.0).abs() < 1e-6);
+        // Ring at the cap: read faster so the surplus drains.
+        assert!(servo_step(1.0, cushion, cushion) > 1.0);
+        // The trim never exceeds SERVO_TRIM in either direction.
+        for fill in [0usize, 1, target / 2, target, cushion, cushion * 2] {
+            let step = servo_step(1.0, cushion, fill);
+            assert!(
+                (step - 1.0).abs() <= SERVO_TRIM + 1e-6,
+                "fill {fill}: {step}"
+            );
+        }
+        // A rate mismatch between mixer and device keeps its base ratio.
+        assert!((servo_step(0.5, cushion, target) - 0.5).abs() < 1e-6);
+    }
 
     #[test]
     fn buses_on_one_device_share_a_stream() {

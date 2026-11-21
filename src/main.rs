@@ -1105,6 +1105,12 @@ struct MixerApp {
     /// Last output-queue depth written to the log, so growth is visible without
     /// hovering the status bar.
     last_ring_logged: usize,
+    /// When an empty output-device list was last reported, so a service hiccup
+    /// is logged once instead of once a second.
+    outputs_empty_logged_at: f64,
+    /// Injected hook DLLs (OBS game capture, NVIDIA overlay) are logged once the
+    /// window has had time to be hooked.
+    hooks_logged: bool,
     /// Last set of open output groups. A change means the device set moved (a
     /// cable re-enumerated), which is when a sticky insert failure is cleared.
     last_group_report: String,
@@ -1657,6 +1663,8 @@ impl MixerApp {
             latency_detail_shown: String::new(),
             latency_tick: 1.0,
             last_ring_logged: 0,
+            outputs_empty_logged_at: -60.0,
+            hooks_logged: false,
             last_group_report: String::new(),
             devices_probe: None,
             inputs_probe: None,
@@ -2692,30 +2700,38 @@ impl MixerApp {
                 dry_detail.join(" ")
             ));
         }
+        let (starved, min_ring) = self.audio.take_starve_report();
+        let starved_total: u64 = starved.iter().sum();
         let underrun_total: u64 = bus_underruns.iter().sum();
-        if late_blocks > 0 || underrun_total > 0 {
+        if late_blocks > 0 || underrun_total > 0 || starved_total > 0 {
             let detail = bus_underruns
                 .iter()
                 .enumerate()
-                .filter(|(_, count)| **count > 0)
+                .filter(|(bus, count)| **count > 0 || starved[*bus] > 0)
                 .map(|(bus, count)| {
                     format!(
-                        "{}={count} (cb {} frames, step {:.3}, ring {})",
+                        "{}={count} (cb {} frames, step {:.3}, ring {}, min {}, starved {} frames)",
                         self.buses[bus].name,
                         self.audio.callback_frames_for(bus),
                         self.audio.bus_step(bus),
-                        self.audio.ring_frames(bus)
+                        self.audio.ring_frames(bus),
+                        if min_ring[bus] == usize::MAX {
+                            "-".to_string()
+                        } else {
+                            min_ring[bus].to_string()
+                        },
+                        starved[bus]
                     )
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
             if detail.is_empty() {
                 diag_log(format!(
-                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s) in the last second"
+                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s) in the last second"
                 ));
             } else {
                 diag_log(format!(
-                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s) in the last second: {detail}"
+                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s) in the last second: {detail}"
                 ));
             }
         }
@@ -2770,6 +2786,22 @@ impl MixerApp {
 
     /// React to a list that arrived from the probe thread.
     fn handle_device_list(&mut self, devices: Vec<String>) {
+        if devices.is_empty() {
+            // An empty list is what the audio service returns while it is busy
+            // or re-enumerating (a Bluetooth headset connecting, audiodg
+            // restarting). Passing it on routes every bus to nothing, which
+            // closes streams that were playing a second ago: ~1 s of silence
+            // and a device reset for every client. Keep what is open and let
+            // the next probe replace it.
+            if self.time >= self.outputs_empty_logged_at + 60.0 {
+                self.outputs_empty_logged_at = self.time;
+                diag_log(format!(
+                    "audio: output list empty, keeping {} device(s) and the open streams",
+                    self.last_outputs.len()
+                ));
+            }
+            return;
+        }
         let list_changed = !self.last_outputs.is_empty() && devices != self.last_outputs;
         let recovered = self.last_outputs.is_empty() && !devices.is_empty();
         self.driver_mode = driver_cables_present_from(&devices);
@@ -9156,6 +9188,21 @@ impl eframe::App for MixerApp {
         if self.save_on_exit && self.shot_path.is_none() {
             self.save_settings();
         }
+        // The state is on disk now. NVIDIA's driver has crashed inside nvapi64
+        // while this process was tearing its OpenGL window down (WER 1000,
+        // 21/11 04:22:51, nvapi64!+0x2ce829, five seconds after the close
+        // request), so give the cable server a moment to drop its connections
+        // and then leave before eframe destroys the window.
+        if self.shot_path.is_some() {
+            return;
+        }
+        for _ in 0..30 {
+            if !self.vc.status().running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::process::exit(0);
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -9172,6 +9219,16 @@ impl eframe::App for MixerApp {
                     self.mixer_hwnd = window.hwnd.get() as isize;
                     diag_log(format!("main: mixer hwnd {:#x}", self.mixer_hwnd));
                 }
+            }
+        }
+        if !self.hooks_logged && self.time >= 3.0 {
+            self.hooks_logged = true;
+            let hooks = injected_hook_modules();
+            if !hooks.is_empty() {
+                diag_log(format!(
+                    "main: injected hook module(s): {} (OBS game capture / NVIDIA overlay)",
+                    hooks.join(", ")
+                ));
             }
         }
         if self.pending_maximize {
@@ -10661,6 +10718,58 @@ fn diag_path(name: &str) -> PathBuf {
     settings_canonical_path().with_file_name(name)
 }
 
+/// DLLs other programs have injected into this process. OBS "Game Capture" hooks
+/// the mixer's OpenGL output (`graphics-hook64.dll`) and the NVIDIA overlay does
+/// the same (`nvspcap64.dll`); both use NVAPI, and the crashes on 20-21/11 were
+/// inside `nvapi64` while a Game Capture source was on this process. Logging the
+/// names makes a reintroduced hook visible instead of mysterious.
+#[cfg(windows)]
+fn injected_hook_modules() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+    };
+
+    let mut out = Vec::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, std::process::id());
+        if snapshot == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut entry: MODULEENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        if Module32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let end = entry
+                    .szModule
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szModule.len());
+                let name = String::from_utf16_lossy(&entry.szModule[..end]);
+                let lower = name.to_ascii_lowercase();
+                if lower.contains("graphics-hook")
+                    || lower.starts_with("obs")
+                    || lower == "nvspcap64.dll"
+                {
+                    out.push(name);
+                }
+                if Module32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+#[cfg(not(windows))]
+fn injected_hook_modules() -> Vec<String> {
+    Vec::new()
+}
+
 fn diag_log(message: impl AsRef<str>) {
     use std::io::Write;
     let path = diag_path("startup.log");
@@ -10719,7 +10828,7 @@ static UI_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 fn main() -> eframe::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     install_panic_log();
-    diag_log("main: entry");
+    diag_log(format!("main: entry pid {}", std::process::id()));
     // Watchdog: a frame that never returns still has working audio threads, so
     // record the stall while it is happening. Measured cause of one such stall:
     // the UI thread inside nvoglv64 waiting on vertical blank from SwapBuffers.
