@@ -44,10 +44,18 @@ const BUS_DRAIN_FRAMES: usize = 2048;
 /// app feed; the status bar follows the monitoring bus, not this one.
 const USB_CABLE_CUSHION_FRAMES: usize = 2048;
 
-/// How much of the rate the output callback's servo is allowed to trim when a
-/// ring is away from its target fill. 0.4 % is about 7 cents, inaudible on
-/// program material, and it is enough to absorb a crystal mismatch of ±0.1 %.
-const SERVO_TRIM: f32 = 0.004;
+/// How much of the rate an output callback's servo is allowed to trim away from
+/// the target fill. 0.5 % is under nine cents, and it is only reached while a
+/// ring is recovering; the steady trim is whatever nulls the clock mismatch.
+const SERVO_TRIM: f32 = 0.005;
+/// Integrator gain per callback: the steady trim it accumulates absorbs the
+/// device/mixer clock mismatch, so the fill converges on the target instead of
+/// settling wherever a proportional term happens to balance. At 100 callbacks a
+/// second this moves the trim 0.08 % per second.
+const SERVO_KI: f32 = 0.0008;
+/// Proportional gain per callback: damps the integrator so the fill does not
+/// overshoot while it converges.
+const SERVO_KP: f32 = 0.001;
 
 /// Ring depth the callback keeps queued for this endpoint.
 fn bus_cushion_frames(device: &str) -> usize {
@@ -60,12 +68,11 @@ fn bus_cushion_frames(device: &str) -> usize {
 
 /// Consumption multiplier applied by an output callback's rate servo: below the
 /// target fill it reads a little slower so the mixer refills the cushion, above
-/// it a little faster. The trim is clamped to `±SERVO_TRIM`, so it can never be
-/// heard as a pitch shift.
-fn servo_step(base_step: f32, cushion: usize, fill: usize) -> f32 {
-    let target = (cushion as f32 * 0.75).max(1.0);
-    let error = ((target - fill as f32) / target).clamp(-1.0, 1.0);
-    base_step * (1.0 - error * SERVO_TRIM)
+/// it a little faster. `trim` is carried by the caller and integrated there; the
+/// result is clamped to `±SERVO_TRIM`, so it can never be heard as a pitch shift
+/// beyond a few cents.
+fn servo_step(base_step: f32, trim: f32) -> f32 {
+    base_step * (1.0 - trim.clamp(-SERVO_TRIM, SERVO_TRIM))
 }
 /// Longest track this build will hold in memory. The original streams from
 /// disk; this rebuild decodes to RAM, so it stops at 30 minutes with a clear
@@ -3617,8 +3624,10 @@ where
     let output_rate = config.sample_rate.0 as f32;
     let error_shared = shared.clone();
     // Carried across callbacks: the last sample keeps a starving callback from
-    // dropping to zero.
+    // dropping to zero, and the servo trim is the integrator state that nulls
+    // the steady rate mismatch.
     let mut last = (0.0f32, 0.0f32);
+    let mut servo_trim = 0.0f32;
     device
         .build_output_stream(
             config,
@@ -3646,14 +3655,18 @@ where
                     .collect();
                 // Rate servo. The device clock and the mixer's timer never match
                 // exactly, so a fixed step slowly drains (or fills) the ring and
-                // the pre-fill is eaten for good: measured on 21/11, 1,121 of
-                // 1,131 seconds had underruns and the cable rings held 12 ms of
-                // their 42 ms cushion. A proportional term trims consumption by
-                // at most 0.4 % - inaudible as pitch - and holds the fill at
-                // three quarters of the cushion, away from both empty and the
-                // 60 ms cap.
+                // the pre-fill is eaten for good. A proportional term alone only
+                // settles where the trim happens to balance the mismatch (measured
+                // at 0.2 %: the cable rings hovered at a third of the cushion with
+                // underruns every second), so the integrator below carries the
+                // steady trim and the fill converges on three quarters of the
+                // cushion - away from both empty and the 60 ms cap.
+                let target = (cushion as f32 * 0.75).max(1.0);
                 let fill = rings.iter().map(|ring| ring.len()).min().unwrap_or(0);
-                let step = servo_step(base_step, cushion, fill);
+                let error = ((target - fill as f32) / target).clamp(-1.0, 1.0);
+                servo_trim = (servo_trim + error * SERVO_KI).clamp(-SERVO_TRIM, SERVO_TRIM);
+                let trim = (servo_trim + error * SERVO_KP).clamp(-SERVO_TRIM, SERVO_TRIM);
+                let step = servo_step(base_step, trim);
                 let mut accumulator = 0.0f32;
                 let mut starved = false;
                 let total = data.len() / channels.max(1);
@@ -4335,22 +4348,30 @@ mod latency_tests {
     fn servo_refills_a_low_ring_and_brakes_a_full_one() {
         let cushion = USB_CABLE_CUSHION_FRAMES;
         let target = (cushion as f32 * 0.75) as usize;
-        // Empty ring: read slower than the mixer writes, so the cushion grows.
-        assert!(servo_step(1.0, cushion, 0) < 1.0);
-        // At the target: no trim at all.
-        assert!((servo_step(1.0, cushion, target) - 1.0).abs() < 1e-6);
-        // Ring at the cap: read faster so the surplus drains.
-        assert!(servo_step(1.0, cushion, cushion) > 1.0);
-        // The trim never exceeds SERVO_TRIM in either direction.
-        for fill in [0usize, 1, target / 2, target, cushion, cushion * 2] {
-            let step = servo_step(1.0, cushion, fill);
-            assert!(
-                (step - 1.0).abs() <= SERVO_TRIM + 1e-6,
-                "fill {fill}: {step}"
-            );
+        // The integrator moves toward "read slower" while the ring is short and
+        // toward "read faster" while it is over the target.
+        let mut trim = 0.0f32;
+        for _ in 0..100 {
+            let error = ((target as f32 - 0.0) / target as f32).clamp(-1.0, 1.0);
+            trim = (trim + error * SERVO_KI).clamp(-SERVO_TRIM, SERVO_TRIM);
+        }
+        assert!(trim > 0.0);
+        assert!(servo_step(1.0, trim) < 1.0);
+        let mut trim = 0.0f32;
+        for _ in 0..100 {
+            let error = ((target as f32 - cushion as f32) / target as f32).clamp(-1.0, 1.0);
+            trim = (trim + error * SERVO_KI).clamp(-SERVO_TRIM, SERVO_TRIM);
+        }
+        assert!(trim < 0.0);
+        assert!(servo_step(1.0, trim) > 1.0);
+        // No trim, no change; and the trim never exceeds SERVO_TRIM.
+        assert!((servo_step(1.0, 0.0) - 1.0).abs() < 1e-6);
+        for trim in [-1.0f32, -0.2, 0.2, 1.0] {
+            let step = servo_step(1.0, trim);
+            assert!((step - 1.0).abs() <= SERVO_TRIM + 1e-6, "{trim}: {step}");
         }
         // A rate mismatch between mixer and device keeps its base ratio.
-        assert!((servo_step(0.5, cushion, target) - 0.5).abs() < 1e-6);
+        assert!((servo_step(0.5, 0.0) - 0.5).abs() < 1e-6);
     }
 
     #[test]
