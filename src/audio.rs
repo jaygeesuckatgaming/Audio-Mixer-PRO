@@ -42,7 +42,7 @@ const BUS_DRAIN_FRAMES: usize = 2048;
 /// more than one callback's worth. Measured starving 1-9 times a second with
 /// 1024 and with 1792 frames. Six callbacks of cushion, 60 ms, is fine for an
 /// app feed; the status bar follows the monitoring bus, not this one.
-const USB_CABLE_CUSHION_FRAMES: usize = 2048;
+const USB_CABLE_CUSHION_FRAMES: usize = 2880;
 
 /// How much of the rate an output callback's servo is allowed to trim away from
 /// the target fill. 0.5 % is under nine cents, and it is only reached while a
@@ -1581,8 +1581,9 @@ impl Dsp {
             }
             // Bound the bus delay too: the ring holds up to 341 ms, and an
             // output stream that stalls under load would otherwise sit that far
-            // behind for good. Keep at most ~60 ms of slack.
-            let limit = (sample_rate as f32 * 0.060) as usize;
+            // behind for good. Keep at most ~80 ms of slack, one cable cushion
+            // plus a mixer block.
+            let limit = (sample_rate as f32 * 0.080) as usize;
             while ring.len() > limit {
                 ring.pop_front();
             }

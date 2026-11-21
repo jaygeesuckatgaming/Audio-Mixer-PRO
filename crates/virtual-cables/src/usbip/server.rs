@@ -193,6 +193,9 @@ struct ParsedSubmit {
     out: Vec<u8>,
     packets: Vec<IsoPacket>,
     complete_at: Instant,
+    /// How much audio this transfer carries; the minimum spacing between two
+    /// answered transfers on the same endpoint.
+    duration: Duration,
 }
 
 async fn read_submit<R: AsyncRead + Unpin>(
@@ -219,6 +222,7 @@ async fn read_submit<R: AsyncRead + Unpin>(
         out,
         packets,
         complete_at: Instant::now(),
+        duration: Duration::ZERO,
     })
 }
 
@@ -227,6 +231,10 @@ struct ConnectionState {
     frame: Duration,
     pending: StdMutex<HashMap<u32, CancellationToken>>,
     iso_next: StdMutex<HashMap<u32, Instant>>,
+    /// When the previous transfer on an endpoint was answered. Responses are
+    /// spaced by at least one transfer's duration, so a stalled server cannot
+    /// release several tens of milliseconds of audio in one go.
+    iso_done: StdMutex<HashMap<u32, Instant>>,
 }
 
 impl ConnectionState {
@@ -275,6 +283,43 @@ impl ConnectionState {
         deadline
     }
 
+    /// Wait for this transfer to be due, but never answer two transfers on the
+    /// same endpoint less than one transfer apart. Submission timestamps can all
+    /// lie in the past after the server stalls (the host queues several URBs at
+    /// once), and completing them back to back hands tens of milliseconds of
+    /// audio to the host at once; its engine then consumes it as a burst and
+    /// drains the application's output ring, which is heard as clicks or a short
+    /// gap. The deadline is clamped per endpoint instead.
+    async fn wait_turn(
+        &self,
+        endpoint: u32,
+        ctx: &CancellationToken,
+        complete_at: Instant,
+        duration: Duration,
+    ) -> Result<(), ()> {
+        if ctx.is_cancelled() {
+            return Err(());
+        }
+        let now = Instant::now();
+        let due = {
+            let mut done = self.iso_done.lock().unwrap();
+            let spaced = done
+                .get(&endpoint)
+                .map(|last| *last + duration)
+                .unwrap_or(now);
+            let due = complete_at.max(spaced).max(now);
+            done.insert(endpoint, due);
+            due
+        };
+        if due <= now {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(due) => Ok(()),
+            _ = ctx.cancelled() => Err(()),
+        }
+    }
+
     fn add_pending(&self, sequence: u32, token: CancellationToken) {
         self.pending.lock().unwrap().insert(sequence, token);
     }
@@ -313,6 +358,7 @@ async fn handle_urbs(
         frame: device.frame_interval(),
         pending: StdMutex::new(HashMap::new()),
         iso_next: StdMutex::new(HashMap::new()),
+        iso_done: StdMutex::new(HashMap::new()),
     });
 
     loop {
@@ -354,6 +400,10 @@ async fn handle_urbs(
                 }
 
                 let token = CancellationToken::new();
+                let mut duration = state.frame * submit.req.number_of_packets.min(2048);
+                if duration > Duration::from_millis(250) {
+                    duration = Duration::from_millis(250);
+                }
                 let complete_at = state.reserve_iso_completion(
                     basic.endpoint,
                     submit.req.number_of_packets,
@@ -361,6 +411,7 @@ async fn handle_urbs(
                 );
                 let mut submit = submit;
                 submit.complete_at = complete_at;
+                submit.duration = duration;
                 state.add_pending(basic.sequence, token.clone());
                 let state_task = state.clone();
                 let device_task = device.clone();
@@ -479,7 +530,11 @@ async fn process_submit(
         }
         let mut packets = submit.packets.clone();
         mark_iso_packets(&mut packets, actual);
-        if req.is_isochronous() && wait_iso_completion(ctx, submit.complete_at).await.is_err()
+        if req.is_isochronous()
+            && state
+                .wait_turn(req.basic.endpoint, ctx, submit.complete_at, submit.duration)
+                .await
+                .is_err()
         {
             mark_iso_error(&mut packets, STATUS_CONN_RESET);
             return state
@@ -492,7 +547,11 @@ async fn process_submit(
     }
 
     if req.basic.endpoint == 2 && req.basic.direction == DIRECTION_IN {
-        if req.is_isochronous() && wait_iso_completion(ctx, submit.complete_at).await.is_err()
+        if req.is_isochronous()
+            && state
+                .wait_turn(req.basic.endpoint, ctx, submit.complete_at, submit.duration)
+                .await
+                .is_err()
         {
             let mut packets = submit.packets.clone();
             mark_iso_error(&mut packets, STATUS_CONN_RESET);
@@ -526,22 +585,6 @@ async fn process_submit(
     state
         .write_submit(req, STATUS_PIPE, 0, &[], &packets, packets.len() as u32)
         .await
-}
-
-async fn wait_iso_completion(
-    ctx: &CancellationToken,
-    complete_at: Instant,
-) -> Result<(), ()> {
-    if ctx.is_cancelled() {
-        return Err(());
-    }
-    if complete_at <= Instant::now() {
-        return Ok(());
-    }
-    tokio::select! {
-        _ = tokio::time::sleep_until(complete_at) => Ok(()),
-        _ = ctx.cancelled() => Err(()),
-    }
 }
 
 fn response_payload_length(req: &SubmitRequest, packets: &[IsoPacket]) -> usize {
