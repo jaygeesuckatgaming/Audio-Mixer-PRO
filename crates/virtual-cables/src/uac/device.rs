@@ -514,9 +514,18 @@ impl Device {
     }
 
     /// Start (or stop) keeping a copy of the incoming playback for the mixer.
+    /// Enabling pre-fills 20 ms of silence: the tap arrives at exactly the rate
+    /// it is consumed, so without a cushion the reader sits at empty and repeats
+    /// samples whenever a transfer is late.
     pub fn enable_tap(&self, enabled: bool) {
-        if !enabled {
-            self.tap.reset();
+        self.tap.reset();
+        if enabled {
+            let (bytes, rate) = self.tap_format();
+            let frame_bytes = bytes as usize * AUDIO_CHANNELS;
+            if frame_bytes > 0 && rate > 0 {
+                let frames = (rate as usize / 50).max(1);
+                self.tap.write(&vec![0u8; frames * frame_bytes]);
+            }
         }
         self.tap_enabled.store(enabled, Ordering::Relaxed);
     }

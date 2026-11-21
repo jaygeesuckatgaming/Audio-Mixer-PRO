@@ -941,9 +941,10 @@ struct MixerApp {
     buses: Vec<Bus>,
     /// One real capture stream per hardware strip (None until a device opens).
     captures: Vec<Option<StripInput>>,
-    /// Per strip: prefer reading a USB cable's own buffer ("direct") over a
-    /// Windows capture stream on its microphone endpoint. The menu flips it for
-    /// the current session when a cable misbehaves.
+    /// Per strip: read a USB cable's own buffer ("direct") instead of a Windows
+    /// capture stream on its microphone endpoint. Off by default while the tap
+    /// is being proven: the strip menu enables it per session, and a strip that
+    /// sounds wrong can always be switched back.
     strip_direct: [bool; MAX_STRIPS],
     tape: Tape,
     audio: AudioEngine,
@@ -1552,7 +1553,7 @@ impl MixerApp {
             pending_auto_assign: Vec::new(),
             buses: (0..audio::MAX_BUSES).map(Bus::new).collect(),
             captures,
-            strip_direct: [true; MAX_STRIPS],
+            strip_direct: [false; MAX_STRIPS],
             tape: Tape::new(),
             audio,
             sample_rate,

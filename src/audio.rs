@@ -2807,6 +2807,11 @@ const INPUT_BUFFER_FRAMES: u32 = 512;
 /// slow clock drift is corrected toward it instead of growing toward the ring
 /// capacity.
 pub const INPUT_TARGET_MS: f32 = 20.0;
+/// Input ring servo: the most it may trim the read rate away from the device's
+/// (7 cents, reached only while the fill is recovering) and the integrator step
+/// per output frame, which lets it converge in about a second.
+const INPUT_TRIM_MAX: f32 = 0.004;
+const INPUT_TRIM_STEP: f32 = 2.0e-7;
 /// Extra fill tolerated before the drift controller starts slipping frames out.
 /// It has to sit above the backlog a healthy capture settles at, or the slip runs
 /// permanently: 250 single-frame removals a second is a continuous stream of
@@ -2942,6 +2947,12 @@ struct InputReader {
     ready: bool,
     drift_tick: u32,
     starve: u32,
+    /// Servo trim that holds the input ring at its target. A capture stream's
+    /// clock and the mixer's timer never match exactly; without this the fill
+    /// drifts to zero and every jitter repeats a sample (heard as roughness),
+    /// which is especially audible on a direct cable tap because it has no
+    /// engine buffer behind it.
+    trim: f32,
 }
 
 impl InputReader {
@@ -2953,6 +2964,7 @@ impl InputReader {
             ready: false,
             drift_tick: 0,
             starve: 0,
+            trim: 0.0,
         }
     }
 
@@ -2975,6 +2987,13 @@ impl InputReader {
         }
 
         let ratio = (input_rate.max(1) as f32) / (output_rate as f32);
+        // Hold the fill at the target instead of letting drift decide it. The
+        // trim is at most 0.4 % (under seven cents) and only reached while the
+        // fill is far from target; once it settles it carries the steady clock
+        // mismatch, so the ring no longer slides toward empty.
+        let error = ((target as f32 - ring.fill() as f32) / target as f32).clamp(-1.0, 1.0);
+        self.trim = (self.trim + error * INPUT_TRIM_STEP).clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
+        let ratio = ratio * (1.0 - self.trim);
         self.phase += ratio;
         while self.phase >= 1.0 {
             if let Some(frame) = ring.pop() {
