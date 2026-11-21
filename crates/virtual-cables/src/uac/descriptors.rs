@@ -378,7 +378,10 @@ fn uac2_as_interface(
             bytes,
             resolution,
         ]);
-        let max_packet = (AUDIO_CHANNELS as u32 * bytes as u32 * max_rate / 8000) as u16;
+        // Ceiling, not truncation: 44.1 kHz needs 22.05 bytes per microframe at
+        // 16-bit stereo, and truncating to 22 under-provisions the endpoint so
+        // usbaudio2 refuses to start it (Code 10). 48/96/192 kHz divide exactly.
+        let max_packet = ((AUDIO_CHANNELS as u32 * bytes as u32 * max_rate + 7999) / 8000) as u16;
         b.extend_from_slice(&[
             9,
             DESC_ENDPOINT,
