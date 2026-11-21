@@ -301,6 +301,14 @@ impl VstChain {
     pub fn take_dry_blocks(&self) -> u64 {
         self.dry_blocks.swap(0, Ordering::Relaxed)
     }
+    /// True when the slot gave up on the plug-in after a processing error.
+    pub fn failed(&self) -> bool {
+        self.inner
+            .try_lock()
+            .map(|inner| inner.failed)
+            .unwrap_or(false)
+    }
+
 
     pub fn latency(&self) -> (u32, u32) {
         self.inner

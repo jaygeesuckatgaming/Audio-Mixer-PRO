@@ -116,6 +116,14 @@ impl PlugIn {
         }
     }
 
+    /// True when the slot gave up on the plug-in after a processing error.
+    pub fn failed(&self) -> bool {
+        match &*self.backend() {
+            Backend::Vst3(chain) => chain.failed(),
+            Backend::Clap(_) => false,
+        }
+    }
+
     /// Dry blocks since the previous call, over all slots.
     pub fn take_dry_blocks(&self) -> u64 {
         match &*self.backend() {

@@ -2663,15 +2663,24 @@ impl MixerApp {
         let (late_blocks, bus_underruns) = self.audio.take_stream_stats();
         // A plug-in block that had to pass dry (slot busy) is an audible switch
         // between processed and unprocessed audio, so it belongs in the log.
-        let dry_blocks: u64 = self
-            .vsts
-            .iter()
-            .take(self.active_strips)
-            .map(|slot| slot.chain.take_dry_blocks())
-            .sum();
-        if dry_blocks > 0 {
+        let mut dry_blocks: u64 = 0;
+        let mut dry_detail: Vec<String> = Vec::new();
+        for (slot, vst) in self.vsts.iter().take(self.active_strips).enumerate() {
+            let count = vst.chain.take_dry_blocks();
+            let failed = vst.chain.failed();
+            if count > 0 || failed {
+                dry_detail.push(format!(
+                    "{}={count}{}",
+                    self.strip_label(slot),
+                    if failed { " (failed)" } else { "" }
+                ));
+            }
+            dry_blocks += count;
+        }
+        if dry_blocks > 0 || !dry_detail.is_empty() {
             diag_log(format!(
-                "audio: {dry_blocks} plug-in block(s) passed dry in the last second"
+                "audio: {dry_blocks} plug-in block(s) passed dry in the last second: {}",
+                dry_detail.join(" ")
             ));
         }
         let underrun_total: u64 = bus_underruns.iter().sum();
