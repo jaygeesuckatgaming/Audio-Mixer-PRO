@@ -16,7 +16,7 @@ use symphonia::core::probe::Hint;
 use virtual_cables::{Device, Mode};
 
 /// Stereo pairs the external ASIO insert exposes (one per shared section pair).
-use asio_insert::section::PAIRS as INSERT_PAIRS;
+pub use asio_insert::section::PAIRS as INSERT_PAIRS;
 
 pub const DEMO_LEN_SECS: f32 = 252.0;
 /// Frames held in each A2/A3 output ring. The master (A1) callback writes

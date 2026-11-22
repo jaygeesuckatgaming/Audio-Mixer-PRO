@@ -3813,6 +3813,18 @@ fn path_delay_ms(
                 vst.bypass as u8
             ));
         }
+        // External ASIO insert: one strip per stereo pair, pre- or post-FX.
+        // Only assigned strips are written; loading clears the rest.
+        for (strip, _) in self.strips.iter().take(self.active_strips).enumerate() {
+            if let Some((pair, post)) = self.audio.strip_insert(strip) {
+                text.push_str(&format!(
+                    "<AsioInsert strip=\"{}\" pair=\"{}\" post=\"{}\" />\n",
+                    strip + 1,
+                    pair + 1,
+                    post as u8
+                ));
+            }
+        }
         text.push_str(&format!(
             "<Streamer enabled='{}' speed='{:.1}' />\n",
             if self.streamer_mode { 1 } else { 0 },
@@ -4353,6 +4365,13 @@ fn path_delay_ms(
                 highest = highest.max(slot.min(MAX_STRIPS));
             }
         }
+        for (attrs, _) in xml_elements(text, "AsioInsert") {
+            if let Some(strip) = xml_attr(attrs, "strip")
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                highest = highest.max(strip.min(MAX_STRIPS));
+            }
+        }
         self.active_strips = highest.clamp(BASE_STRIPS, MAX_STRIPS);
         self.audio.set_strip_count(self.active_strips);
 
@@ -4369,6 +4388,40 @@ fn path_delay_ms(
             if let Some(value) = bool_attr(attrs, "bypass") {
                 self.vsts[slot].bypass = value;
             }
+        }
+
+        // External ASIO insert assignments. The scene is the full state, so a
+        // scene without an <AsioInsert> turns a previous assignment off.
+        for strip in 0..MAX_STRIPS {
+            self.audio.set_strip_insert(strip, None, false);
+        }
+        for (attrs, _) in xml_elements(text, "AsioInsert") {
+            let Some(strip) = xml_attr(attrs, "strip")
+                .and_then(|value| value.parse::<usize>().ok())
+                .and_then(|value| value.checked_sub(1))
+            else {
+                continue;
+            };
+            let Some(pair) = xml_attr(attrs, "pair")
+                .and_then(|value| value.parse::<usize>().ok())
+                .and_then(|value| value.checked_sub(1))
+            else {
+                continue;
+            };
+            if strip >= MAX_STRIPS || pair >= audio::INSERT_PAIRS {
+                continue;
+            }
+            // The panel allows one strip on each pair; the last element wins,
+            // as it would if the same assignment were made twice in the UI.
+            for other in 0..MAX_STRIPS {
+                if other != strip
+                    && self.audio.strip_insert(other).map(|(used, _)| used) == Some(pair)
+                {
+                    self.audio.set_strip_insert(other, None, false);
+                }
+            }
+            let post = bool_attr(attrs, "post").unwrap_or(false);
+            self.audio.set_strip_insert(strip, Some(pair), post);
         }
 
         if let Some((attrs, _)) = xml_elements(text, "Streamer").first() {
@@ -5507,6 +5560,9 @@ fn path_delay_ms(
             self.audio.detach_input(i);
         }
         self.audio.set_strip_count(BASE_STRIPS);
+        for strip in 0..MAX_STRIPS {
+            self.audio.set_strip_insert(strip, None, false);
+        }
         self.buses = (0..audio::MAX_BUSES).map(Bus::new).collect();
         self.audio.unload();
         self.tape = Tape::new();
