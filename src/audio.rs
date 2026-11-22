@@ -3050,6 +3050,9 @@ pub(crate) struct InputShared {
     peak: AtomicU32,
     /// Frames in the last capture callback.
     frames: AtomicUsize,
+    /// Total frames pushed by the producer. `pushed - ring fill` is how much
+    /// the mixer has actually consumed, which is the player's playback clock.
+    pushed: AtomicU64,
     error: Mutex<Option<String>>,
     /// Short envelope (peak per 128 frames) of what this strip receives. Two
     /// strips listening to the same cable can be cross-correlated with it to
@@ -3117,6 +3120,7 @@ impl InputShared {
             rate: AtomicU32::new(48_000),
             peak: f32_atomic(0.0),
             frames: AtomicUsize::new(0),
+            pushed: AtomicU64::new(0),
             error: Mutex::new(None),
             envelope: Mutex::new(Envelope::new()),
         }
@@ -3136,6 +3140,26 @@ impl InputShared {
         }
         self.peak.store(peak.to_bits(), Ordering::Relaxed);
         self.frames.store(frames.len(), Ordering::Relaxed);
+        self.pushed
+            .fetch_add(frames.len() as u64, Ordering::Relaxed);
+    }
+
+    /// Frames waiting in the ring. The player uses this for back-pressure and
+    /// for its playback clock (`pushed - fill` = frames the mixer consumed).
+    pub(crate) fn ring_fill(&self) -> usize {
+        lock_source(&self.ring).fill()
+    }
+
+    /// Frames the mixer has consumed since this input was created.
+    pub(crate) fn played_frames(&self) -> u64 {
+        self.pushed
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.ring_fill() as u64)
+    }
+
+    /// Rate the producer delivers at.
+    pub(crate) fn rate(&self) -> u32 {
+        self.rate.load(Ordering::Relaxed).max(1)
     }
 
     pub(crate) fn set_rate(&self, rate: u32) {
@@ -4633,6 +4657,107 @@ pub fn pick_audio_file() -> Option<PathBuf> {
 
 #[cfg(not(windows))]
 pub fn pick_audio_file() -> Option<PathBuf> {
+    None
+}
+
+/// Native "open file" dialog with a caller-supplied title and filter. The filter
+/// must be a double-NUL-terminated UTF-8 string such as
+/// `"Text (*.txt)\0*.txt\0All files\0*.*\0\0"`.
+#[cfg(windows)]
+pub fn pick_file(title: &str, filter: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OPENFILENAMEW};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+
+    let wide = |s: &str| -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v
+    };
+    let filter = wide(filter);
+    let title = wide(title);
+    let mut file_buf = vec![0u16; 4000];
+
+    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = unsafe { GetActiveWindow() };
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = file_buf.as_mut_ptr();
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.Flags = 0x0082_1000;
+
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+    if ok == 0 {
+        return None;
+    }
+    let len = file_buf
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(file_buf.len());
+    if len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_wide(
+        &file_buf[..len],
+    )))
+}
+
+#[cfg(not(windows))]
+pub fn pick_file(_title: &str, _filter: &str) -> Option<PathBuf> {
+    None
+}
+
+/// Native "save file" dialog, used for exporting the player's playlist.
+#[cfg(windows)]
+pub fn pick_save_file(title: &str, filter: &str, default_name: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OPENFILENAMEW};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+
+    let wide = |s: &str| -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v
+    };
+    let filter = wide(filter);
+    let title = wide(title);
+    let mut file_buf = vec![0u16; 4000];
+    let name: Vec<u16> = default_name.encode_utf16().collect();
+    for (slot, ch) in file_buf.iter_mut().zip(name.iter()) {
+        *slot = *ch;
+    }
+
+    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = unsafe { GetActiveWindow() };
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = file_buf.as_mut_ptr();
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrTitle = title.as_ptr();
+    // OFN_OVERWRITEPROMPT | OFN_ENABLESIZING | OFN_PATHMUSTEXIST
+    ofn.Flags = 0x0080_080A;
+
+    let ok = unsafe { GetSaveFileNameW(&mut ofn) };
+    if ok == 0 {
+        return None;
+    }
+    let len = file_buf
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(file_buf.len());
+    if len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_wide(
+        &file_buf[..len],
+    )))
+}
+
+#[cfg(not(windows))]
+pub fn pick_save_file(_title: &str, _filter: &str, _default_name: &str) -> Option<PathBuf> {
     None
 }
 

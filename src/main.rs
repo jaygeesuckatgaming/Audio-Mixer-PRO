@@ -8,6 +8,7 @@ mod clap_slot;
 mod diagnostics;
 mod editor_host;mod endpoint_format;
 mod host_window;
+mod player;
 mod plugin;
 mod sessions;
 mod vban;
@@ -1083,6 +1084,19 @@ struct MixerApp {
     tape_error: Option<String>,
     tape_info: Option<String>,
     tape_recent: Vec<PathBuf>,
+    /// Internal streaming player: playlist, gapless playback and crossfade.
+    /// It pushes decoded frames into the same ring a capture uses, so its strip
+    /// gets the full channel strip (fader, EQ, dynamics, VST, insert, buses).
+    player: Option<player::Player>,
+    /// Strip whose input the player replaces.
+    player_strip: usize,
+    /// Strip the player is attached to right now (usize::MAX = none).
+    player_attached: usize,
+    show_player: bool,
+    /// Cached playlist for drawing, refreshed when the player's revision moves.
+    player_cache: Vec<player::Track>,
+    player_cache_rev: u64,
+    player_status: String,
     tape_path_input: String,
     status: String,
     status_until: f64,
@@ -1659,6 +1673,13 @@ impl MixerApp {
             tape_error: None,
             tape_info: None,
             tape_recent: Vec::new(),
+            player: None,
+            player_strip: MAX_STRIPS - 1,
+            player_attached: usize::MAX,
+            show_player: false,
+            player_cache: Vec::new(),
+            player_cache_rev: 0,
+            player_status: String::new(),
             tape_path_input: String::new(),
             status: audio_status,
             status_until: 12.0,
@@ -1915,6 +1936,29 @@ impl MixerApp {
         // VstPlugin and vst_state.bin) after a diagnostic plug-in load.
         if std::env::args().any(|a| a == "--vst-save-settings") {
             app.save_settings();
+        }
+        // Diagnostic: open the player window (and attach its strip) at startup,
+        // so the feature can be exercised without clicking the menu.
+        if std::env::args().any(|a| a == "--player") {
+            app.show_player = true;
+            app.ensure_player();
+        }
+        // Diagnostic: `--player-playlist <file>` loads a playlist at startup.
+        if let Some(pos) = std::env::args().position(|a| a == "--player-playlist") {
+            if let Some(path) = std::env::args().nth(pos + 1) {
+                app.show_player = true;
+                app.ensure_player();
+                match player::load_playlist(Path::new(&path)) {
+                    Ok(tracks) => {
+                        let count = tracks.len();
+                        if let Some(player) = app.player.as_ref() {
+                            player.set_tracks(tracks, 0);
+                        }
+                        app.player_status = format!("{count} tracks from {path}");
+                    }
+                    Err(err) => app.player_status = err,
+                }
+            }
         }
         app
     }
@@ -3818,6 +3862,43 @@ fn path_delay_ms(
                 xml_escape(&path.display().to_string())
             ));
         }
+        // Rebuild extension: the internal streaming player. A scene without it
+        // still loads; the element is simply absent.
+        {
+            let crossfade = self
+                .player
+                .as_ref()
+                .map(|p| p.crossfade_ms())
+                .unwrap_or(3000);
+            let repeat = self
+                .player
+                .as_ref()
+                .map(|p| p.repeat().to_u8())
+                .unwrap_or(0);
+            let shuffle = self.player.as_ref().map(|p| p.shuffle()).unwrap_or(false);
+            let tracks = self
+                .player
+                .as_ref()
+                .map(|p| p.tracks())
+                .unwrap_or_default();
+            text.push_str(&format!(
+                "<Player strip='{}' crossfade='{}' repeat='{}' shuffle='{}' open='{}'>\n",
+                self.player_strip,
+                crossfade,
+                repeat,
+                if shuffle { 1 } else { 0 },
+                if self.show_player { 1 } else { 0 }
+            ));
+            for track in &tracks {
+                text.push_str(&format!(
+                    "<PlayerTrack path=\"{}\" title=\"{}\" duration=\"{}\" />\n",
+                    xml_escape(&track.path.display().to_string()),
+                    xml_escape(&track.title),
+                    track.duration_ms.unwrap_or(0)
+                ));
+            }
+            text.push_str("</Player>\n");
+        }
         // Rebuild extension: one VST3 insert per input strip. Unknown elements
         // are ignored by the original's tag-driven reader.
         for (slot, vst) in self.vsts.iter().take(self.active_strips).enumerate() {
@@ -5043,6 +5124,52 @@ fn path_delay_ms(
                 recent.push((recent_order, PathBuf::from(path)));
                 recent_order += 1;
             }
+        }
+
+        // Rebuild extension: internal player (playlist, crossfade, strip).
+        if let Some((attrs, body)) = xml_elements(text, "Player").first() {
+            if let Some(v) = xml_attr(attrs, "strip").and_then(|v| v.parse::<usize>().ok()) {
+                self.player_strip = v.min(MAX_STRIPS - 1);
+            }
+            let crossfade = xml_attr(attrs, "crossfade")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(3000);
+            let repeat = player::Repeat::from_u8(
+                xml_attr(attrs, "repeat")
+                    .and_then(|v| v.parse::<u8>().ok())
+                    .unwrap_or(0),
+            );
+            let shuffle = xml_attr(attrs, "shuffle").map(|v| v == "1").unwrap_or(false);
+            let open = xml_attr(attrs, "open").map(|v| v == "1").unwrap_or(false);
+            let mut tracks = Vec::new();
+            for (track_attrs, _) in xml_elements(body, "PlayerTrack") {
+                let Some(path) = xml_attr(track_attrs, "path").map(|p| xml_unescape(&p)) else {
+                    continue;
+                };
+                if path.trim().is_empty() {
+                    continue;
+                }
+                let mut track = player::Track::new(PathBuf::from(path));
+                if let Some(title) = xml_attr(track_attrs, "title").map(|t| xml_unescape(&t)) {
+                    if !title.is_empty() {
+                        track.title = title;
+                    }
+                }
+                track.duration_ms = xml_attr(track_attrs, "duration")
+                    .and_then(|d| d.parse::<u64>().ok())
+                    .filter(|d| *d > 0);
+                tracks.push(track);
+            }
+            if !tracks.is_empty() {
+                self.ensure_player();
+                if let Some(player) = self.player.as_ref() {
+                    player.set_tracks(tracks, 0);
+                    player.set_crossfade_ms(crossfade);
+                    player.set_repeat(repeat);
+                    player.set_shuffle(shuffle);
+                }
+            }
+            self.show_player = open;
         }
 
         if tape_demo >= 0 {
@@ -7807,6 +7934,418 @@ Right click > Source to use the Windows capture stream instead."
         });
     }
 
+    // ------------------------------------------------------------------
+    // Internal streaming player
+    // ------------------------------------------------------------------
+
+    /// Create the player once and attach it to its strip.
+    fn ensure_player(&mut self) {
+        if self.player.is_none() {
+            let input = Arc::new(audio::InputShared::new());
+            self.player = Some(player::Player::new(input));
+        }
+        // Cheap when already attached: only the strip change does work.
+        self.sync_player_strip(false);
+    }
+
+    /// Point the player at `player_strip`. That strip stops being a capture and
+    /// its ring is fed by the decoder instead, so it keeps its whole channel
+    /// strip: fader, EQ, dynamics, VST slot, ASIO insert and bus sends.
+    fn sync_player_strip(&mut self, force: bool) {
+        let Some(input) = self.player.as_ref().map(|p| p.input()) else {
+            return;
+        };
+        let strip = self
+            .player_strip
+            .min(self.active_strips.saturating_sub(1))
+            .min(MAX_STRIPS - 1);
+        if !force && self.player_attached == strip {
+            return;
+        }
+        let previous = self.player_attached;
+        if previous < MAX_STRIPS && previous != strip {
+            self.audio.detach_input(previous);
+            self.captures[previous] = None;
+            if self.strips[previous].device == "PLAYER" {
+                self.strips[previous].device = "No input".to_string();
+            }
+        }
+        // The player owns this strip's ring; close any capture on it so two
+        // producers cannot both write.
+        self.captures[strip] = None;
+        self.strip_direct[strip] = false;
+        self.strips[strip].tape_feed = false;
+        self.strips[strip].device = "PLAYER".to_string();
+        // A strip with no bus lit would be silent even though the player runs.
+        if !self.strips[strip].route.iter().any(|r| *r) {
+            self.strips[strip].route[0] = true;
+        }
+        let any_solo = self
+            .strips
+            .iter()
+            .take(self.active_strips)
+            .any(|s| s.solo);
+        let s = &self.strips[strip];
+        self.audio.set_strip(
+            strip, s.gain_db, s.pan, s.comp, s.gate, s.mute, s.solo, s.mono, s.route, any_solo,
+        );
+        self.audio.attach_input(strip, input);
+        self.player_attached = strip;
+    }
+
+    fn player_import_playlist(&mut self) {
+        self.ensure_player();
+        #[cfg(windows)]
+        let chosen = audio::pick_file(
+            "Open Playlist",
+            "Playlists (xspf, m3u, m3u8, pls)\0*.xspf;*.m3u;*.m3u8;*.pls\0All files\0*.*\0\0",
+        );
+        #[cfg(not(windows))]
+        let chosen: Option<PathBuf> = None;
+        let Some(path) = chosen else { return };
+        match player::load_playlist(&path) {
+            Ok(tracks) => {
+                let count = tracks.len();
+                if let Some(player) = self.player.as_ref() {
+                    player.set_tracks(tracks, 0);
+                    player.jump_to(0);
+                }
+                self.player_cache_rev = 0;
+                self.player_status = format!("{count} tracks from {}", path.display());
+                self.toast(format!("Playlist loaded: {count} tracks"));
+            }
+            Err(err) => {
+                self.player_status = err.clone();
+                self.toast(format!("Playlist: {err}"));
+            }
+        }
+    }
+
+    fn player_add_file(&mut self) {
+        self.ensure_player();
+        #[cfg(windows)]
+        let chosen = audio::pick_file(
+            "Add Audio File",
+            "Audio (wav, mp3, m4a, aif, bwf, flac, ogg)\0*.wav;*.mp3;*.m4a;*.aif;*.bwf;*.flac;*.ogg\0All files\0*.*\0\0",
+        );
+        #[cfg(not(windows))]
+        let chosen: Option<PathBuf> = None;
+        let Some(path) = chosen else { return };
+        if let Some(player) = self.player.as_ref() {
+            player.add_tracks(vec![player::Track::new(path)]);
+        }
+        self.player_cache_rev = 0;
+    }
+
+    fn player_save_playlist(&mut self) {
+        self.ensure_player();
+        #[cfg(windows)]
+        let chosen = audio::pick_save_file(
+            "Save Playlist",
+            "XSPF playlist (*.xspf)\0*.xspf\0All files\0*.*\0\0",
+            "playlist.xspf",
+        );
+        #[cfg(not(windows))]
+        let chosen: Option<PathBuf> = None;
+        let Some(path) = chosen else { return };
+        let tracks = self
+            .player
+            .as_ref()
+            .map(|p| p.tracks())
+            .unwrap_or_default();
+        match player::save_playlist(&path, &tracks) {
+            Ok(()) => self.toast(format!("Playlist saved to {}", path.display())),
+            Err(err) => self.toast(format!("Playlist: {err}")),
+        }
+    }
+
+    fn player_action(&mut self, action: PlayerAction) {
+        // These need &mut self (they create/attach the player or open dialogs).
+        match action {
+            PlayerAction::Import => {
+                self.player_import_playlist();
+                return;
+            }
+            PlayerAction::AddFile => {
+                self.player_add_file();
+                return;
+            }
+            PlayerAction::SaveAs => {
+                self.player_save_playlist();
+                return;
+            }
+            _ => {}
+        }
+        let mut invalidate = false;
+        if let Some(player) = self.player.as_ref() {
+            match action {
+                PlayerAction::Play => {
+                    if player.index() < player.tracks().len() {
+                        player.play();
+                    }
+                }
+                PlayerAction::Pause => player.pause(),
+                PlayerAction::Stop => player.stop(),
+                PlayerAction::Next => player.next(),
+                PlayerAction::Previous => player.previous(),
+                PlayerAction::Jump(index) => player.jump_to(index),
+                PlayerAction::Remove(index) => {
+                    player.remove(index);
+                    invalidate = true;
+                }
+                PlayerAction::Clear => {
+                    player.clear();
+                    invalidate = true;
+                }
+                PlayerAction::Seek(ms) => player.seek_ms(ms),
+                PlayerAction::Import | PlayerAction::AddFile | PlayerAction::SaveAs => {}
+            }
+        }
+        if invalidate {
+            self.player_cache_rev = 0;
+        }
+    }
+
+    fn player_window(&mut self, ctx: &egui::Context) {
+        if !self.show_player {
+            return;
+        }
+        self.ensure_player();
+        let rev = self.player.as_ref().map(|p| p.revision()).unwrap_or(0);
+        if rev != self.player_cache_rev {
+            self.player_cache_rev = rev;
+            self.player_cache = self
+                .player
+                .as_ref()
+                .map(|p| p.tracks())
+                .unwrap_or_default();
+        }
+
+        let mut open = self.show_player;
+        let mut action: Option<PlayerAction> = None;
+        let mut crossfade;
+        let mut repeat;
+        let mut shuffle;
+        let mut strip_choice = self
+            .player_strip
+            .min(self.active_strips.saturating_sub(1));
+        let mut status = self.player_status.clone();
+
+        let Some(player) = self.player.take() else {
+            return;
+        };
+        let playing = player.is_playing();
+        let position = player.position_ms();
+        let duration = player.duration_ms();
+        let current = player.index();
+        let error = player.error();
+        crossfade = player.crossfade_ms();
+        repeat = player.repeat();
+        shuffle = player.shuffle();
+        let tracks = self.player_cache.clone();
+        let now_playing = tracks
+            .get(current)
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| "No track".to_string());
+
+        egui::Window::new("Player")
+            .open(&mut open)
+            .default_width(560.0)
+            .default_height(400.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("|<").on_hover_text("Previous").clicked() {
+                        action = Some(PlayerAction::Previous);
+                    }
+                    let play_label = if playing { "Pause" } else { "Play" };
+                    if ui.button(play_label).clicked() {
+                        action = Some(if playing {
+                            PlayerAction::Pause
+                        } else {
+                            PlayerAction::Play
+                        });
+                    }
+                    if ui.button("Stop").clicked() {
+                        action = Some(PlayerAction::Stop);
+                    }
+                    if ui.button(">|").on_hover_text("Next").clicked() {
+                        action = Some(PlayerAction::Next);
+                    }
+                    ui.separator();
+                    ui.label(player_clock(position));
+                    ui.label("/");
+                    ui.label(player_clock(duration));
+                });
+
+                ui.label(
+                    egui::RichText::new(&now_playing)
+                        .size(11.0)
+                        .color(if playing { GREEN } else { TEXT }),
+                );
+                if let Some(err) = &error {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(err).size(9.0).color(RED)).wrap(),
+                    );
+                } else if !status.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(status.as_str()).size(9.0).color(DIM),
+                        )
+                        .wrap(),
+                    );
+                }
+
+                let mut seek = position.min(duration.max(1));
+                let scrub = ui.add(
+                    egui::Slider::new(&mut seek, 0..=duration.max(1))
+                        .show_value(false)
+                        .step_by(1000.0),
+                );
+                if scrub.drag_stopped() {
+                    action = Some(PlayerAction::Seek(seek));
+                }
+
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(230.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if tracks.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Load an XSPF / M3U / PLS playlist, or add files one at a time.",
+                                )
+                                .size(10.0)
+                                .color(DIM),
+                            );
+                        }
+                        for (i, track) in tracks.iter().enumerate() {
+                            let missing = !track.exists();
+                            let length = track
+                                .duration_ms
+                                .map(player_clock)
+                                .unwrap_or_else(|| "--:--".to_string());
+                            let label = format!("{:>3}.  {}   {length}", i + 1, track.title);
+                            let colour = if missing {
+                                RED
+                            } else if i == current {
+                                GREEN
+                            } else {
+                                TEXT
+                            };
+                            let response = ui.selectable_label(
+                                i == current,
+                                egui::RichText::new(label).size(10.0).color(colour),
+                            );
+                            if response.double_clicked() {
+                                action = Some(PlayerAction::Jump(i));
+                            }
+                            response.context_menu(|ui| {
+                                if ui.button("Play").clicked() {
+                                    action = Some(PlayerAction::Jump(i));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Remove").clicked() {
+                                    action = Some(PlayerAction::Remove(i));
+                                    ui.close_menu();
+                                }
+                            });
+                            if missing {
+                                ui.label(
+                                    egui::RichText::new("     file not found")
+                                        .size(8.0)
+                                        .color(RED),
+                                );
+                            }
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Load Playlist...").clicked() {
+                        action = Some(PlayerAction::Import);
+                    }
+                    if ui.button("Add File...").clicked() {
+                        action = Some(PlayerAction::AddFile);
+                    }
+                    if ui.button("Save Playlist...").clicked() {
+                        action = Some(PlayerAction::SaveAs);
+                    }
+                    if ui.button("Clear").clicked() {
+                        action = Some(PlayerAction::Clear);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Crossfade");
+                    let mut seconds = crossfade as f32 / 1000.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut seconds, 0.0..=10.0)
+                                .suffix(" s")
+                                .fixed_decimals(1),
+                        )
+                        .changed()
+                    {
+                        crossfade = (seconds * 1000.0) as u32;
+                    }
+                    if ui
+                        .button(format!("Repeat: {}", repeat.label()))
+                        .clicked()
+                    {
+                        repeat = match repeat {
+                            player::Repeat::Off => player::Repeat::One,
+                            player::Repeat::One => player::Repeat::All,
+                            player::Repeat::All => player::Repeat::Off,
+                        };
+                    }
+                    if ui.checkbox(&mut shuffle, "Shuffle").changed() {}
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Strip");
+                    let selected = strip_choice.min(self.active_strips.saturating_sub(1));
+                    egui::ComboBox::from_id_source("player_strip")
+                        .selected_text(format!(
+                            "{} {}",
+                            selected + 1,
+                            self.strips
+                                .get(selected)
+                                .map(|s| s.name.clone())
+                                .unwrap_or_default()
+                        ))
+                        .show_ui(ui, |ui| {
+                            for i in 0..self.active_strips {
+                                let name = format!("{} {}", i + 1, self.strips[i].name);
+                                if ui.selectable_label(i == selected, name).clicked() {
+                                    strip_choice = i;
+                                }
+                            }
+                        });
+                    ui.label(
+                        egui::RichText::new("(the player replaces this strip's input)")
+                            .size(9.0)
+                            .color(DIM),
+                    );
+                });
+            });
+
+        self.player = Some(player);
+        self.show_player = open;
+        self.player_status = status;
+        if let Some(player) = self.player.as_ref() {
+            player.set_crossfade_ms(crossfade);
+            player.set_repeat(repeat);
+            player.set_shuffle(shuffle);
+        }
+        if strip_choice != self.player_strip {
+            self.player_strip = strip_choice;
+            self.sync_player_strip(true);
+        }
+        if let Some(action) = action {
+            self.player_action(action);
+        }
+    }
+
     fn on_transport(&mut self, t: Transport) {
         if self.lock_gui {
             self.toast("Interface is locked - unlock it in the menu");
@@ -7973,6 +8512,11 @@ Right click > Source to use the Windows capture stream instead."
                         }
                         if menu_item(left, "Audio Stats...", "", true) {
                             self.show_audio_stats = true;
+                            close = true;
+                        }
+                        if menu_item(left, "Player...", "", true) {
+                            self.show_player = true;
+                            self.ensure_player();
                             close = true;
                         }
                         if menu_item(left, "Ducking...", "", true) {
@@ -8741,6 +9285,8 @@ Right click > Source to use the Windows capture stream instead."
                 });
             self.show_audio_stats = open;
         }
+
+        self.player_window(ctx);
 
         if self.show_about {
             let mut open = self.show_about;
@@ -11295,6 +11841,23 @@ enum Transport {
     Rec,
 }
 
+/// One action requested from the player window. Collected inside the window
+/// closure and applied afterwards, so the player borrow is released first.
+enum PlayerAction {
+    Play,
+    Pause,
+    Stop,
+    Next,
+    Previous,
+    Jump(usize),
+    Remove(usize),
+    Clear,
+    Import,
+    AddFile,
+    SaveAs,
+    Seek(u64),
+}
+
 fn transport_button(
     ui: &egui::Ui,
     rect: Rect,
@@ -11489,6 +12052,19 @@ fn feedback_loops_from(
 fn clock(secs: f32) -> String {
     let s = secs.max(0.0) as u32;
     format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// `mm:ss` or `h:mm:ss` for the player's millisecond transport.
+fn player_clock(ms: u64) -> String {
+    let total = ms / 1000;
+    let seconds = total % 60;
+    let minutes = (total / 60) % 60;
+    let hours = total / 3600;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
 }
 
 fn fit_text(painter: &egui::Painter, text: &str, size: f32, max_w: f32) -> String {
