@@ -4735,18 +4735,26 @@ pub fn pick_files(title: &str, filter: &str) -> Vec<PathBuf> {
     ofn.lpstrFile = file_buf.as_mut_ptr();
     ofn.nMaxFile = file_buf.len() as u32;
     ofn.lpstrTitle = title.as_ptr();
-    ofn.Flags = 0x0002_0000   // OFN_ALLOWMULTISELECT
+    ofn.Flags = 0x0000_0200   // OFN_ALLOWMULTISELECT
         | 0x0008_0000         // OFN_EXPLORER
         | 0x0000_1000         // OFN_FILEMUSTEXIST
         | 0x0000_0800         // OFN_PATHMUSTEXIST
         | 0x0080_0000         // OFN_ENABLESIZING
-        | 0x0020_0000; // OFN_NONETWORKBUTTON
+        | 0x0002_0000; // OFN_NONETWORKBUTTON
 
     let ok = unsafe { GetOpenFileNameW(&mut ofn) };
     if ok == 0 {
         return Vec::new();
     }
+    parse_open_file_buffer(&file_buf)
+}
 
+/// Decode the OPENFILENAME result buffer. One selected file arrives as a single
+/// full path; several arrive as the folder followed by each name, NUL separated
+/// and terminated by a double NUL.
+#[cfg(windows)]
+fn parse_open_file_buffer(file_buf: &[u16]) -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
     let mut parts: Vec<std::ffi::OsString> = Vec::new();
     let mut start = 0usize;
     for i in 0..file_buf.len() {
@@ -4959,6 +4967,36 @@ pub fn wav_selftest() {
 #[cfg(test)]
 mod latency_tests {
     use super::*;
+
+    /// Regression: the multi-select flag was once set to OFN_NONETWORKBUTTON's
+    /// value, so the dialog stayed single-select. The buffer layout is decoded
+    /// here without opening a dialog.
+    #[cfg(windows)]
+    #[test]
+    fn multi_select_buffer_decodes_to_every_file() {
+        let mut buf: Vec<u16> = Vec::new();
+        for part in ["C:\\Music\\List", "one.mp3", "two.mp3"] {
+            buf.extend(part.encode_utf16());
+            buf.push(0);
+        }
+        buf.push(0);
+        buf.extend(std::iter::repeat(0).take(8));
+        let files = parse_open_file_buffer(&buf);
+        assert_eq!(files.len(), 2);
+        assert!(files[0].ends_with("one.mp3"));
+        assert!(files[1].ends_with("two.mp3"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn single_selection_buffer_is_one_full_path() {
+        let mut buf: Vec<u16> = "C:\\Music\\one.mp3".encode_utf16().collect();
+        buf.push(0);
+        buf.push(0);
+        let files = parse_open_file_buffer(&buf);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("one.mp3"));
+    }
 
     #[test]
     fn servo_refills_a_low_ring_and_brakes_a_full_one() {
