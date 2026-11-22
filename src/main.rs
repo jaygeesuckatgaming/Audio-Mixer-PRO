@@ -972,6 +972,8 @@ struct MixerApp {
     /// `<OutputDev pOut1..pOut8>` for an unassigned output (name "-").
     output_patch: [[i32; 8]; audio::MAX_BUSES],
     engine_mode: usize,
+    /// A1 is the console clock reference (A1 output device's clock).
+    a1_master: bool,
     limit_remote: bool,
     monitor_on_sel: bool,
     lock_gui: bool,
@@ -1576,6 +1578,7 @@ impl MixerApp {
             output_types: [DEVICE_TYPE_WDM; audio::MAX_BUSES],
             output_patch: [[0; 8]; audio::MAX_BUSES],
             engine_mode: 0,
+            a1_master: false,
             limit_remote: false,
             monitor_on_sel: false,
             lock_gui: false,
@@ -2652,6 +2655,7 @@ fn path_delay_ms(
         let result = self
             .audio
             .apply_format(self.sample_rate, self.main_buffer, None);
+        self.audio.set_a1_master(self.a1_master);
         self.sample_rate = self.audio.sample_rate.max(8_000);
         if result.is_ok() {
             self.reload_tape_audio();
@@ -3017,13 +3021,25 @@ fn path_delay_ms(
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
+            let clock = if self.a1_master {
+                if self.audio.bus_state(0) == audio::BusState::Running {
+                    format!(
+                        "  [A1 master trim {:+.0} ppm]",
+                        self.audio.master_trim() * 1_000_000.0
+                    )
+                } else {
+                    "  [A1 master waiting for A1]".to_string()
+                }
+            } else {
+                String::new()
+            };
             if detail.is_empty() {
                 diag_log(format!(
-                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s) in the last second"
+                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s) in the last second{clock}"
                 ));
             } else {
                 diag_log(format!(
-                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s) in the last second: {detail}"
+                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s) in the last second{clock}: {detail}"
                 ));
             }
         }
@@ -3234,6 +3250,7 @@ fn path_delay_ms(
         // StartAudioStream with the current settings.
         let wanted_rate = self.sample_rate;
         self.audio = AudioEngine::new();
+        self.audio.set_a1_master(self.a1_master);
         // The new engine owns five fresh VST slots, so put the saved plug-ins
         // back once the new output stream (and its sample rate) exists. Every
         // plug-in's own window must close before its chain goes away.
@@ -3709,12 +3726,13 @@ fn path_delay_ms(
             _ => "custom",
         };
         text.push_str(&format!(
-            "<AppOptions sampleRate='{}' buffer='{}' mainBuffer='{}' latencyProfile='{}' engine='{}' limitRemote='{}' lock='{}' autoRestart='{}' autoRestartAll='{}' helpCaption='{}' loadOnStartup='{}' saveOnExit='{}' presetOnStartup='{}' />\n",
+            "<AppOptions sampleRate='{}' buffer='{}' mainBuffer='{}' latencyProfile='{}' engine='{}' a1master='{}' limitRemote='{}' lock='{}' autoRestart='{}' autoRestartAll='{}' helpCaption='{}' loadOnStartup='{}' saveOnExit='{}' presetOnStartup='{}' />\n",
             self.sample_rate,
             self.buffer,
             self.main_buffer,
             latency_profile,
             self.engine_mode,
+            self.a1_master as u8,
             self.limit_remote as u8,
             self.lock_gui as u8,
             self.auto_restart_a1 as u8,
@@ -4827,6 +4845,10 @@ fn path_delay_ms(
             }
             self.tape.arm = arm;
         }
+        // A1 master is part of the scene; a file that does not say so starts
+        // with the switch off instead of inheriting the previous scene.
+        self.a1_master = false;
+        self.audio.set_a1_master(false);
         if let Some((attrs, _)) = xml_elements(text, "AppOptions").first() {
             let has_latency_profile = xml_attr(attrs, "latencyProfile").is_some();
             if let Some(v) = xml_attr(attrs, "sampleRate").and_then(|v| v.parse::<u32>().ok()) {
@@ -4848,6 +4870,10 @@ fn path_delay_ms(
             }
             if let Some(v) = xml_attr(attrs, "engine").and_then(|v| v.parse::<usize>().ok()) {
                 self.engine_mode = v.min(1);
+            }
+            if let Some(v) = bool_attr(attrs, "a1master") {
+                self.a1_master = v;
+                self.audio.set_a1_master(v);
             }
             if let Some(v) = bool_attr(attrs, "limitRemote") {
                 self.limit_remote = v;
@@ -5560,6 +5586,8 @@ fn path_delay_ms(
             self.audio.detach_input(i);
         }
         self.audio.set_strip_count(BASE_STRIPS);
+        self.a1_master = false;
+        self.audio.set_a1_master(false);
         for strip in 0..MAX_STRIPS {
             self.audio.set_strip_insert(strip, None, false);
         }
@@ -7046,14 +7074,71 @@ Right click > Source to use the Windows capture stream instead."
             ));
         }
 
+        // A1 clock switch only on the A1 card. In master mode the A1 output
+        // callback steers the internal mixer timer, so every strip's resampler
+        // follows A1's device clock; if A1 is not running the timer stays on
+        // its nominal rate.
+        let mut over_master = false;
+        if idx == 0 {
+            let master_rect = Rect::from_min_size(
+                Pos2::new(header.left() + 50.0, header.top() + 1.0),
+                Vec2::new(42.0, 12.0),
+            );
+            let mresp = ui.interact(master_rect, Id::new("bus_a1_master"), Sense::click());
+            over_master = mresp.hovered();
+            let active = self.a1_master;
+            let waiting = active && self.audio.bus_state(0) != audio::BusState::Running;
+            let color = if waiting {
+                AMBER
+            } else if active {
+                GREEN
+            } else {
+                FAINT
+            };
+            ui.painter().rect_filled(
+                master_rect,
+                3.0,
+                if mresp.hovered() { PANEL_HI } else { TRACK },
+            );
+            ui.painter().rect_stroke(
+                master_rect,
+                3.0,
+                Stroke::new(1.0, if active { color } else { LINE }),
+            );
+            ui.painter().text(
+                master_rect.center(),
+                Align2::CENTER_CENTER,
+                "MASTER",
+                FontId::proportional(6.4),
+                color,
+            );
+            let mresp = mresp.on_hover_text(
+                "Use the A1 output device as the master clock for the whole console. \
+                 All strips follow it while A1 is running.",
+            );
+            if mresp.clicked() && enabled {
+                self.a1_master = !self.a1_master;
+                self.audio.set_a1_master(self.a1_master);
+                if self.a1_master {
+                    if self.audio.bus_state(0) == audio::BusState::Running {
+                        self.toast("A1 master clock on");
+                    } else {
+                        self.toast("A1 master clock armed; it takes over when A1 is running");
+                    }
+                } else {
+                    self.toast("A1 master clock off");
+                }
+            }
+        }
+
         let over_refresh = ui
             .input(|i| i.pointer.interact_pos())
             .map(|pos| refresh_rect.contains(pos))
             .unwrap_or(false);
-        if hresp.clicked() && enabled && !over_refresh {
+        if hresp.clicked() && enabled && !over_refresh && !over_master {
             self.picker = Some(Picker::Bus(idx));
         }
-        if hresp.double_clicked() && enabled {
+        if hresp.double_clicked() && enabled && !over_master {
             self.bus_rename = Some(idx);
             self.bus_rename_text = self.buses[idx].name.clone();
             self.bus_rename_focus = true;

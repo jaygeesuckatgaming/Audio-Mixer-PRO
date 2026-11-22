@@ -77,6 +77,13 @@ fn bus_cushion_frames(device: &str) -> usize {
 fn servo_step(base_step: f32, trim: f32) -> f32 {
     base_step * (1.0 - trim.clamp(-SERVO_TRIM, SERVO_TRIM))
 }
+
+/// Mixer timer period when A1 is the clock reference. A positive trim (A1 ring
+/// below target) shortens the period so the console produces faster; a full
+/// ring lengthens it. Same sign as `servo_step`, applied to the producer.
+fn master_period_nanos(nominal_nanos: f64, trim: f32) -> f64 {
+    (nominal_nanos * (1.0 - trim.clamp(-SERVO_TRIM, SERVO_TRIM)) as f64).max(1.0)
+}
 /// Longest track this build will hold in memory. The original streams from
 /// disk; this rebuild decodes to RAM, so it stops at 30 minutes with a clear
 /// message instead of failing silently.
@@ -688,6 +695,12 @@ struct Shared {
     /// the per-bus output streams replay it on their own devices.
     bus_out_rings: [Mutex<VecDeque<(f32, f32)>>; MAX_BUSES],
     bus_out_active: [AtomicBool; MAX_BUSES],
+    /// A1 is the clock reference. Its output callback publishes `master_trim`
+    /// and bumps `master_seen`; the mixer timer follows that trim while A1 is
+    /// alive, so every strip's resampler follows A1's device clock.
+    a1_master: AtomicBool,
+    master_trim: AtomicU32,
+    master_seen: AtomicU64,
     /// Frames rendered per mixer callback.
     mixer_block: AtomicU32,
     /// Outgoing VBAN streams: (bus index, sender ring).
@@ -796,6 +809,9 @@ impl Shared {
                 Mutex::new(VecDeque::with_capacity(BUS_RING_FRAMES))
             }),
             bus_out_active: std::array::from_fn(|_| AtomicBool::new(false)),
+            a1_master: AtomicBool::new(false),
+            master_trim: f32_atomic(0.0),
+            master_seen: AtomicU64::new(0),
             mixer_block: AtomicU32::new(512),
             vban_tx: Mutex::new(Vec::new()),
             inputs: Mutex::new(std::array::from_fn(|_| None)),
@@ -2659,6 +2675,26 @@ impl AudioEngine {
             .map(String::as_str)
     }
 
+    /// Use the A1 output device as the console's clock reference. The A1
+    /// callback then publishes the rate trim the mixer timer follows; turning
+    /// it off returns the timer to its nominal rate immediately.
+    pub fn set_a1_master(&self, on: bool) {
+        self.shared.a1_master.store(on, Ordering::Relaxed);
+        self.shared
+            .master_trim
+            .store(0.0f32.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn a1_master(&self) -> bool {
+        self.shared.a1_master.load(Ordering::Relaxed)
+    }
+
+    /// Current clock trim published by the A1 callback, in fractions of the
+    /// nominal rate (e.g. 0.0002 = +200 ppm). Zero when A1 is not the master.
+    pub fn master_trim(&self) -> f32 {
+        f32::from_bits(self.shared.master_trim.load(Ordering::Relaxed))
+    }
+
     /// Human-readable bus name: A1..A3 are the console's main buses, B1/B2
     /// are the virtual cable buses.
     fn bus_label(bus: usize) -> String {
@@ -3847,8 +3883,8 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
     let mut buffer = vec![0.0f32; block.max(1) * 2];
     // Large enough for a whole tap drain at 32-bit stereo (16 KB = 2048 frames).
     let mut tap_buf = vec![0u8; 16_384];
-    let period =
-        std::time::Duration::from_nanos(((block.max(1) as f64 / rate.max(1) as f64) * 1e9) as u64);
+    let nominal_nanos =
+        ((block.max(1) as f64 / rate.max(1) as f64) * 1e9).max(1.0);
 
     #[cfg(windows)]
     unsafe {
@@ -3860,6 +3896,8 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
     #[cfg(windows)]
     let timer = MixerTimer::new();
 
+    let mut last_master_seen = 0u64;
+    let mut last_master_at = std::time::Instant::now();
     let mut next = std::time::Instant::now();
     loop {
         let now = std::time::Instant::now();
@@ -3879,6 +3917,28 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
         // Taps first: the strip's reader must see this block's audio already.
         pump_taps(&shared, &mut tap_buf);
         dsp.render(&mut buffer, 2, &shared);
+        // A1 master: follow the rate trim published by the A1 output callback.
+        // It bumps `master_seen` on every callback; if that stops (A1 closed,
+        // unplugged or failed to open), fall back to the nominal timer after
+        // 100 ms instead of holding the console at a stale rate.
+        let master = shared.a1_master.load(Ordering::Relaxed);
+        let seen = shared.master_seen.load(Ordering::Acquire);
+        if master && seen != last_master_seen {
+            last_master_seen = seen;
+            last_master_at = std::time::Instant::now();
+        }
+        let trim = if master
+            && last_master_at.elapsed() < std::time::Duration::from_millis(100)
+        {
+            f32::from_bits(shared.master_trim.load(Ordering::Relaxed))
+                .clamp(-SERVO_TRIM, SERVO_TRIM)
+        } else {
+            0.0
+        };
+        // A low A1 ring publishes a positive trim: shorten the mixer period so
+        // it produces faster. A full ring lengthens it. Same sign as
+        // `servo_step`, applied to the producer instead of the consumer.
+        let period = std::time::Duration::from_nanos(master_period_nanos(nominal_nanos, trim) as u64);
         next += period;
         let now = std::time::Instant::now();
         if next < now {
@@ -4023,7 +4083,17 @@ where
                 let error = ((target - fill as f32) / target).clamp(-1.0, 1.0);
                 servo_trim = (servo_trim + error * SERVO_KI).clamp(-SERVO_TRIM, SERVO_TRIM);
                 let trim = (servo_trim + error * SERVO_KP).clamp(-SERVO_TRIM, SERVO_TRIM);
-                let step = servo_step(base_step, trim);
+                let master_group = buses.contains(&0) && shared.a1_master.load(Ordering::Relaxed);
+                let step = if master_group {
+                    // A1 is the clock reference: publish the correction for the
+                    // mixer timer and consume at the device's own rate. Every
+                    // other group keeps its local servo.
+                    shared.master_trim.store(trim.to_bits(), Ordering::Relaxed);
+                    shared.master_seen.fetch_add(1, Ordering::Release);
+                    base_step
+                } else {
+                    servo_step(base_step, trim)
+                };
                 let mut accumulator = 0.0f32;
                 let mut starved = false;
                 let total = data.len() / channels.max(1);
@@ -4729,6 +4799,22 @@ mod latency_tests {
         }
         // A rate mismatch between mixer and device keeps its base ratio.
         assert!((servo_step(0.5, 0.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a1_master_trim_steers_the_mixer_period() {
+        let nominal = 10_666_666.0;
+        // Positive trim means the A1 ring is short: produce faster, i.e. a
+        // shorter mixer period. Negative means slow down. Same sign as the
+        // consumer servo, applied to the producer.
+        assert!(master_period_nanos(nominal, 0.001) < nominal);
+        assert!(master_period_nanos(nominal, -0.001) > nominal);
+        assert!((master_period_nanos(nominal, 0.0) - nominal).abs() < 0.5);
+        // The correction is clamped to the same +/-SERVO_TRIM as the servo.
+        let fastest = master_period_nanos(nominal, 10.0);
+        let slowest = master_period_nanos(nominal, -10.0);
+        assert!((slowest - nominal * (1.0 + SERVO_TRIM as f64)).abs() < 1.0);
+        assert!((fastest - nominal * (1.0 - SERVO_TRIM as f64)).abs() < 1.0);
     }
 
     #[test]
