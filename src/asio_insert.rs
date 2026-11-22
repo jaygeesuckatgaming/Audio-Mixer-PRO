@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-use asio_insert::section::{Shared, BLOCK_FRAMES, PAIRS};
+use asio_insert::section::{Shared, BLOCKS, BLOCK_FRAMES, PAIRS};
 
 use crate::audio::MAX_STRIPS;
 
@@ -90,10 +90,17 @@ impl Inserts {
             shared.set_rate(rate);
             shared
         });
+        // The ring's sequence numbers live in the section, not in this struct:
+        // the driver may have been running (and returning blocks) before this
+        // instance existed. Start from the next block this instance will send;
+        // returns from an earlier mixer run are not our audio, and the driver
+        // may not be running at all.
+        let seq = shared.as_ref().map(|shared| shared.seq_in()).unwrap_or(0);
+        let next_return = seq.saturating_add(1);
         Self {
             shared,
-            seq: 0,
-            next_return: [0; PAIRS],
+            seq,
+            next_return: [next_return; PAIRS],
             returns: std::array::from_fn(|_| vec![0.0; BLOCK_FRAMES * 2]),
             ready: [false; PAIRS],
             misses: 0,
@@ -126,8 +133,16 @@ impl Inserts {
             let Some(shared) = &self.shared else {
                 continue;
             };
-            if shared.seq_out() >= self.next_return[pair] {
-                let source = shared.output_block(pair, self.next_return[pair]);
+            let seq_out = shared.seq_out();
+            let next = self.next_return[pair];
+            // The driver keeps BLOCKS returned blocks. If it got further ahead
+            // than that while this thread was stalled, the block we still owed
+            // has been overwritten (and the next driver callback would overwrite
+            // the one after it). Take the newest block instead of reading a slot
+            // that is being written.
+            if seq_out >= next.saturating_add((BLOCKS - 1) as u64) {
+                self.misses += seq_out.saturating_sub(next);
+                let source = shared.output_block(pair, seq_out);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         source,
@@ -135,9 +150,21 @@ impl Inserts {
                         BLOCK_FRAMES * 2,
                     );
                 }
-                self.next_return[pair] += 1;
+                self.next_return[pair] = seq_out.saturating_add(1);
                 self.ready[pair] = true;
-            } else {
+            } else if seq_out >= next {
+                let source = shared.output_block(pair, next);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source,
+                        self.returns[pair].as_mut_ptr(),
+                        BLOCK_FRAMES * 2,
+                    );
+                }
+                self.next_return[pair] = next + 1;
+                self.ready[pair] = true;
+            } else if self.seq > 0 {
+                // The mixer has published, but this block has not come back yet.
                 self.misses += 1;
             }
         }
@@ -173,7 +200,10 @@ impl Inserts {
             return;
         }
         let frames = frames.min(BLOCK_FRAMES);
-        let target = shared.input_block(pair, self.seq + 1);
+        // The true next block number lives in the section. Using a local counter
+        // here would write the wrong slot after a restart while the driver kept
+        // running.
+        let target = shared.input_block(pair, shared.seq_in() + 1);
         for frame in 0..frames {
             unsafe {
                 *target.add(frame * 2) = left[frame];
@@ -196,7 +226,7 @@ impl Inserts {
         if pair >= PAIRS {
             return;
         }
-        let target = shared.input_block(pair, self.seq + 1);
+        let target = shared.input_block(pair, shared.seq_in() + 1);
         unsafe {
             std::ptr::write_bytes(target, 0u8, BLOCK_FRAMES * 2);
         }
@@ -207,7 +237,7 @@ impl Inserts {
         let Some(shared) = &self.shared else {
             return;
         };
-        self.seq += 1;
+        self.seq = shared.seq_in() + 1;
         self.blocks += 1;
         shared.publish_block();
     }

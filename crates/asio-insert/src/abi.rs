@@ -19,6 +19,8 @@ pub const ASE_OK: ASIOError = 0;
 pub const ASE_SUCCESS: ASIOError = 0x3f48_47a0;
 pub const ASE_NotPresent: ASIOError = -1000;
 pub const ASE_HWMalfunction: ASIOError = -999;
+pub const ASE_InvalidParameter: ASIOError = -998;
+pub const ASE_InvalidMode: ASIOError = -997;
 
 pub const ASIO_TRUE: ASIOBool = 1;
 pub const ASIO_FALSE: ASIOBool = 0;
@@ -94,6 +96,8 @@ pub struct ASIOTimeCode {
     pub speed: f64,
     pub time_code_samples: ASIOSamples,
     pub flags: u32,
+    /// `char future[64]` in ASIO SDK 2.3, which is the header JUCE and every
+    /// Windows host are built against.
     pub future: [i8; 64],
 }
 
@@ -105,7 +109,9 @@ pub struct ASIOTimeInfo {
     pub sample_position: ASIOSamples,
     pub sample_rate: ASIOSampleRate,
     pub flags: u32,
-    pub reserved: [i8; 64],
+    /// `char reserved[12]` in ASIO SDK 2.3 (this used to be 64 bytes here,
+    /// which moved `timeCode` and made every host read the wrong offset).
+    pub reserved: [i8; 12],
 }
 
 #[repr(C)]
@@ -115,6 +121,30 @@ pub struct ASIOTime {
     pub time_info: ASIOTimeInfo,
     pub time_code: ASIOTimeCode,
 }
+
+// The host reads these structures at the offsets the SDK's 2.3 header defines;
+// a size change here silently shifts `timeCode` for every callback.
+const _: () = assert!(std::mem::size_of::<ASIOTimeInfo>() == 48);
+const _: () = assert!(std::mem::size_of::<ASIOTimeCode>() == 88);
+const _: () = assert!(std::mem::size_of::<ASIOTime>() == 152);
+
+/// `ASIOChannelInfo.channelType` values (LSB-first sample formats).
+pub const ASIOST_FLOAT32_LSB: i32 = 19;
+
+/// What the host calls `getChannelInfo` with: the channel and direction on
+/// entry, the description on exit. `long`s, so 52 bytes on Windows.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ASIOChannelInfo {
+    pub channel: i32,
+    pub is_input: ASIOBool,
+    pub is_active: ASIOBool,
+    pub channel_group: i32,
+    pub channel_type: i32,
+    pub name: [u8; 32],
+}
+
+const _: () = assert!(std::mem::size_of::<ASIOChannelInfo>() == 52);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -181,7 +211,11 @@ pub struct IASIOVtbl {
     pub set_clock_source: unsafe extern "system" fn(*mut c_void, i32) -> ASIOError,
     pub get_sample_position:
         unsafe extern "system" fn(*mut c_void, *mut ASIOSamples, *mut ASIOTimeStamp) -> ASIOError,
-    pub get_block_size: unsafe extern "system" fn(*mut c_void, *mut i32) -> ASIOError,
+    /// Slot 15 in the IASIO vtable. This is `getChannelInfo`, not a
+    /// `getBlockSize` - there is no such driver method; the host's
+    /// `ASIOGetBlockSize` helper is built on `getBufferSize`.
+    pub get_channel_info:
+        unsafe extern "system" fn(*mut c_void, *mut ASIOChannelInfo) -> ASIOError,
     pub create_buffers: unsafe extern "system" fn(
         *mut c_void,
         *mut ASIOBufferInfo,

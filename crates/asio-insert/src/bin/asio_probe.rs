@@ -24,9 +24,13 @@ type DllGetClassObjectFn =
 const CHANNELS: usize = PAIRS * 2;
 
 /// Addresses of the planar channel buffers the driver fills and the host
-/// writes, published to the callback (which runs on the driver's thread).
-static IN_ADDR: [AtomicUsize; CHANNELS] = [const { AtomicUsize::new(0) }; CHANNELS];
-static OUT_ADDR: [AtomicUsize; CHANNELS] = [const { AtomicUsize::new(0) }; CHANNELS];
+/// writes, published to the callback (which runs on the driver's thread). ASIO
+/// gives two buffers per channel for double buffering, and `bufferSwitch` tells
+/// the host which one this callback belongs to.
+static IN_ADDR: [[AtomicUsize; CHANNELS]; 2] =
+    [const { [const { AtomicUsize::new(0) }; CHANNELS] }; 2];
+static OUT_ADDR: [[AtomicUsize; CHANNELS]; 2] =
+    [const { [const { AtomicUsize::new(0) }; CHANNELS] }; 2];
 
 /// The host side: a DAW would process the input and write the output. Here the
 /// output is a straight copy, so the round trip must be sample-identical.
@@ -39,17 +43,18 @@ static ASIO: AtomicUsize = AtomicUsize::new(0);
 static ASYNC: AtomicBool = AtomicBool::new(false);
 static ADDITIVE: AtomicBool = AtomicBool::new(false);
 
-unsafe extern "system" fn buffer_switch(_index: i32, _direct: ASIOBool) {
+unsafe extern "system" fn buffer_switch(index: i32, _direct: ASIOBool) {
+    let slot = index.clamp(0, 1) as usize;
     if ASYNC.load(Ordering::Relaxed) {
         // JUCE-style: the graph finishes after the callback returns.
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             std::thread::sleep(Duration::from_micros(
                 std::env::var("AMI_PROBE_DELAY_US")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(300),
             ));
-            write_outputs();
+            write_outputs(slot);
             let asio = ASIO.load(Ordering::Relaxed) as *mut c_void;
             if !asio.is_null() {
                 let vtbl = unsafe { *(asio as *const *const IASIOVtbl) };
@@ -58,15 +63,15 @@ unsafe extern "system" fn buffer_switch(_index: i32, _direct: ASIOBool) {
         });
         return;
     }
-    write_outputs();
+    write_outputs(slot);
 }
 
-/// Copy (or add) the planar inputs into the planar outputs.
-fn write_outputs() {
+/// Copy (or add) the planar inputs into the planar outputs for one buffer slot.
+fn write_outputs(slot: usize) {
     let additive = ADDITIVE.load(Ordering::Relaxed);
     for channel in 0..CHANNELS {
-        let source = IN_ADDR[channel].load(Ordering::Relaxed) as *const f32;
-        let target = OUT_ADDR[channel].load(Ordering::Relaxed) as *mut f32;
+        let source = IN_ADDR[slot][channel].load(Ordering::Relaxed) as *const f32;
+        let target = OUT_ADDR[slot][channel].load(Ordering::Relaxed) as *mut f32;
         if source.is_null() || target.is_null() {
             continue;
         }
@@ -101,7 +106,7 @@ fn main() {
         Ordering::Relaxed,
     );
     // ---- the mixer side -------------------------------------------------
-    let mut shared = Shared::open_or_create(48_000).expect("could not open the insert section");
+    let shared = Shared::open_or_create(48_000).expect("could not open the insert section");
     println!(
         "section : {} Hz, {} frames, {} stereo pairs ({} channels)",
         shared.rate(),
@@ -187,19 +192,71 @@ fn main() {
     );
     println!("latency : {latency_in} in / {latency_out} out frames");
 
-    // ---- buffers and callbacks ------------------------------------------
-    let mut input_buffers: [Vec<f32>; CHANNELS] = std::array::from_fn(|_| vec![0.0; BLOCK_FRAMES]);
-    let mut output_buffers: [Vec<f32>; CHANNELS] = std::array::from_fn(|_| vec![0.0; BLOCK_FRAMES]);
+    // A host asks what each channel carries before opening it. JUCE uses the
+    // type to convert buffers, so a wrong/absent answer makes it read 16-bit
+    // data as floats - the bug that used to make Waveform produce garbled audio.
     for channel in 0..CHANNELS {
-        IN_ADDR[channel].store(
-            input_buffers[channel].as_mut_ptr() as usize,
-            Ordering::Relaxed,
-        );
-        OUT_ADDR[channel].store(
-            output_buffers[channel].as_mut_ptr() as usize,
-            Ordering::Relaxed,
-        );
+        for is_input in [ASIO_TRUE, ASIO_FALSE] {
+            let mut info = ASIOChannelInfo {
+                channel: channel as i32,
+                is_input,
+                is_active: 0,
+                channel_group: -1,
+                channel_type: -1,
+                name: [0; 32],
+            };
+            let err = unsafe { ((*vtbl).get_channel_info)(asio, &mut info) };
+            assert_eq!(err, ASE_OK, "getChannelInfo failed for {channel}");
+            assert_eq!(info.is_active, ASIO_TRUE);
+            assert_eq!(info.channel_type, ASIOST_FLOAT32_LSB);
+            let name = unsafe { std::ffi::CStr::from_ptr(info.name.as_ptr() as *const i8) }
+                .to_string_lossy()
+                .to_string();
+            assert!(name.starts_with("Insert"), "channel name was {name:?}");
+        }
     }
+    let mut out_of_range = ASIOChannelInfo {
+        channel: CHANNELS as i32,
+        is_input: ASIO_TRUE,
+        is_active: 0,
+        channel_group: 0,
+        channel_type: 0,
+        name: [0; 32],
+    };
+    assert_eq!(
+        unsafe { ((*vtbl).get_channel_info)(asio, &mut out_of_range) },
+        ASE_InvalidParameter
+    );
+    println!("channels: active, {ASIOST_FLOAT32_LSB} (float32 LSB), named");
+
+    // ---- buffers and callbacks ------------------------------------------
+    let double = std::env::var("AMI_PROBE_DOUBLE")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    let mut input_buffers: [[Vec<f32>; CHANNELS]; 2] =
+        std::array::from_fn(|_| std::array::from_fn(|_| vec![0.0; BLOCK_FRAMES]));
+    let mut output_buffers: [[Vec<f32>; CHANNELS]; 2] =
+        std::array::from_fn(|_| std::array::from_fn(|_| vec![0.0; BLOCK_FRAMES]));
+    // In single-buffer mode both ASIO slots point at the same memory, which is
+    // legal; in double mode they are distinct and the callback index selects.
+    let second_slot = if double { 1 } else { 0 };
+    for slot in 0..2 {
+        for channel in 0..CHANNELS {
+            let source_slot = if double { slot } else { 0 };
+            IN_ADDR[slot][channel].store(
+                input_buffers[source_slot][channel].as_mut_ptr() as usize,
+                Ordering::Relaxed,
+            );
+            OUT_ADDR[slot][channel].store(
+                output_buffers[source_slot][channel].as_mut_ptr() as usize,
+                Ordering::Relaxed,
+            );
+        }
+    }
+    println!(
+        "host    : {} buffered",
+        if double { "double" } else { "single" }
+    );
 
     let mut infos: Vec<ASIOBufferInfo> = Vec::with_capacity(CHANNELS * 2);
     for channel in 0..CHANNELS {
@@ -207,8 +264,8 @@ fn main() {
             is_input: ASIO_TRUE,
             channel_num: channel as i32,
             buffers: [
-                input_buffers[channel].as_mut_ptr() as *mut c_void,
-                input_buffers[channel].as_mut_ptr() as *mut c_void,
+                input_buffers[0][channel].as_mut_ptr() as *mut c_void,
+                input_buffers[second_slot][channel].as_mut_ptr() as *mut c_void,
             ],
         });
     }
@@ -217,8 +274,8 @@ fn main() {
             is_input: ASIO_FALSE,
             channel_num: channel as i32,
             buffers: [
-                output_buffers[channel].as_mut_ptr() as *mut c_void,
-                output_buffers[channel].as_mut_ptr() as *mut c_void,
+                output_buffers[0][channel].as_mut_ptr() as *mut c_void,
+                output_buffers[second_slot][channel].as_mut_ptr() as *mut c_void,
             ],
         });
     }
@@ -310,6 +367,9 @@ fn main() {
     }
 
     assert_eq!(unsafe { ((*vtbl).stop)(asio) }, ASE_OK);
+    // The asynchronous host writes on detached threads; let the last one finish
+    // before the object is released, or it would call outputReady on freed memory.
+    std::thread::sleep(Duration::from_millis(100));
 
     let mut reported = ASIOSamples { hi: 0, lo: 0 };
     let mut stamp = ASIOTimeStamp { hi: 0, lo: 0 };

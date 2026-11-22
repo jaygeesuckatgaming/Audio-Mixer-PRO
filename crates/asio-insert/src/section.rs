@@ -115,7 +115,7 @@ impl Shared {
                 let header = shared.header_mut();
                 header.magic.copy_from_slice(&MAGIC);
                 header.version = VERSION;
-                header.rate = rate.max(1);
+                header.rate.store(rate.max(1), Ordering::Relaxed);
                 header.block = BLOCK_FRAMES as u32;
                 header.pairs = PAIRS as u32;
             } else {
@@ -135,12 +135,13 @@ impl Shared {
 
     /// Sample rate published by whoever created the section (the mixer).
     pub fn rate(&self) -> u32 {
-        self.header().rate.max(1)
+        self.header().rate.load(Ordering::Relaxed).max(1)
     }
 
-    /// The mixer may update the rate after a settings change.
-    pub fn set_rate(&mut self, rate: u32) {
-        self.header_mut().rate = rate.max(1);
+    /// The mixer may update the rate after a settings change. Atomic because a
+    /// running driver polls it from its own thread.
+    pub fn set_rate(&self, rate: u32) {
+        self.header().rate.store(rate.max(1), Ordering::Relaxed);
     }
 
     pub fn seq_in(&self) -> u64 {
@@ -159,6 +160,15 @@ impl Shared {
         }
     }
 
+    /// Wake a waiting pump without advancing `seq_in`. Stop/release use this:
+    /// `publish_block` there would announce a block that was never written, and
+    /// the next mixer session would adopt that phantom sequence number.
+    pub fn wake(&self) {
+        unsafe {
+            SetEvent(self.block_event);
+        }
+    }
+
     /// Record how many blocks the driver has returned. Stored rather than
     /// incremented so a driver that starts late (or one that processed several
     /// published blocks in one wake-up) publishes an exact count.
@@ -172,7 +182,17 @@ impl Shared {
     }
 
     pub fn note_missed(&self) {
-        self.header().missed.fetch_add(1, Ordering::Relaxed);
+        self.note_missed_by(1);
+    }
+
+    /// Record blocks the driver had to drop because the ring was already
+    /// overwritten (a stall), not merely a block that had not arrived yet.
+    pub fn note_missed_by(&self, count: u64) {
+        if count > 0 {
+            self.header()
+                .missed
+                .fetch_add(count, Ordering::Relaxed);
+        }
     }
 
     pub fn blocks(&self) -> u64 {
@@ -244,7 +264,9 @@ impl Drop for Shared {
 struct Header {
     magic: [u8; 4],
     version: u32,
-    rate: u32,
+    /// Written by the mixer (through `set_rate`) and polled by a running
+    /// driver, so it is atomic rather than a plain `u32` data race.
+    rate: AtomicU32,
     block: u32,
     pairs: u32,
     _pad: u32,
