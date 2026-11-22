@@ -11,8 +11,9 @@
     Waveform 14 and other 64-bit hosts only: this driver is x64 for now.
 
 .PARAMETER Dll
-    Path to asio_insert.dll. Defaults to the crate's release build
-    (crates\asio-insert\target\diag\release\asio_insert.dll, then target\release).
+    Path to asio_insert.dll. Defaults to the copy next to this script (the
+    distribution layout), then the crate's release build
+    (crates\asio-insert\target\release\asio_insert.dll).
 
 .PARAMETER Name
     The name the host shows and the key written under HKLM\SOFTWARE\ASIO.
@@ -79,17 +80,26 @@ if ($Unregister) {
 
 # ---- locate and copy the driver ------------------------------------------
 if (-not $Dll) {
-    $root = Resolve-Path (Join-Path $PSScriptRoot "..\..\..")
+    # Distribution layout: the DLL lives next to this script. A source tree
+    # layout is also supported so the same script works from the repo.
+    $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..\..") -ErrorAction SilentlyContinue
     $candidates = @(
-        (Join-Path $root "crates\asio-insert\target\diag\release\asio_insert.dll"),
-        (Join-Path $root "crates\asio-insert\target\release\asio_insert.dll")
+        (Join-Path $PSScriptRoot "asio_insert.dll"),
+        (Join-Path $PSScriptRoot "..\crates\asio-insert\target\release\asio_insert.dll"),
+        (Join-Path $PSScriptRoot "..\crates\asio-insert\target\diag\release\asio_insert.dll")
     )
+    if ($repoRoot) {
+        $candidates += @(
+            (Join-Path $repoRoot "crates\asio-insert\target\release\asio_insert.dll"),
+            (Join-Path $repoRoot "crates\asio-insert\target\diag\release\asio_insert.dll")
+        )
+    }
     $Dll = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $Dll) {
         Write-Host "asio_insert.dll was not found. Build it first:" -ForegroundColor Yellow
         Write-Host "  cd crates\asio-insert"
-        Write-Host "  `$env:CARGO_TARGET_DIR = 'target/diag'"
         Write-Host "  cargo build --release"
+        Write-Host "or pass -Dll <path to asio_insert.dll>."
         exit 1
     }
 }
@@ -131,7 +141,8 @@ Write-Host ("    Description : {0}" -f $check.Description)
 Write-Host ("  {0}\InprocServer32" -f $clsidKey)
 Write-Host ("    (default)   : {0}" -f $server)
 Write-Host ""
-Write-Host "Next: open Waveform 14 -> Settings -> Audio Devices, set the device type" -ForegroundColor Cyan
-Write-Host "to ASIO, and pick '$Name'. Expect 48000 Hz and a 512-sample buffer."
-Write-Host "It will be silent until the mixer side of the insert is wired (phase 2)."
+Write-Host "Next: close the DAW, choose '$Name' as its ASIO device (48000 Hz, 512 samples)." -ForegroundColor Cyan
+Write-Host "In the mixer, assign a strip to EXTERNAL INSERT (ASIO) pair 1 or 2."
+Write-Host "Pair 1 is ASIO channels 1/2; pair 2 is channels 3/4. The DAW track must"
+Write-Host "monitor (record-arm) its input, or it returns silence."
 Write-Host "To remove it: .\register-asio.ps1 -Unregister"
