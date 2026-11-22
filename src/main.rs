@@ -5786,9 +5786,15 @@ fn path_delay_ms(
             Pos2::new(rect.left() + 494.0, rect.top() + 7.0),
             Vec2::new(76.0, 24.0),
         );
+        // The player follows Ducking: another processing panel, not a window
+        // control.
+        let player_hit = Rect::from_min_size(
+            Pos2::new(rect.left() + 576.0, rect.top() + 7.0),
+            Vec2::new(70.0, 24.0),
+        );
         let button_hits = [
-            menu_hit, vban_hit, cables_hit, ducking_hit, close_hit, min_hit, max_hit, help_hit,
-            lock_hit, r_hit, a_hit,
+            menu_hit, vban_hit, cables_hit, ducking_hit, player_hit, close_hit, min_hit, max_hit,
+            help_hit, lock_hit, r_hit, a_hit,
         ];
         let drag_strip = Rect::from_min_max(
             rect.min,
@@ -5867,6 +5873,11 @@ fn path_delay_ms(
             self.show_ducking = true;
         }
 
+        if top_button(ui, player_hit, "PLAYER", self.show_player, AMBER) {
+            self.show_player = true;
+            self.ensure_player();
+        }
+
         // Build identity, left of the seven window-control buttons (each 24 wide
         // with a 28 gap): clear of the A / R buttons.
         let build_rect = Rect::from_min_size(
@@ -5941,17 +5952,17 @@ fn path_delay_ms(
 
         // transient status message
         if self.time < self.status_until && !self.status.is_empty() {
-            // Keep clear of CABLES and DUCKING so a transient message never
-            // hides the panel buttons next to them.
+            // Keep clear of CABLES, DUCKING and PLAYER so a transient message
+            // never hides the panel buttons next to them.
             let srect = Rect::from_min_size(
-                Pos2::new(rect.left() + 578.0, rect.top() + 8.0),
-                Vec2::new(258.0, 22.0),
+                Pos2::new(rect.left() + 654.0, rect.top() + 8.0),
+                Vec2::new(182.0, 22.0),
             );
             p.rect_filled(srect, 3.0, Color32::from_rgb(36, 44, 38));
             p.text(
                 srect.center(),
                 Align2::CENTER_CENTER,
-                fit_text(p, &self.status, 9.5, 250.0),
+                fit_text(p, &self.status, 9.5, 174.0),
                 FontId::proportional(9.5),
                 Color32::from_rgb(190, 220, 180),
             );
