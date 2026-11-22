@@ -7081,8 +7081,8 @@ Right click > Source to use the Windows capture stream instead."
         let mut over_master = false;
         if idx == 0 {
             let master_rect = Rect::from_min_size(
-                Pos2::new(header.left() + 50.0, header.top() + 1.0),
-                Vec2::new(42.0, 12.0),
+                Pos2::new(refresh_rect.left() - 30.0, refresh_rect.top()),
+                Vec2::new(26.0, refresh_rect.height()),
             );
             let mresp = ui.interact(master_rect, Id::new("bus_a1_master"), Sense::click());
             over_master = mresp.hovered();
@@ -7108,12 +7108,12 @@ Right click > Source to use the Windows capture stream instead."
             ui.painter().text(
                 master_rect.center(),
                 Align2::CENTER_CENTER,
-                "MASTER",
-                FontId::proportional(6.4),
+                "CLK",
+                FontId::proportional(6.8),
                 color,
             );
             let mresp = mresp.on_hover_text(
-                "Use the A1 output device as the master clock for the whole console. \
+                "A1 master clock: use the A1 output device as the console clock. \
                  All strips follow it while A1 is running.",
             );
             if mresp.clicked() && enabled {
