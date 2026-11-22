@@ -8024,17 +8024,62 @@ Right click > Source to use the Windows capture stream instead."
     fn player_add_file(&mut self) {
         self.ensure_player();
         #[cfg(windows)]
-        let chosen = audio::pick_file(
-            "Add Audio File",
+        let chosen = audio::pick_files(
+            "Add Audio Files",
             "Audio (wav, mp3, m4a, aif, bwf, flac, ogg)\0*.wav;*.mp3;*.m4a;*.aif;*.bwf;*.flac;*.ogg\0All files\0*.*\0\0",
         );
         #[cfg(not(windows))]
-        let chosen: Option<PathBuf> = None;
-        let Some(path) = chosen else { return };
+        let chosen: Vec<PathBuf> = Vec::new();
+        if chosen.is_empty() {
+            return;
+        }
+        self.player_add_paths(chosen);
+    }
+
+    /// Append files, folders and playlist files to the list. Used by the picker
+    /// and by drag & drop.
+    fn player_add_paths(&mut self, paths: Vec<PathBuf>) {
+        self.ensure_player();
+        let mut added: Vec<player::Track> = Vec::new();
+        let mut playlists = 0usize;
+        for path in paths {
+            if path.is_dir() {
+                added.extend(collect_audio_files(&path, 0));
+                continue;
+            }
+            if matches!(
+                player::playlist_format(&path),
+                player::PlaylistFormat::Xspf
+                    | player::PlaylistFormat::M3u
+                    | player::PlaylistFormat::Pls
+            ) {
+                match player::load_playlist(&path) {
+                    Ok(tracks) => {
+                        added.extend(tracks);
+                        playlists += 1;
+                    }
+                    Err(err) => self.toast(format!("Playlist: {err}")),
+                }
+                continue;
+            }
+            added.push(player::Track::new(path));
+        }
+        if added.is_empty() {
+            self.toast("Nothing to add - no audio files found");
+            return;
+        }
+        let count = added.len();
         if let Some(player) = self.player.as_ref() {
-            player.add_tracks(vec![player::Track::new(path)]);
+            player.add_tracks(added);
         }
         self.player_cache_rev = 0;
+        self.show_player = true;
+        self.player_status = if playlists > 0 {
+            format!("Added {count} tracks ({playlists} playlist(s))")
+        } else {
+            format!("Added {count} tracks")
+        };
+        self.toast(self.player_status.clone());
     }
 
     fn player_save_playlist(&mut self) {
@@ -8091,6 +8136,16 @@ Right click > Source to use the Windows capture stream instead."
                 PlayerAction::Jump(index) => player.jump_to(index),
                 PlayerAction::Remove(index) => {
                     player.remove(index);
+                    invalidate = true;
+                }
+                PlayerAction::MoveUp(index) => {
+                    if index > 0 {
+                        player.move_track(index, index - 1);
+                        invalidate = true;
+                    }
+                }
+                PlayerAction::MoveDown(index) => {
+                    player.move_track(index, index + 1);
                     invalidate = true;
                 }
                 PlayerAction::Clear => {
@@ -8246,6 +8301,14 @@ Right click > Source to use the Windows capture stream instead."
                                     action = Some(PlayerAction::Jump(i));
                                     ui.close_menu();
                                 }
+                                if ui.button("Move up").clicked() {
+                                    action = Some(PlayerAction::MoveUp(i));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Move down").clicked() {
+                                    action = Some(PlayerAction::MoveDown(i));
+                                    ui.close_menu();
+                                }
                                 if ui.button("Remove").clicked() {
                                     action = Some(PlayerAction::Remove(i));
                                     ui.close_menu();
@@ -8266,7 +8329,7 @@ Right click > Source to use the Windows capture stream instead."
                     if ui.button("Load Playlist...").clicked() {
                         action = Some(PlayerAction::Import);
                     }
-                    if ui.button("Add File...").clicked() {
+                    if ui.button("Add Files...").clicked() {
                         action = Some(PlayerAction::AddFile);
                     }
                     if ui.button("Save Playlist...").clicked() {
@@ -10645,6 +10708,20 @@ impl eframe::App for MixerApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         UI_HEARTBEAT_MS.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
+        // Drag & drop from Explorer: files, folders and playlists all append to
+        // the player's list (VLC behaviour).
+        if !self.safe_mode {
+            let dropped: Vec<PathBuf> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
+            if !dropped.is_empty() {
+                self.player_add_paths(dropped);
+            }
+        }
         if self.first_frame {
             self.first_frame = false;
             if self.shot_path.is_some() {
@@ -11851,6 +11928,8 @@ enum PlayerAction {
     Previous,
     Jump(usize),
     Remove(usize),
+    MoveUp(usize),
+    MoveDown(usize),
     Clear,
     Import,
     AddFile,
@@ -12065,6 +12144,45 @@ fn player_clock(ms: u64) -> String {
     } else {
         format!("{minutes:02}:{seconds:02}")
     }
+}
+
+/// Audio files under `dir`, sorted, depth-limited so a symlink loop cannot spin
+/// forever. Dropping a folder on the mixer adds its music, like VLC.
+fn collect_audio_files(dir: &Path, depth: usize) -> Vec<player::Track> {
+    let mut out = Vec::new();
+    if depth > 3 {
+        return out;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            ext.as_str(),
+            "mp3" | "wav" | "flac" | "ogg" | "oga" | "m4a" | "aac" | "aif" | "aiff" | "bwf"
+        ) {
+            files.push(path);
+        }
+    }
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    dirs.sort();
+    out.extend(files.into_iter().map(player::Track::new));
+    for sub in dirs {
+        out.extend(collect_audio_files(&sub, depth + 1));
+    }
+    out
 }
 
 fn fit_text(painter: &egui::Painter, text: &str, size: f32, max_w: f32) -> String {

@@ -4709,6 +4709,70 @@ pub fn pick_file(_title: &str, _filter: &str) -> Option<PathBuf> {
     None
 }
 
+/// Native multi-select "open files" dialog. With one file selected the buffer is
+/// a single full path; with several it is the folder followed by each name, all
+/// NUL separated (the classic OPENFILENAME multi-string layout).
+#[cfg(windows)]
+pub fn pick_files(title: &str, filter: &str) -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OPENFILENAMEW};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+
+    let wide = |s: &str| -> Vec<u16> {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        v
+    };
+    let filter = wide(filter);
+    let title = wide(title);
+    let mut file_buf = vec![0u16; 64 * 1024];
+
+    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = unsafe { GetActiveWindow() };
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = file_buf.as_mut_ptr();
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.Flags = 0x0002_0000   // OFN_ALLOWMULTISELECT
+        | 0x0008_0000         // OFN_EXPLORER
+        | 0x0000_1000         // OFN_FILEMUSTEXIST
+        | 0x0000_0800         // OFN_PATHMUSTEXIST
+        | 0x0080_0000         // OFN_ENABLESIZING
+        | 0x0020_0000; // OFN_NONETWORKBUTTON
+
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+    if ok == 0 {
+        return Vec::new();
+    }
+
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    let mut start = 0usize;
+    for i in 0..file_buf.len() {
+        if file_buf[i] == 0 {
+            if i == start {
+                break;
+            }
+            parts.push(std::ffi::OsString::from_wide(&file_buf[start..i]));
+            start = i + 1;
+        }
+    }
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    if parts.len() == 1 {
+        return vec![PathBuf::from(&parts[0])];
+    }
+    let folder = PathBuf::from(&parts[0]);
+    parts[1..].iter().map(|name| folder.join(name)).collect()
+}
+
+#[cfg(not(windows))]
+pub fn pick_files(_title: &str, _filter: &str) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// Native "save file" dialog, used for exporting the player's playlist.
 #[cfg(windows)]
 pub fn pick_save_file(title: &str, filter: &str, default_name: &str) -> Option<PathBuf> {
