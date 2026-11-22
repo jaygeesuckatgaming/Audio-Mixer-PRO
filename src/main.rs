@@ -6079,6 +6079,30 @@ fn path_delay_ms(
         APPS_BLOCK_H
     }
 
+    /// Send a strip to one external ASIO insert pair. The panel allows one strip
+    /// per pair, so release any other strip already using it first.
+    fn assign_strip_insert(&mut self, idx: usize, pair: usize) {
+        let post = self
+            .audio
+            .strip_insert(idx)
+            .map(|(_, post)| post)
+            .unwrap_or(false);
+        for other in 0..self.strips.len() {
+            if other != idx
+                && self.audio.strip_insert(other).map(|(used, _)| used) == Some(pair)
+            {
+                self.audio.set_strip_insert(other, None, false);
+            }
+        }
+        self.audio.set_strip_insert(idx, Some(pair), post);
+        self.toast(format!(
+            "{}: ASIO insert pair {} ({})",
+            self.strip_label(idx),
+            pair + 1,
+            if post { "post-FX" } else { "pre-FX" }
+        ));
+    }
+
     fn draw_strip_card(&mut self, ui: &egui::Ui, card: Rect, idx: usize) {
         let accent = if idx < 3 { Color32::from_rgb(128, 168, 190) } else { TEAL };
         let inner = card.shrink2(Vec2::new(5.0, 4.0));
@@ -6435,6 +6459,97 @@ Right click > Source to use the Windows capture stream instead."
             }
         }
         y += header_h + 3.0;
+
+        // External ASIO insert pair buttons. Two stereo pairs are available;
+        // the selected one is green so the strip shows at a glance which ASIO
+        // pair (if any) it is using. Click again to turn it off, right-click
+        // the active pair to switch pre/post.
+        let current_insert = self.audio.strip_insert(idx);
+        let insert_post = current_insert.map(|(_, post)| post).unwrap_or(false);
+        let pair_gap = 2.0;
+        let pair_w = (w - pair_gap) / 2.0;
+        for pair in 0..2 {
+            let selected = matches!(current_insert, Some((used, _)) if used == pair);
+            let r = Rect::from_min_size(
+                Pos2::new(inner.left() + pair as f32 * (pair_w + pair_gap), y),
+                Vec2::new(pair_w, 14.0),
+            );
+            let resp = ui.interact(r, Id::new(("strip_insert", idx, pair)), Sense::click());
+            let color = if !enabled {
+                FAINT
+            } else if selected {
+                GREEN
+            } else {
+                DIM
+            };
+            ui.painter().rect_filled(
+                r,
+                2.0,
+                if selected && enabled {
+                    Color32::from_rgb(36, 86, 58)
+                } else {
+                    TRACK
+                },
+            );
+            ui.painter().rect_stroke(
+                r,
+                2.0,
+                Stroke::new(1.0, if selected && enabled { GREEN } else { LINE }),
+            );
+            let label = format!("Insert {}", pair + 1);
+            if selected {
+                ui.painter().text(
+                    Pos2::new(r.left() + 4.0, r.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(6.8),
+                    if enabled { TEXT } else { FAINT },
+                );
+                ui.painter().text(
+                    Pos2::new(r.right() - 4.0, r.center().y),
+                    Align2::RIGHT_CENTER,
+                    if insert_post { "POST" } else { "PRE" },
+                    FontId::proportional(5.4),
+                    if enabled {
+                        Color32::from_rgb(180, 230, 190)
+                    } else {
+                        FAINT
+                    },
+                );
+            } else {
+                ui.painter().text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    label,
+                    FontId::proportional(6.8),
+                    color,
+                );
+            }
+            let resp = resp.on_hover_text(format!(
+                "External ASIO insert pair {} (ASIO channels {}/{}). Click to send this strip; \
+                 click again to turn it off. Right-click the active pair to switch pre/post.",
+                pair + 1,
+                pair * 2 + 1,
+                pair * 2 + 2
+            ));
+            if resp.clicked() && enabled {
+                if selected {
+                    self.audio.set_strip_insert(idx, None, false);
+                    self.toast(format!("{}: ASIO insert off", self.strip_label(idx)));
+                } else {
+                    self.assign_strip_insert(idx, pair);
+                }
+            }
+            if resp.secondary_clicked() && enabled && selected {
+                self.audio.set_strip_insert(idx, Some(pair), !insert_post);
+                self.toast(format!(
+                    "{} insert is now {}",
+                    self.strip_label(idx),
+                    if insert_post { "pre-FX" } else { "post-FX" }
+                ));
+            }
+        }
+        y += 17.0;
 
         // Plug-in insert panel. The built-in pan/comp/gate/3-band EQ controls are
         // gone: every strip runs a VST3 insert, so this space names the plug-in
