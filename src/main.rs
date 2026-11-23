@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+﻿#![windows_subsystem = "windows"]
 
 mod audio;
 mod asio_insert;
@@ -970,7 +970,6 @@ struct MixerApp {
     vban_quality: u8,
     vban_target_strip: usize,
     vban_out: Vec<vban::VbanOutConfig>,
-    show_tape_opts: bool,
     /// FUN_0052d990 / FUN_0052de50 preset scene browser: a saved scene with
     /// PresetName / PresetComment / PresetTimeStamp around the parameter block.
     show_presets: bool,
@@ -1015,7 +1014,6 @@ struct MixerApp {
     /// In-app clipboard used by the strip context menu's Copy All / Paste
     /// (FUN_00538860 commands 0x262 and 0x26c).
     strip_clip: Option<StripClip>,
-    tape_picker: bool,
     tape_error: Option<String>,
     tape_info: Option<String>,
     tape_recent: Vec<PathBuf>,
@@ -1574,7 +1572,6 @@ impl MixerApp {
             vban_quality: 1,
             vban_target_strip: 3,
             vban_out: Vec::new(),
-            show_tape_opts: false,
             show_presets: false,
             preset_name: String::new(),
             preset_comment: String::new(),
@@ -1608,7 +1605,6 @@ impl MixerApp {
             label_edit: None,
             label_buf: String::new(),
             strip_clip: None,
-            tape_picker: false,
             tape_error: None,
             tape_info: None,
             tape_recent: Vec::new(),
@@ -6171,7 +6167,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit Â· 48 kHz"), from the
+        // The endpoint's configured format ("24-bit Ãƒâ€šÃ‚Â· 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6254,7 +6250,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit Â· 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui
@@ -7471,306 +7467,116 @@ Right click > Source to use the Windows capture stream instead."
         );
         let inner = rect.shrink2(Vec2::new(10.0, 5.0));
         let enabled = !self.lock_gui;
+        let row_y = inner.top();
 
-        // first row
-        let row1_y = inner.top();
         p.text(
-            Pos2::new(inner.left(), row1_y + 2.0),
+            Pos2::new(inner.left(), row_y + 2.0),
             Align2::LEFT_TOP,
-            "TAPE",
+            "PLAYER",
             FontId::proportional(9.5),
             AMBER,
         );
         p.text(
-            Pos2::new(inner.left(), row1_y + 12.0),
+            Pos2::new(inner.left(), row_y + 12.0),
             Align2::LEFT_TOP,
-            "RECORDER",
+            "MUSIC",
             FontId::proportional(6.5),
             FAINT,
         );
 
-        // file selector
-        let file_rect = Rect::from_min_size(Pos2::new(inner.left() + 56.0, row1_y), Vec2::new(190.0, 22.0));
-        let file_tip = if let Some(err) = &self.tape_error {
-            format!("{err}\n\nClick to Select Audio file for Playback")
-        } else if let Some(info) = &self.tape_info {
-            format!("{info}\n\nClick to Select Audio file for Playback")
-        } else {
-            "Click to Select Audio file for Playback".to_string()
-        };
-        let file_hover = ui
-            .interact(file_rect, Id::new("tape_file"), Sense::click())
-            .on_hover_text(file_tip);
-        p.rect_filled(file_rect, 3.0, PANEL_HI);
-        p.rect_stroke(
-            file_rect,
-            3.0,
-            Stroke::new(
-                1.0,
-                if self.tape_error.is_some() { RED } else { LINE },
-            ),
-        );
-        p.text(
-            file_rect.center(),
-            Align2::CENTER_CENTER,
-            fit_text(p, &self.tape.file, 8.0, file_rect.width() - 8.0),
-            FontId::proportional(8.0),
-            if self.tape_error.is_some() {
-                Color32::from_rgb(238, 140, 128)
-            } else {
-                TEXT
-            },
-        );
-        if file_hover.clicked() && enabled {
-            self.tape_picker = true;
-        }
-
-        // transport time
-        let time_txt = format!(
-            "{} / {}",
-            clock(self.tape.pos),
-            if self.tape.recording {
-                clock(self.tape.pos)
-            } else {
-                clock(self.tape.len)
+        // Now playing, straight from the player.
+        let (title, position, duration, playing) = match self.player.as_ref() {
+            Some(player) => {
+                let index = player.index();
+                let title = self
+                    .player_cache
+                    .get(index)
+                    .map(|track| track.title.clone())
+                    .unwrap_or_else(|| "No track".to_string());
+                (
+                    title,
+                    player.position_ms(),
+                    player.duration_ms(),
+                    player.is_playing(),
+                )
             }
-        );
+            None => ("No track".to_string(), 0, 0, false),
+        };
         p.text(
-            Pos2::new(inner.left() + 254.0, row1_y + 6.0),
+            Pos2::new(inner.left() + 56.0, row_y + 1.0),
             Align2::LEFT_TOP,
-            time_txt,
+            fit_text(p, &title, 8.5, 300.0),
+            FontId::proportional(8.5),
+            if playing { GREEN } else { TEXT },
+        );
+        p.text(
+            Pos2::new(inner.left() + 362.0, row_y + 1.0),
+            Align2::LEFT_TOP,
+            format!("{} / {}", player_clock(position), player_clock(duration)),
             FontId::proportional(8.0),
             DIM,
         );
 
-        // transport buttons
-        let mut bx = inner.left() + 320.0;
-        let by = row1_y + 1.0;
-        let mut buttons: Vec<(Rect, Transport)> = Vec::new();
-        for t in [
-            Transport::Rew,
-            Transport::Ff,
-            Transport::Play,
-            Transport::Stop,
-            Transport::Rec,
-        ] {
-            let w = if t == Transport::Rec { 34.0 } else { 26.0 };
-            let r = Rect::from_min_size(Pos2::new(bx, by), Vec2::new(w, 20.0));
-            buttons.push((r, t));
-            bx += w + 3.0;
+        // Transport: previous, play/pause, next, and the list window.
+        let by = row_y - 2.0;
+        let mut bx = inner.left() + 470.0;
+        let prev = Rect::from_min_size(Pos2::new(bx, by), Vec2::new(26.0, 20.0));
+        bx += 29.0;
+        let play = Rect::from_min_size(Pos2::new(bx, by), Vec2::new(44.0, 20.0));
+        bx += 47.0;
+        let next = Rect::from_min_size(Pos2::new(bx, by), Vec2::new(26.0, 20.0));
+        bx += 29.0;
+        let list = Rect::from_min_size(Pos2::new(bx, by), Vec2::new(46.0, 20.0));
+
+        if top_button(ui, prev, "|<", false, BLUE) && enabled {
+            self.ensure_player();
+            self.player_action(PlayerAction::Previous);
         }
-        for (r, t) in buttons {
-            let active = match t {
-                Transport::Play => self.tape.playing,
-                Transport::Rec => self.tape.recording,
-                _ => false,
-            };
-            let col = if t == Transport::Rec {
-                RED
-            } else if t == Transport::Play {
-                GREEN
+        if top_button(ui, play, if playing { "PAUSE" } else { "PLAY" }, playing, GREEN) && enabled {
+            self.ensure_player();
+            self.player_action(if playing {
+                PlayerAction::Pause
             } else {
-                BLUE
-            };
-            if transport_button(ui, r, t, active, col, enabled) {
-                self.on_transport(t);
-            }
+                PlayerAction::Play
+            });
+        }
+        if top_button(ui, next, ">|", false, BLUE) && enabled {
+            self.ensure_player();
+            self.player_action(PlayerAction::Next);
+        }
+        if top_button(ui, list, "LIST", self.show_player, AMBER) && enabled {
+            self.show_player = true;
+            self.ensure_player();
         }
 
-        // tape routing
-        let mut rx = inner.left() + 495.0;
-        for i in 0..audio::MAX_BUSES {
-            let r = Rect::from_min_size(Pos2::new(rx, by), Vec2::new(22.0, 20.0));
-            let label = format!("{}{}", if i < 3 { "A" } else { "B" }, if i < 3 { i + 1 } else { i - 2 });
-            let route = self.tape.route[i];
-            let (clicked, _) = chip(
-                ui,
-                r,
-                &label,
-                route,
-                if i < 3 { AMBER } else { BLUE },
-                enabled,
-                Id::new(("tape_route", i)),
-                "Route the recorder playback into this bus",
-            );
-            if clicked {
-                self.tape.route[i] = !route;
-            }
-            rx += 24.0;
-        }
-
-        // tape gain
-        let gain_rect = Rect::from_min_size(Pos2::new(inner.left() + 644.0, by), Vec2::new(108.0, 20.0));
-        let gain_resp = ui.interact(gain_rect, Id::new("tape_gain"), Sense::click_and_drag());
-        p.rect_filled(gain_rect, 3.0, TRACK);
-        p.rect_stroke(gain_rect, 3.0, Stroke::new(1.0, LINE));
-        let t = ((self.tape.gain_db - GAIN_MIN) / (GAIN_MAX - GAIN_MIN)).clamp(0.0, 1.0);
-        let fill = Rect::from_min_size(
-            gain_rect.left_top(),
-            Vec2::new(gain_rect.width() * t, gain_rect.height()),
-        );
-        p.rect_filled(fill, 3.0, Color32::from_rgb(50, 90, 70));
+        // Which strip carries it, and whether the demo mirror is on.
+        let strip_name = self
+            .strips
+            .get(self.player_strip.min(self.active_strips.saturating_sub(1)))
+            .map(|strip| format!("{} {}", self.player_strip + 1, strip.name))
+            .unwrap_or_default();
         p.text(
-            gain_rect.center(),
-            Align2::CENTER_CENTER,
-            format!("PLAY {}", fmt_db(self.tape.gain_db)),
-            FontId::proportional(7.0),
-            TEXT,
-        );
-        if gain_resp.dragged() && enabled {
-            let dx = ui.input(|i| i.pointer.delta().x);
-            self.tape.gain_db =
-                (self.tape.gain_db + dx * (GAIN_MAX - GAIN_MIN) / gain_rect.width()).clamp(GAIN_MIN, GAIN_MAX);
-        }
-        if gain_resp.double_clicked() && enabled {
-            self.tape.gain_db = 0.0;
-        }
-
-        // right-hand status
-        let status_color = FAINT;
-        let status = if self.time < self.status_until && !self.status.is_empty() {
-            self.status.clone()
-        } else if self.audio.available {
-            format!("A1 output: {}", self.audio.device)
-        } else {
-            "No audio output device".to_string()
-        };
-        p.text(
-            Pos2::new(inner.right(), row1_y + 6.0),
-            Align2::RIGHT_TOP,
-            status,
-            FontId::proportional(7.5),
-            status_color,
-        );
-
-        // second row: progress + engine status
-        let row2 = rect.bottom() - 24.0;
-        let bar = Rect::from_min_size(Pos2::new(inner.left(), row2), Vec2::new(inner.width(), 14.0));
-        p.rect_filled(bar, 3.0, TRACK);
-        let frac = if self.tape.recording {
-            (self.tape.pos / 600.0).min(1.0)
-        } else if self.tape.len > 0.0 {
-            (self.tape.pos / self.tape.len).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let progress = Rect::from_min_size(
-            bar.left_top(),
-            Vec2::new(bar.width() * frac, bar.height()),
-        );
-        p.rect_filled(
-            progress,
-            3.0,
-            if self.tape.recording {
-                RED.gamma_multiply(0.7)
-            } else {
-                Color32::from_rgb(58, 120, 90)
-            },
-        );
-        for i in 0..40 {
-            let x = bar.left() + bar.width() * (i as f32 / 40.0);
-            p.line_segment(
-                [Pos2::new(x, bar.bottom() - 3.0), Pos2::new(x, bar.bottom())],
-                Stroke::new(1.0, FAINT.gamma_multiply(0.7)),
-            );
-        }
-        // FUN_0053e7b0 case 0xb4: a click inside the recorder display scrubs
-        // the playhead. The display keeps an 11 px inset on each side
-        // (DAT_0057cd90 + 0xb, DAT_0057cd98 - 0xb) and the position is
-        // MulDiv(x - (rect.x + 11), length, (rect.w - 22)).
-        let scrub = ui.interact(bar, Id::new("tape_scrub"), Sense::click_and_drag());
-        if enabled && self.tape.len > 0.0 && !self.tape.recording {
-            if let Some(pos) = scrub.interact_pointer_pos() {
-                if scrub.clicked() || scrub.dragged() {
-                    let t = ((pos.x - bar.left() - 11.0) / (bar.width() - 22.0).max(1.0))
-                        .clamp(0.0, 1.0);
-                    let seek = t * self.tape.len;
-                    self.tape.pos = seek;
-                    self.audio.seek(seek);
-                }
-            }
-        }
-        // Refresh the readout once a second instead of every frame: the measured
-        // value jitters by a millisecond or two continuously, which reads as the
-        // whole line twitching. The tooltip is refreshed on the same tick so the
-        // two never disagree.
-        self.latency_tick += ui.ctx().input(|i| i.stable_dt).min(0.1) as f64;
-        if self.latency_tick >= 1.0 || self.latency_detail_shown.is_empty() {
-            self.latency_tick = 0.0;
-            let (ms, detail) = self.latency_report();
-            self.latency_ms_shown = ms;
-            self.latency_detail_shown = detail;
-        }
-        let latency_ms = self.latency_ms_shown;
-        let latency_detail = self.latency_detail_shown.clone();
-        // Fixed-width fields. The backdrop is sized from this text, so any change
-        // in digit count or in STOPPED/PLAYING/RECORDING used to resize it every
-        // few seconds; padding makes the string the same length in every state.
-        let engine_text = format!(
-            "{:>5.1} kHz  |  buffer {:>4}  |  engine {:<6}  |  {:<9}  |  latency ~{:>4.0} ms",
-            self.sample_rate as f32 / 1000.0,
-            self.buffer,
-            if self.engine_mode == 0 { "Normal" } else { "Swift" },
-            if self.tape.recording {
-                "RECORDING"
-            } else if self.tape.playing {
-                "PLAYING"
-            } else {
-                "STOPPED"
-            },
-            latency_ms
-        );
-        // Monospaced so the padded columns are also equal *widths*: in the
-        // proportional face a "1" is narrower than an "8", so a constant
-        // character count still changed the panel width as the digits changed.
-        let status_font = FontId::monospace(7.0);
-        let tw = p
-            .layout_no_wrap(engine_text.clone(), status_font.clone(), DIM)
-            .size()
-            .x;
-        if (tw - self.last_status_width).abs() > 0.25 {
-            diag_log(format!("status: width {tw:.2} text={engine_text}"));
-            self.last_status_width = tw;
-        }
-        let backdrop = Rect::from_min_max(
-            Pos2::new(bar.right() - tw - 10.0, bar.top() + 1.0),
-            Pos2::new(bar.right() - 2.0, bar.bottom() - 1.0),
-        );
-        p.rect_filled(backdrop, 2.0, Color32::from_rgb(18, 21, 26));
-        p.text(
-            Pos2::new(bar.right() - 6.0, bar.center().y),
-            Align2::RIGHT_CENTER,
-            engine_text,
-            status_font.clone(),
+            Pos2::new(inner.left() + 628.0, row_y + 2.0),
+            Align2::LEFT_TOP,
+            fit_text(p, &format!("\u{2192} {strip_name}"), 8.0, 180.0),
+            FontId::proportional(8.0),
             DIM,
         );
-        // The latency figure is painted text, so it had no widget to hover:
-        // give it an invisible interact rect right over the phrase and hang the
-        // breakdown on that.
-        let latency_text = format!("latency ~{latency_ms:>4.0} ms");
-        let latency_w = p
-            .layout_no_wrap(latency_text, status_font, DIM)
-            .size()
-            .x;
-        let latency_rect = Rect::from_min_size(
-            Pos2::new(bar.right() - 6.0 - latency_w, bar.top()),
-            Vec2::new(latency_w + 6.0, bar.height()),
-        );
-        let latency_resp = ui.interact(latency_rect, Id::new("status_latency"), Sense::hover());
-        // A fixed maximum width: the bus list and the live millisecond values
-        // used to make this floating box grow and shrink on every update, which
-        // read as "the window is resizing". Wrapped text at a set width cannot.
-        let _ = latency_resp.on_hover_ui(|ui| {
-            ui.set_max_width(340.0);
-            ui.label(latency_detail);
-        });
+        if self.player_mirror {
+            let chip = Rect::from_min_size(
+                Pos2::new(inner.right() - 74.0, row_y),
+                Vec2::new(64.0, 14.0),
+            );
+            p.rect_filled(chip, 2.0, AMBER.gamma_multiply(0.85));
+            p.text(
+                chip.center(),
+                Align2::CENTER_CENTER,
+                "MIRROR",
+                FontId::proportional(6.4),
+                Color32::from_rgb(26, 20, 10),
+            );
+        }
     }
-
-    // ------------------------------------------------------------------
-    // Internal streaming player
-    // ------------------------------------------------------------------
-
-    /// Create the player once and attach it to its strip.
     fn ensure_player(&mut self) {
         if self.player.is_none() {
             let input = Arc::new(audio::InputShared::new());
@@ -8618,14 +8424,6 @@ Right click > Source to use the Windows capture stream instead."
                             self.show_vc = true;
                             close = true;
                         }
-                        if menu_item(left, "Tape Recorder Options...", "Ctrl+5", true) {
-                            self.show_tape_opts = true;
-                            close = true;
-                        }
-                        if menu_item(left, "Eject Cassette (release audio file)", "", true) {
-                            self.eject_tape();
-                            close = true;
-                        }
                         if menu_item(right, "M.I.D.I. Mapping...", "Ctrl+3", true) {
                             self.show_info = Some((
                                 "M.I.D.I. Mapping".to_string(),
@@ -9435,106 +9233,6 @@ Right click > Source to use the Windows capture stream instead."
             }
         }
 
-        if self.show_tape_opts {
-            let mut open = self.show_tape_opts;
-            egui::Window::new("Tape Recorder Options")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .default_width(340.0)
-                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    egui::Grid::new("tape_opts")
-                        .num_columns(2)
-                        .spacing([10.0, 6.0])
-                        .show(ui, |ui| {
-                            // FUN_0052cd90 accepts FileType 1/2/3/100,
-                            // BitRes >> 3 = 1..4, only 2/4/6/8 channels,
-                            // the nine TargetSR rates and the 14 kbps
-                            // values 32..320; preRecTime is capped at 20 s.
-                            ui.label("File type:");
-                            ui.label(format!(
-                                "WAV (PCM), type {} (accepted {:?})",
-                                self.tape.rec_file_type, REC_FILE_TYPES
-                            ));
-                            ui.end_row();
-                            ui.label("Bit resolution:");
-                            ui.label(format!(
-                                "{} bit (accepted {:?})",
-                                self.tape.rec_bit_depth, REC_BIT_DEPTHS
-                            ));
-                            ui.end_row();
-                            ui.label("Target sample rate:");
-                            ui.label(format!(
-                                "{} Hz ({} accepted rates, 22050..192000)",
-                                self.tape.rec_target_sr,
-                                REC_TARGET_RATES.len()
-                            ));
-                            ui.end_row();
-                            ui.label("Channels:");
-                            ui.label(format!(
-                                "{} (accepted {:?})",
-                                self.tape.rec_channels, REC_CHANNELS
-                            ));
-                            ui.end_row();
-                            ui.label("MP3 bitrate:");
-                            ui.label(format!(
-                                "{} kbps ({} accepted values, 32..320)",
-                                self.tape.rec_kbps,
-                                REC_KBPS.len()
-                            ));
-                            ui.end_row();
-                            ui.label("Pre-roll:");
-                            ui.label(format!(
-                                "{} s (0..{} s)",
-                                self.tape.rec_pre_rec, REC_PRE_REC_MAX_S
-                            ));
-                            ui.end_row();
-                            ui.label("Timer stop:");
-                            ui.label(format!(
-                                "{} s (0 = off, RecordMode TimerStop)",
-                                self.tape.timer_stop
-                            ));
-                            ui.end_row();
-                            ui.label("Armed:");
-                            let armed_in: Vec<String> = (1..=8)
-                                .filter(|n| self.tape.arm & (1 << (n - 1)) != 0)
-                                .map(|n| n.to_string())
-                                .collect();
-                            let armed_bus: Vec<String> = (1..=8)
-                                .filter(|n| self.tape.arm & (1 << (15 + n)) != 0)
-                                .map(|n| n.to_string())
-                                .collect();
-                            ui.label(format!(
-                                "inputs [{}] buses [{}] (RecordArm bits)",
-                                armed_in.join(", "),
-                                armed_bus.join(", ")
-                            ));
-                            ui.end_row();
-                            ui.label("End of file:");
-                            ui.checkbox(
-                                &mut self.tape.loop_playback,
-                                "Loop (RecordMode Loop)",
-                            );
-                            ui.end_row();
-                        });
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(
-                            "Recordings follow the selected bus routing. \
-                             Click the file name in the tape deck to choose material.",
-                        )
-                        .size(10.0)
-                        .color(DIM),
-                    );
-                    if ui.button("Close").clicked() {
-                        self.show_tape_opts = false;
-                    }
-                });
-            if !open {
-                self.show_tape_opts = false;
-            }
-        }
 
         // -------------------------------------------------------------------
         // Preset Scene (FUN_0052d990 / FUN_0052de50)
@@ -10277,112 +9975,6 @@ Right click > Source to use the Windows capture stream instead."
             }
         }
 
-        if self.tape_picker {
-            let mut open = self.tape_picker;
-            let mut close_now = false;
-            let mut browse = false;
-            let mut load_path: Option<PathBuf> = None;
-            let mut load_recent: Option<PathBuf> = None;
-            egui::Window::new("Select Audio File")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .default_width(360.0)
-                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label(
-                        egui::RichText::new("Built-in demo tracks (these really play)")
-                            .size(10.0)
-                            .color(DIM),
-                    );
-                    for kind in DemoKind::ALL {
-                        let label = format!("{}  -  {}", kind.file_name(), kind.description());
-                        if ui.button(label).clicked() {
-                            self.select_demo(kind);
-                            close_now = true;
-                        }
-                    }
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Your own audio file (WAV, MP3, AIFF, BWF or M4A)")
-                            .size(10.0)
-                            .color(DIM),
-                    );
-                    if ui.button("Browse with Windows...").clicked() {
-                        browse = true;
-                    }
-                    ui.label(
-                        egui::RichText::new("or type/paste a full path:")
-                            .size(9.0)
-                            .color(DIM),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.tape_path_input)
-                                .desired_width(250.0)
-                                .hint_text("C:\\Music\\track.wav"),
-                        );
-                        if ui.button("Load").clicked() {
-                            let raw = self.tape_path_input.trim().trim_matches('"').to_string();
-                            if !raw.is_empty() {
-                                load_path = Some(PathBuf::from(raw));
-                            }
-                        }
-                    });
-                    if !self.tape_recent.is_empty() {
-                        ui.label(egui::RichText::new("Recent").size(9.0).color(DIM));
-                        for path in self.tape_recent.iter().take(4) {
-                            let name = path
-                                .file_name()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_else(|| path.display().to_string());
-                            if ui
-                                .button(format!("{}  -  {}", name, path.display()))
-                                .on_hover_text("Load this file again")
-                                .clicked()
-                            {
-                                load_recent = Some(path.clone());
-                            }
-                        }
-                    }
-                    if let Some(info) = &self.tape_info {
-                        ui.label(
-                            egui::RichText::new(format!("Loaded: {info}"))
-                                .size(9.0)
-                                .color(GREEN),
-                        );
-                    }
-                    if let Some(err) = &self.tape_error {
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("This file could not be loaded:")
-                                .size(10.0)
-                                .color(RED),
-                        );
-                        ui.label(egui::RichText::new(err).size(9.0).color(RED));
-                        ui.label(
-                            egui::RichText::new(
-                                "Pick a .wav, .mp3, .aiff, .bwf or .m4a file. If it is one of those and still fails, the file may be damaged or use an unsupported codec.",
-                            )
-                            .size(9.0)
-                            .color(DIM),
-                        );
-                    }
-                });
-            if browse {
-                if let Some(path) = audio::pick_audio_file() {
-                    if self.load_wav_file(path) {
-                        close_now = true;
-                    }
-                }
-            }
-            if let Some(path) = load_path.or(load_recent) {
-                if self.load_wav_file(path) {
-                    close_now = true;
-                }
-            }
-            self.tape_picker = open && !close_now;
-        }
 
         if self.show_ducking {
             let mut open = self.show_ducking;
@@ -10861,12 +10453,10 @@ impl eframe::App for MixerApp {
             self.show_system = false;
             self.show_vc = false;
             self.show_about = false;
-            self.show_tape_opts = false;
             self.show_presets = false;
             self.bus_eq_open = None;
             self.picker = None;
             self.label_edit = None;
-            self.tape_picker = false;
             self.show_info = None;
         }
 

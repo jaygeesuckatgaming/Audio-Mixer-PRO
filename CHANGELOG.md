@@ -3,6 +3,26 @@
 Audio Mixer PRO reports its build in the top bar as `<CHANNEL> · rev <REV>`.
 `REV` counts every published build of that release line.
 
+## 1.1 — unreleased
+
+Interface cleanup, plus a demo feature for showing several plug-ins at once.
+
+- **Removed controls that did nothing:** the `A` and `R` top-bar buttons (they
+  only showed hardcoded toasts), the strip `K` (karaoke) and `M.C.` buttons, the
+  bus `MODE` selector, the bus `SEL` button, the "Monitor on BUS SEL" option,
+  and the draggable limiter marker on every meter.
+- **The bottom bar is PLAYER, not TAPE.** The cassette transport, file picker,
+  bus route chips, `PLAY` gain and the non-functional `REC` button are gone. The
+  bar now shows the current track, elapsed/total, previous/play/next, a button
+  for the playlist window, and which strip carries the player.
+- Removed the "Tape Recorder Options" window and the "Eject Cassette" menu item.
+  The tape engine and built-in demo material stay for `--startup-demo`.
+- **Player mirror (demo mode):** "Mirror to every strip" feeds the same decoded
+  audio into every other strip's ring, so several plug-in windows can be shown
+  on one source with no cable and no offset between strips. Each strip keeps its
+  own VST, fader and bus routing; switching the mirror off restores the previous
+  input of every strip.
+
 ## 1.0.1 — rev 2 (2026-11-23)
 
 - **Fix: a plug-in's editor window could jump in front of whatever you clicked.**
