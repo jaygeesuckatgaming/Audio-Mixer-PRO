@@ -7036,16 +7036,25 @@ Right click > Source to use the Windows capture stream instead."
             self.ensure_player();
         }
 
-        // Which strip carries it, and whether the demo mirror is on.
+        // Which strip carries it, and whether the demo mirror is on. The
+        // original used a "->" arrow here, but the UI font has no arrow glyph
+        // (it drew as an empty box), so the label says FEEDS instead.
         let strip_name = self
             .strips
             .get(self.player_strip.min(self.active_strips.saturating_sub(1)))
             .map(|strip| format!("{} {}", self.player_strip + 1, strip.name))
             .unwrap_or_default();
         p.text(
-            Pos2::new(inner.left() + 628.0, row_y + 2.0),
+            Pos2::new(inner.left() + 628.0, row_y + 3.0),
             Align2::LEFT_TOP,
-            fit_text(p, &format!("\u{2192} {strip_name}"), 8.0, 180.0),
+            "FEEDS",
+            FontId::proportional(6.5),
+            FAINT,
+        );
+        p.text(
+            Pos2::new(inner.left() + 660.0, row_y + 2.0),
+            Align2::LEFT_TOP,
+            fit_text(p, &strip_name, 8.0, 150.0),
             FontId::proportional(8.0),
             DIM,
         );
