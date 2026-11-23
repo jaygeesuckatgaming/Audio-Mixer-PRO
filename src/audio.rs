@@ -27,6 +27,13 @@ const BUS_RING_FRAMES: usize = 16_384;
 /// at 512 frames: measured with one block, every bus starved a callback about
 /// once a second.
 const BUS_PREFILL_FRAMES: usize = 1024;
+/// How long a bus device may take to open before the card is told the open is
+/// wedged rather than "opening". Windows audio calls can block for minutes when
+/// the audio service is stuck, which left every card amber for the session.
+const BUS_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Retry interval after a wedged open. A normal failure retries every 3 s;
+/// a wedged one is slower because each attempt strands a thread in the call.
+const BUS_OPEN_RETRY_WEDGED: std::time::Duration = std::time::Duration::from_secs(30);
 /// What the stream callback trims the ring back to when it has grown. It used
 /// to be half the capacity (8192 frames, 170 ms), which never fired in normal
 /// use: a device clock even slightly slower than the mixer's timer let the
@@ -1751,6 +1758,9 @@ struct PendingBusGroup {
     device: String,
     buses: Vec<usize>,
     result: std::sync::mpsc::Receiver<Result<(cpal::Stream, u32), String>>,
+    /// When the open worker was started, so a call wedged inside the audio
+    /// service can be given up on instead of leaving the card amber forever.
+    started: std::time::Instant,
 }
 
 /// Group the resolved bus device names: every bus routed to the same endpoint
@@ -2343,7 +2353,21 @@ impl AudioEngine {
         while index < pending.len() {
             let finished = match pending[index].result.try_recv() {
                 Ok(result) => Some(result),
-                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // A device open that never returns is a wedged audio service,
+                    // not a slow device: give up, say so on the card, and retry
+                    // on a slow cadence so abandoned worker threads do not pile
+                    // up. Without this the card sat amber for the whole session.
+                    if now.duration_since(pending[index].started) >= BUS_OPEN_TIMEOUT {
+                        Some(Err(format!(
+                            "the output device did not open within {} s; the Windows \
+                             audio service may be wedged (restart it or reboot)",
+                            BUS_OPEN_TIMEOUT.as_secs()
+                        )))
+                    } else {
+                        None
+                    }
+                }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     Some(Err("the output worker stopped".to_string()))
                 }
@@ -2388,8 +2412,17 @@ impl AudioEngine {
                     });
                 }
                 Err(err) => {
+                    // A wedged open is retried slowly: each attempt leaves a
+                    // worker thread stuck inside the audio service, so three
+                    // seconds only stacks them up.
+                    let timed_out = err.starts_with("the output device did not open within");
                     for &b in &group.buses {
-                        self.bus_retry_at[b] = Some(now + std::time::Duration::from_secs(3));
+                        let wait = if timed_out {
+                            BUS_OPEN_RETRY_WEDGED
+                        } else {
+                            std::time::Duration::from_secs(3)
+                        };
+                        self.bus_retry_at[b] = Some(now + wait);
                         self.bus_last_error[b] = err.clone();
                         // A bus that another group already serves must keep its
                         // active flag: clearing it stopped the mixer feeding that
@@ -2492,6 +2525,7 @@ impl AudioEngine {
                 device: device.clone(),
                 buses: buses.clone(),
                 result: rx,
+                started: now,
             });
         }
         // An open whose bus was rerouted or removed is abandoned; the worker

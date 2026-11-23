@@ -30,6 +30,12 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   on one source with no cable and no offset between strips. Each strip keeps its
   own VST, fader and bus routing; switching the mirror off restores the previous
   input of every strip.
+- **A wedged device open is reported, not left amber.** If the Windows audio
+  service stops answering, a bus-device open can block for minutes. The card
+  used to sit on "opening the output ..." for the whole session; after 10 s it
+  now goes red with "the output device did not open within 10 s; the Windows
+  audio service may be wedged", and the retry backs off to every 30 s instead of
+  stacking stuck worker threads every 3 s.
 - **Buses no longer stay dark when the device list is slow.** If the output
   enumeration was wedged inside the audio service (a cable attaching, a wedged
   endpoint), the empty list made every bus resolve to "no device", so the cards
