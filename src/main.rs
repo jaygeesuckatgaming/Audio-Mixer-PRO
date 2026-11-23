@@ -1032,6 +1032,10 @@ struct MixerApp {
     player_cache: Vec<player::Track>,
     player_cache_rev: u64,
     player_status: String,
+    /// Session-only demo mode: the player also feeds every other strip.
+    player_mirror: bool,
+    /// Devices the mirrored strips had before, so switching it off restores them.
+    player_mirror_prev: Vec<(usize, String)>,
     tape_path_input: String,
     status: String,
     status_until: f64,
@@ -1615,6 +1619,8 @@ impl MixerApp {
             player_cache: Vec::new(),
             player_cache_rev: 0,
             player_status: String::new(),
+            player_mirror: false,
+            player_mirror_prev: Vec::new(),
             tape_path_input: String::new(),
             status: audio_status,
             status_until: 12.0,
@@ -7819,6 +7825,67 @@ Right click > Source to use the Windows capture stream instead."
         self.player_attached = strip;
     }
 
+    /// Feed the same decoded audio into every other active strip. Used for
+    /// demos: several plug-in windows on one source, sample-aligned, with no
+    /// cables. Each strip keeps its own VST, fader and bus routing.
+    fn set_player_mirror(&mut self, on: bool) {
+        self.ensure_player();
+        if on == self.player_mirror {
+            return;
+        }
+        let primary = self.player_attached.min(MAX_STRIPS - 1);
+        if on {
+            self.player_mirror_prev.clear();
+            let mut rings: Vec<Arc<audio::InputShared>> = Vec::new();
+            for i in 0..self.active_strips {
+                if i == primary {
+                    continue;
+                }
+                self.player_mirror_prev
+                    .push((i, self.strips[i].device.clone()));
+                let ring = Arc::new(audio::InputShared::new());
+                self.captures[i] = None;
+                self.strip_direct[i] = false;
+                self.strips[i].tape_feed = false;
+                self.strips[i].device = "PLAYER".to_string();
+                if !self.strips[i].route.iter().any(|r| *r) {
+                    self.strips[i].route[0] = true;
+                }
+                let any_solo = self
+                    .strips
+                    .iter()
+                    .take(self.active_strips)
+                    .any(|s| s.solo);
+                let s = &self.strips[i];
+                self.audio.set_strip(
+                    i, s.gain_db, s.pan, 0.0, 0.0, s.mute, s.solo, s.mono, s.route, any_solo,
+                );
+                self.audio.attach_input(i, Arc::clone(&ring));
+                rings.push(ring);
+            }
+            if let Some(player) = self.player.as_ref() {
+                player.set_targets(rings);
+            }
+            self.player_mirror = true;
+            self.toast("Player mirrored to every strip");
+        } else {
+            if let Some(player) = self.player.as_ref() {
+                player.set_targets(Vec::new());
+            }
+            let restore: Vec<(usize, String)> = self.player_mirror_prev.drain(..).collect();
+            for (i, device) in restore {
+                self.audio.detach_input(i);
+                self.captures[i] = None;
+                self.strips[i].device = device.clone();
+                if !device.is_empty() && device != "No input" && device != "PLAYER" {
+                    self.spawn_capture_open(i, device);
+                }
+            }
+            self.player_mirror = false;
+            self.toast("Player mirror off");
+        }
+    }
+
     fn player_import_playlist(&mut self) {
         self.ensure_player();
         #[cfg(windows)]
@@ -8010,6 +8077,7 @@ Right click > Source to use the Windows capture stream instead."
         let mut strip_choice = self
             .player_strip
             .min(self.active_strips.saturating_sub(1));
+        let mut mirror_wanted = self.player_mirror;
         let mut status = self.player_status.clone();
 
         let Some(player) = self.player.take() else {
@@ -8252,6 +8320,28 @@ Right click > Source to use the Windows capture stream instead."
                             .color(DIM),
                     );
                 });
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut mirror_wanted, "Mirror to every strip")
+                        .on_hover_text(
+                            "Feed the same decoded audio into every other strip's input, so a \
+                             demo can show several plug-ins on one source. Each strip keeps its \
+                             own VST, fader and bus routing.",
+                        )
+                        .changed()
+                    {
+                        // Applied after the window so the player borrow is released.
+                    }
+                    ui.label(
+                        egui::RichText::new(if self.player_mirror {
+                            "on: all strips play this source"
+                        } else {
+                            "for demos: same source into every strip"
+                        })
+                        .size(9.0)
+                        .color(DIM),
+                    );
+                });
             });
 
         self.player = Some(player);
@@ -8264,7 +8354,15 @@ Right click > Source to use the Windows capture stream instead."
         }
         if strip_choice != self.player_strip {
             self.player_strip = strip_choice;
+            if self.player_mirror {
+                self.set_player_mirror(false);
+            }
             self.sync_player_strip(true);
+            if mirror_wanted {
+                self.set_player_mirror(true);
+            }
+        } else if mirror_wanted != self.player_mirror {
+            self.set_player_mirror(mirror_wanted);
         }
         if let Some(action) = action {
             self.player_action(action);

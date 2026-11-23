@@ -411,6 +411,8 @@ impl Program {
 pub struct Player {
     shared: Arc<Shared>,
     input: Arc<InputShared>,
+    /// Extra strip rings fed with the same decoded audio (demo/mirror mode).
+    targets: Arc<Mutex<Vec<Arc<InputShared>>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -419,18 +421,21 @@ impl Player {
     pub fn new(input: Arc<InputShared>) -> Self {
         let shared = Arc::new(Shared::new());
         let stop = Arc::new(AtomicBool::new(false));
+        let targets: Arc<Mutex<Vec<Arc<InputShared>>>> = Arc::new(Mutex::new(Vec::new()));
         let thread = {
             let shared = Arc::clone(&shared);
             let input = Arc::clone(&input);
             let stop = Arc::clone(&stop);
+            let targets = Arc::clone(&targets);
             std::thread::Builder::new()
                 .name("mixer-player".to_string())
-                .spawn(move || worker(shared, input, stop))
+                .spawn(move || worker(shared, input, targets, stop))
                 .ok()
         };
         Self {
             shared,
             input,
+            targets,
             stop,
             thread,
         }
@@ -438,6 +443,13 @@ impl Player {
 
     pub fn input(&self) -> Arc<InputShared> {
         Arc::clone(&self.input)
+    }
+
+    /// Feed the same decoded audio into these extra strip rings as well.
+    /// Each ring is consumed by its own strip reader, so every strip sees the
+    /// identical sample stream at the same moment.
+    pub fn set_targets(&self, targets: Vec<Arc<InputShared>>) {
+        *lock(&self.targets) = targets;
     }
 
     // --- transport -------------------------------------------------------
@@ -622,7 +634,12 @@ impl Drop for Player {
 // Worker
 // ---------------------------------------------------------------------------
 
-fn worker(shared: Arc<Shared>, input: Arc<InputShared>, stop: Arc<AtomicBool>) {
+fn worker(
+    shared: Arc<Shared>,
+    input: Arc<InputShared>,
+    targets: Arc<Mutex<Vec<Arc<InputShared>>>>,
+    stop: Arc<AtomicBool>,
+) {
     let mut program: Option<Program> = None;
     let mut program_generation = 0u64;
     let mut buf: Vec<[f32; 2]> = Vec::with_capacity(PUSH_BLOCK);
@@ -764,7 +781,13 @@ fn worker(shared: Arc<Shared>, input: Arc<InputShared>, stop: Arc<AtomicBool>) {
         // Feed the ring only while it is below the input reader's high-water
         // mark (it slips frames above 40 ms), so the cushion lives here.
         let ring_target = (rate_now * RING_TARGET_MS as usize / 1000).max(256);
-        if !pending.is_empty() && input.ring_fill() < ring_target {
+        let mirrors = lock(&targets).clone();
+        let fill = mirrors
+            .iter()
+            .fold(input.ring_fill(), |deepest, target| {
+                deepest.max(target.ring_fill())
+            });
+        if !pending.is_empty() && fill < ring_target {
             let take = pending.len().min(PUSH_BLOCK);
             let mut chunk: Vec<[f32; 2]> = Vec::with_capacity(take);
             for _ in 0..take {
@@ -774,6 +797,10 @@ fn worker(shared: Arc<Shared>, input: Arc<InputShared>, stop: Arc<AtomicBool>) {
             }
             input.set_rate(rate_now as u32);
             input.push_block(&chunk);
+            for mirror in &mirrors {
+                mirror.set_rate(rate_now as u32);
+                mirror.push_block(&chunk);
+            }
             let played = input.played_frames().saturating_sub(played_base);
             let ms = position_base_ms + (played as f64 * 1000.0 / rate_now as f64) as u64;
             shared.position_ms.store(ms, Ordering::Relaxed);
