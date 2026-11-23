@@ -5227,20 +5227,28 @@ fn path_delay_ms(
         let help_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
         bx -= 28.0;
         let lock_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
+        // A narrow window cannot hold the scene badge and the three panel
+        // buttons at their full positions, so below this width the badge is
+        // dropped and CABLES / DUCKING / PLAYER move into its space. That
+        // leaves the strip between PLAYER and the window controls free for the
+        // build label and the status message (at zoom 1.6 the window saved at
+        // 1376 px is only 860 points wide, which is exactly this case).
+        let compact = rect.width() < 1000.0;
+        let panel_shift = if compact { -120.0 } else { 0.0 };
         let cables_hit = Rect::from_min_size(
-            Pos2::new(rect.left() + 420.0, rect.top() + 7.0),
+            Pos2::new(rect.left() + 420.0 + panel_shift, rect.top() + 7.0),
             Vec2::new(70.0, 24.0),
         );
         // Ducking sits next to CABLES: both are processing panels for the
         // virtual devices rather than scene/window controls.
         let ducking_hit = Rect::from_min_size(
-            Pos2::new(rect.left() + 494.0, rect.top() + 7.0),
+            Pos2::new(rect.left() + 494.0 + panel_shift, rect.top() + 7.0),
             Vec2::new(76.0, 24.0),
         );
         // The player follows Ducking: another processing panel, not a window
         // control.
         let player_hit = Rect::from_min_size(
-            Pos2::new(rect.left() + 576.0, rect.top() + 7.0),
+            Pos2::new(rect.left() + 576.0 + panel_shift, rect.top() + 7.0),
             Vec2::new(70.0, 24.0),
         );
         let button_hits = [
@@ -5304,16 +5312,18 @@ fn path_delay_ms(
             self.show_vban = true;
         }
 
-        // preset / scene badge
-        let badge = Rect::from_min_size(Pos2::new(rect.left() + 300.0, rect.top() + 9.0), Vec2::new(112.0, 20.0));
-        p.rect_filled(badge, 3.0, Color32::from_rgb(25, 29, 36));
-        p.text(
-            badge.center(),
-            Align2::CENTER_CENTER,
-            format!("SCENE: {}", self.preset_active.to_uppercase()),
-            FontId::proportional(8.0),
-            DIM,
-        );
+        // preset / scene badge (hidden when the window is too narrow for it)
+        if !compact {
+            let badge = Rect::from_min_size(Pos2::new(rect.left() + 300.0, rect.top() + 9.0), Vec2::new(112.0, 20.0));
+            p.rect_filled(badge, 3.0, Color32::from_rgb(25, 29, 36));
+            p.text(
+                badge.center(),
+                Align2::CENTER_CENTER,
+                format!("SCENE: {}", self.preset_active.to_uppercase()),
+                FontId::proportional(8.0),
+                DIM,
+            );
+        }
 
         let cables_rect = cables_hit;
         if top_button(ui, cables_rect, "CABLES", self.show_vc, AMBER) {
@@ -5329,23 +5339,37 @@ fn path_delay_ms(
             self.ensure_player();
         }
 
-        // Build identity, left of the seven window-control buttons (each 24 wide
-        // with a 28 gap): clear of the A / R buttons.
-        let build_rect = Rect::from_min_size(
-            Pos2::new(rect.right() - 318.0, rect.top() + 7.0),
-            Vec2::new(80.0, 24.0),
-        );
-        p.text(
-            Pos2::new(build_rect.right(), rect.top() + 12.0),
-            Align2::RIGHT_TOP,
-            BUILD,
-            FontId::proportional(8.0),
-            FAINT,
-        );
-        let build_tip = format!("Audio Mixer PRO {BUILD_FULL}");
-        let _ = ui
-            .interact(build_rect, Id::new("build_label"), Sense::hover())
-            .on_hover_text(build_tip);
+        // Build identity. The width is measured instead of assumed: the label
+        // goes just left of the window controls, and is skipped when that band
+        // is too small for it (narrow window or a large UI zoom).
+        let build_font = FontId::proportional(8.0);
+        let build_width = p
+            .layout_no_wrap(BUILD.to_string(), build_font.clone(), FAINT)
+            .size()
+            .x;
+        let controls_left = rect.right() - 144.0;
+        let build_right = controls_left - 8.0;
+        let build_left = build_right - build_width;
+        let show_build = build_left >= player_hit.right() + 8.0;
+        let mut status_right = controls_left - 8.0;
+        if show_build {
+            p.text(
+                Pos2::new(build_right, rect.top() + 12.0),
+                Align2::RIGHT_TOP,
+                BUILD,
+                build_font,
+                FAINT,
+            );
+            let build_rect = Rect::from_min_size(
+                Pos2::new(build_left - 4.0, rect.top() + 7.0),
+                Vec2::new(build_width + 8.0, 24.0),
+            );
+            let build_tip = format!("Audio Mixer PRO {BUILD_FULL}");
+            let _ = ui
+                .interact(build_rect, Id::new("build_label"), Sense::hover())
+                .on_hover_text(build_tip);
+            status_right = build_left - 8.0;
+        }
 
         // right-hand status boxes
         let mut x = rect.right() - 8.0;
@@ -5379,20 +5403,25 @@ fn path_delay_ms(
 
         // transient status message
         if self.time < self.status_until && !self.status.is_empty() {
-            // Keep clear of CABLES, DUCKING and PLAYER so a transient message
-            // never hides the panel buttons next to them.
-            let srect = Rect::from_min_size(
-                Pos2::new(rect.left() + 654.0, rect.top() + 8.0),
-                Vec2::new(182.0, 22.0),
-            );
-            p.rect_filled(srect, 3.0, Color32::from_rgb(36, 44, 38));
-            p.text(
-                srect.center(),
-                Align2::CENTER_CENTER,
-                fit_text(p, &self.status, 9.5, 174.0),
-                FontId::proportional(9.5),
-                Color32::from_rgb(190, 220, 180),
-            );
+            // Between PLAYER and whatever sits on the right (the build label
+            // when it fits, otherwise the window controls). A transient message
+            // is dropped rather than drawn over a button when there is no room.
+            let left = player_hit.right() + 8.0;
+            let width = (status_right - left).min(182.0);
+            if width >= 96.0 {
+                let srect = Rect::from_min_size(
+                    Pos2::new(left, rect.top() + 8.0),
+                    Vec2::new(width, 22.0),
+                );
+                p.rect_filled(srect, 3.0, Color32::from_rgb(36, 44, 38));
+                p.text(
+                    srect.center(),
+                    Align2::CENTER_CENTER,
+                    fit_text(p, &self.status, 9.5, width - 8.0),
+                    FontId::proportional(9.5),
+                    Color32::from_rgb(190, 220, 180),
+                );
+            }
         }
     }
 
