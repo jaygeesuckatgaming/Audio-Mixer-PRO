@@ -77,43 +77,18 @@ const CMD_AUTO_RESTART_ALL: u32 = 69; // 0x45
 const FADER_TRAVEL_DB: f32 = 72.0; // 0x56de70 (f64)
 const STRIP_FADER_PAD: f32 = 64.0; // FUN_00541ce0, controls 0xd4-0xd8
 const BUS_FADER_PAD: f32 = 56.0; // FUN_00541ce0, controls 0xd9-0xdd
-// Knobs (pan / EQ / compressor / gate) step 0.1 per pixel, 0x56dba0.
-const KNOB_STEP_PER_PX: f32 = 0.1;
 // L/R PAN control range, FUN_00530520 -> 0x56dbe8 / 0x56dbe4.
 const PAN_MIN: f32 = -0.5;
 const PAN_MAX: f32 = 0.5;
-// FUN_0052b490 reads three audibility fields and clamps each to 0..10
-// (0x56dce8): +0x30 "audibility", +0x34 "audibility_c" (the COMP knob) and
-// +0x38 "audibility_g" (the GATE knob). FUN_00530520 gives controls
-// 0x4ba-0x4bc and 0x4c4-0x4c6 that same 0..10 range.
-const AUDIBILITY_MIN: f32 = 0.0;
-const AUDIBILITY_MAX: f32 = 10.0; // 0x56dce8
 // FUN_0052b490 clamps the three virtual-input EQ bands to -12..+12 dB
 // (0x56de68 and 0x56db6c).
 const EQ_GAIN_MIN: f32 = -12.0; // 0x56de68
 const EQ_GAIN_MAX: f32 = 12.0; // 0x56db6c
-// FUN_00541ce0 controls 0x114-0x116 (the hardware 3D panel this rebuild
-// draws): the 143 x 128 control keeps a 14 px inset on each side and a 15 px
-// bottom / 25 px top inset (height - 40). X maps to -0.5..+0.5 and Y to 0..1:
-//   x = (px - rect.x - 14) / (rect.w - 28) - 0.5
-//   y = (rect.bottom - py - 15) / (rect.h - 40)
-// FUN_00541510 resets the active pair to (0,0), i.e. bottom centre, not the
-// middle. The separate virtual-strip pads 0x123/0x124 use an 8 px inset and
-// map BOTH axes to -0.5..+0.5 over 59 x 52 px.
+// The original's pan panel mapped X to -0.5..+0.5 (0x56dbe8 / 0x56dbe4). Only
+// the pan axis survives here; the colour and modulation pads it used to share
+// the field with are gone.
 const PANEL_X_MIN: f32 = -0.5; // 0x56dbe8
 const PANEL_X_MAX: f32 = 0.5; // 0x56dbe4
-const PANEL_Y_MIN: f32 = -0.5; // virtual pads 0x123/0x124
-const PANEL_Y_MAX: f32 = 0.5; // virtual pads 0x123/0x124
-const PANEL3D_Y_MIN: f32 = 0.0; // hardware panel 0x114-0x116
-const PANEL3D_Y_MAX: f32 = 1.0;
-const PANEL_W: f32 = 143.0; // panel rect 0x57cd54 (x=7, y=129)
-const PANEL_H: f32 = 128.0;
-const PANEL_X_INSET: f32 = 14.0; // (rect.w - 28) leaves 115 px of travel
-const PANEL_Y_TOP_INSET: f32 = 25.0; // (rect.h - 40) leaves 88 px
-const PANEL_Y_BOTTOM_INSET: f32 = 15.0;
-// The virtual-strip pads (controls 0x123/0x124) use an 8 px inset over a
-// 59 x 52 px control; this rebuild has no virtual pad, so that branch is
-// recorded in MECHANICS.md rather than drawn.
 // Brickwall limiter: -40 dB minimum (0x56dd30) and +12 dB maximum
 // (0x56db6c). FUN_00541ce0's dedicated limiter controls 0x96-0x98 use 60 dB
 // of travel over their 60 px control (0x56df58 / 0x57c7e8). The six meter
@@ -172,53 +147,6 @@ const VU_RELEASE_S: f32 = 0.18;
 const VU_MAX_RISE_DB_S: f32 = 240.0;
 const VU_MAX_FALL_DB_S: f32 = 200.0;
 const METER_PEAK_FALL_DB_S: f32 = 18.0;
-
-// FUN_00538fa0 writes the strip dynamics block and shows where the DSP
-// fields live inside the 0x7c-byte strip record:
-//   compressor +0x3c gainin, +0x40 attack, +0x44 release, +0x48 knee,
-//              +0x4c comprate, +0x50 threshold, +0x58 automakeup,
-//              +0x5c gainout
-//   gate       +0x60 thresin, +0x64 damping, +0x68 bpsidechain,
-//              +0x6c attack, +0x70 hold, +0x74 release
-// FUN_0052b490 reads every other strip field but never these blocks, and the
-// file has no "StripComp"/"StripGate" element-name string outside the writer,
-// so in 2.1.2.2 the dynamics values are engine-fixed. The compressor preset
-// copied by FUN_00541510 comes from 0x584abc (nine dwords):
-const COMP_GAININ_DB: f32 = 0.0; // 0x584abc
-const COMP_ATTACK_MS: f32 = 10.0; // 0x584ac0
-const COMP_RELEASE_MS: f32 = 50.0; // 0x584ac4
-const COMP_KNEE: f32 = 0.5; // 0x584ac8
-const COMP_RATIO: f32 = 1.0; // 0x584acc
-const COMP_THRESHOLD_DB: f32 = -40.0; // 0x584ad0
-const COMP_AUTOMAKEUP: u32 = 1; // 0x584ad8
-const COMP_GAINOUT_DB: f32 = 0.0; // 0x584adc
-// Gate fields as written by FUN_00538fa0. The installed scene uses these
-// values; the 0..10 knob is audibility_g, not the gate threshold.
-const GATE_THRESHOLD_DB: f32 = -60.0;
-const GATE_DAMPING_DB: f32 = -60.0;
-const GATE_SIDECHAIN_PCT: f32 = 100.0;
-const GATE_ATTACK_MS: f32 = 20.0;
-const GATE_HOLD_MS: f32 = 200.0;
-const GATE_RELEASE_MS: f32 = 1250.0;
-
-// FUN_0052cd90 (the RecordParam reader) accepts only these values. It shifts
-// BitRes right by 3 and keeps 1..4, caps preRecTime at DAT_0057c6e8 (= 20),
-// and treats any nbChannel other than 4/6/8 as 2.
-const REC_FILE_TYPES: [i32; 4] = [1, 2, 3, 100];
-const REC_BIT_DEPTHS: [u32; 4] = [8, 16, 24, 32];
-const REC_TARGET_RATES: [u32; 9] = [
-    22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000,
-];
-const REC_CHANNELS: [u32; 4] = [2, 4, 6, 8];
-const REC_KBPS: [u32; 14] = [
-    32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
-];
-const REC_PRE_REC_MAX_S: i32 = 20; // DAT_0057c6e8
-// Default recorder values used by the console.
-const REC_FILE_TYPE: i32 = 3;
-const REC_BIT_DEPTH: u32 = 16;
-const REC_KBPS_DEFAULT: u32 = 192;
-const REC_PRE_REC_DEFAULT: i32 = 0;
 
 // FUN_00527ad0 accepts exactly these main-stream rates (32000, 0xac44,
 // 48000, 0x15888, 96000, 0x2b110, 0x2ee00) and rejects a main buffer above
@@ -418,31 +346,12 @@ struct Strip {
     device: String,
     gain_db: f32,
     pan: f32,
-    comp: f32,
-    gate: f32,
-    /// FUN_0052b490 / FUN_00528b40 strip flags 0x10 (`prg_c`) and 0x20
-    /// (`prg_g`): the engine's "compressor / gate program active" bits.
-    /// FUN_00528410 clears them whenever the matching knob is adjusted and
-    /// FUN_00541510 clears them on double click, so they only survive a
-    /// scene load untouched.
-    comp_prg: bool,
-    gate_prg: bool,
     limit: f32,
     eq: [f32; 3],
-    intelli: [f32; 2],
-    /// FUN_0052b490 "paneltype": 0 = Pan (0x100000 clear, 0x200000 clear),
-    /// 1 = Color (flag 0x100000), 2 = Mod/Fx (flag 0x200000).
-    panel_type: u8,
-    /// +0x10 / +0x14 ColorPanelx / ColorPanely (x -0.5..+0.5, y 0..1).
-    color_panel: [f32; 2],
-    /// +0x18 / +0x1c ModPanelx / ModPanely (x -0.5..+0.5, y 0..1).
-    mod_panel: [f32; 2],
     route: [bool; audio::MAX_BUSES],
     mute: bool,
     solo: bool,
     mono: bool,
-    mc: bool,
-    karaoke: u8,
     /// Virtual Input 1 meters the tape deck while it keeps its original
     /// "Virtual 1 (VAIO)" device; choosing a Windows endpoint or "No input"
     /// turns this off.
@@ -484,22 +393,12 @@ impl Strip {
             },
             gain_db: 0.0,
             pan: 0.0,
-            comp: 0.0,
-            gate: 0.0,
-            comp_prg: false,
-            gate_prg: false,
             limit: 12.0,
             eq: [0.0, 0.0, 0.0],
-            intelli: [0.0, 0.0],
-            panel_type: 0,
-            color_panel: [0.0, 0.0],
-            mod_panel: [0.0, 0.0],
             route,
             mute: false,
             solo: false,
             mono: false,
-            mc: false,
-            karaoke: 0,
             tape_feed: i == 3,
             meter: 0.0,
             peak: 0.0,
@@ -613,22 +512,12 @@ impl StripInput {
 struct StripClip {
     gain_db: f32,
     pan: f32,
-    comp: f32,
-    gate: f32,
-    comp_prg: bool,
-    gate_prg: bool,
     limit: f32,
     eq: [f32; 3],
-    intelli: [f32; 2],
-    panel_type: u8,
-    color_panel: [f32; 2],
-    mod_panel: [f32; 2],
     route: [bool; audio::MAX_BUSES],
     mute: bool,
     solo: bool,
     mono: bool,
-    mc: bool,
-    karaoke: u8,
 }
 
 impl StripClip {
@@ -638,22 +527,12 @@ impl StripClip {
         StripClip {
             gain_db: s.gain_db,
             pan: s.pan,
-            comp: s.comp,
-            gate: s.gate,
-            comp_prg: s.comp_prg,
-            gate_prg: s.gate_prg,
             limit: s.limit,
             eq: s.eq,
-            intelli: s.intelli,
-            panel_type: s.panel_type,
-            color_panel: s.color_panel,
-            mod_panel: s.mod_panel,
             route: s.route,
             mute: s.mute,
             solo: s.solo,
             mono: s.mono,
-            mc: s.mc,
-            karaoke: s.karaoke,
         }
     }
 
@@ -661,22 +540,12 @@ impl StripClip {
     fn apply(self, s: &mut Strip) {
         s.gain_db = self.gain_db;
         s.pan = self.pan;
-        s.comp = self.comp;
-        s.gate = self.gate;
-        s.comp_prg = self.comp_prg;
-        s.gate_prg = self.gate_prg;
         s.limit = self.limit;
         s.eq = self.eq;
-        s.intelli = self.intelli;
-        s.panel_type = self.panel_type;
-        s.color_panel = self.color_panel;
-        s.mod_panel = self.mod_panel;
         s.route = self.route;
         s.mute = self.mute;
         s.solo = self.solo;
         s.mono = self.mono;
-        s.mc = self.mc;
-        s.karaoke = self.karaoke;
     }
 }
 
@@ -696,9 +565,6 @@ struct Bus {
     mute: bool,
     mono: u8,
     eq_on: bool,
-    sel: bool,
-    monitor: bool,
-    mode: usize,
     meter: f32,
     peak: f32,
     hold: f32,
@@ -734,9 +600,6 @@ impl Bus {
             mute: false,
             mono: 0,
             eq_on: false,
-            sel: false,
-            monitor: false,
-            mode: 0,
             meter: 0.0,
             peak: 0.0,
             hold: 0.0,
@@ -747,7 +610,6 @@ impl Bus {
 
 struct Tape {
     playing: bool,
-    recording: bool,
     pos: f32,
     len: f32,
     file: String,
@@ -759,24 +621,12 @@ struct Tape {
     route: [bool; audio::MAX_BUSES],
     /// RecordMode Loop: restart at the end instead of stopping.
     loop_playback: bool,
-    /// <RecordParam> values, read with FUN_0052cd90's acceptance rules.
-    rec_file_type: i32,
-    rec_bit_depth: u32,
-    rec_target_sr: u32,
-    rec_channels: u32,
-    rec_kbps: u32,
-    rec_pre_rec: i32,
-    /// <RecordMode TimerStop>: a non-negative second count, not a flag.
-    timer_stop: i32,
-    /// <RecordArm> bits: ArmIn1-8 in 0..7, ArmBus1-8 in 16..23.
-    arm: u32,
 }
 
 impl Tape {
     fn new() -> Self {
         Tape {
             playing: false,
-            recording: false,
             pos: 0.0,
             len: 252.0,
             file: "No file loaded - click to choose".to_string(),
@@ -785,14 +635,6 @@ impl Tape {
             gain_db: 0.0,
             route: [true, false, false, false, false, false],
             loop_playback: false,
-            rec_file_type: REC_FILE_TYPE,
-            rec_bit_depth: REC_BIT_DEPTH,
-            rec_target_sr: 48_000,
-            rec_channels: 2,
-            rec_kbps: REC_KBPS_DEFAULT,
-            rec_pre_rec: REC_PRE_REC_DEFAULT,
-            timer_stop: 0,
-            arm: 0,
         }
     }
 }
@@ -914,11 +756,9 @@ struct MixerApp {
     output_types: [i32; audio::MAX_BUSES],
     /// `<OutputDev pOut1..pOut8>` for an unassigned output (name "-").
     output_patch: [[i32; 8]; audio::MAX_BUSES],
-    engine_mode: usize,
     /// A1 is the console clock reference (A1 output device's clock).
     a1_master: bool,
     limit_remote: bool,
-    monitor_on_sel: bool,
     lock_gui: bool,
     help_caption: bool,
     menu_open: bool,
@@ -1022,8 +862,6 @@ struct MixerApp {
     /// (FUN_00538860 commands 0x262 and 0x26c).
     strip_clip: Option<StripClip>,
     tape_error: Option<String>,
-    tape_info: Option<String>,
-    tape_recent: Vec<PathBuf>,
     /// Internal streaming player: playlist, gapless playback and crossfade.
     /// It pushes decoded frames into the same ring a capture uses, so its strip
     /// gets the full channel strip (fader, EQ, dynamics, VST, insert, buses).
@@ -1041,7 +879,6 @@ struct MixerApp {
     player_mirror: bool,
     /// Devices the mirrored strips had before, so switching it off restores them.
     player_mirror_prev: Vec<(usize, String)>,
-    tape_path_input: String,
     status: String,
     status_until: f64,
     time: f64,
@@ -1535,10 +1372,8 @@ impl MixerApp {
             input_types: [DEVICE_TYPE_WDM; 3],
             output_types: [DEVICE_TYPE_WDM; audio::MAX_BUSES],
             output_patch: [[0; 8]; audio::MAX_BUSES],
-            engine_mode: 0,
             a1_master: false,
             limit_remote: false,
-            monitor_on_sel: false,
             lock_gui: false,
             help_caption: true,
             menu_open: false,
@@ -1613,8 +1448,6 @@ impl MixerApp {
             label_buf: String::new(),
             strip_clip: None,
             tape_error: None,
-            tape_info: None,
-            tape_recent: Vec::new(),
             player: None,
             player_strip: MAX_STRIPS - 1,
             player_attached: usize::MAX,
@@ -1624,7 +1457,6 @@ impl MixerApp {
             player_status: String::new(),
             player_mirror: false,
             player_mirror_prev: Vec::new(),
-            tape_path_input: String::new(),
             status: audio_status,
             status_until: 12.0,
             time: 0.0,
@@ -1721,7 +1553,7 @@ impl MixerApp {
         if std::env::args().any(|a| a == "--bus-demo") {
             app.tape.route = [false, false, false, true, true, false];
             app.select_demo(DemoKind::Track1);
-            app.on_transport(Transport::Play);
+            app.play_tape();
         }
         // Diagnostic: add virtual input strips at startup
         // (`--add-virtual-inputs N`, up to the strip limit).
@@ -2415,12 +2247,6 @@ fn path_delay_ms(
         }
     }
 
-    fn push_recent(&mut self, path: &Path) {
-        self.tape_recent.retain(|p| p != path);
-        self.tape_recent.insert(0, path.to_path_buf());
-        self.tape_recent.truncate(6);
-    }
-
     fn select_demo(&mut self, kind: DemoKind) {
         self.audio.load_demo(kind);
         self.tape.demo = Some(kind);
@@ -2429,9 +2255,7 @@ fn path_delay_ms(
         self.tape.len = audio::DEMO_LEN_SECS;
         self.tape.pos = 0.0;
         self.tape.playing = false;
-        self.tape.recording = false;
         self.tape_error = None;
-        self.tape_info = Some("built-in generated track".to_string());
         if self.audio.available {
             self.toast(format!("{} selected - press Play", kind.file_name()));
         } else {
@@ -2455,10 +2279,7 @@ fn path_delay_ms(
                 self.tape.len = info.duration.max(0.1);
                 self.tape.pos = 0.0;
                 self.tape.playing = false;
-                self.tape.recording = false;
                 self.tape_error = None;
-                self.tape_info = Some(info.detail());
-                self.push_recent(&path);
                 if self.audio.available {
                     self.toast(format!(
                         "Loaded {} ({}) - press Play",
@@ -2472,7 +2293,6 @@ fn path_delay_ms(
             }
             Err(err) => {
                 self.tape_error = Some(format!("{display}: {err}"));
-                self.tape_info = None;
                 self.toast_for(format!("Could not load {display}: {err}"), 9.0);
                 false
             }
@@ -2491,14 +2311,6 @@ fn path_delay_ms(
         if self.tape.playing {
             self.audio.play();
         }
-    }
-
-    fn eject_tape(&mut self) {
-        self.audio.unload();
-        self.tape = Tape::new();
-        self.tape_error = None;
-        self.tape_info = None;
-        self.toast("Cassette ejected - audio file released");
     }
 
     fn sync_audio_controls(&mut self) {
@@ -3462,10 +3274,9 @@ fn path_delay_ms(
                 i - 2
             ));
         }
-        text.push_str(&format!(
-            "\t<VMOptions MonitorOnSEL='{}' SliderRelative='0' />\n",
-            self.monitor_on_sel as u8
-        ));
+        // <VMOptions> is not written any more: MonitorOnSEL went with the
+        // "Monitor on BUS SEL" option and nothing else in it was used.
+
         for (i, s) in self.strips.iter().take(self.active_strips).enumerate() {
             // FUN_00528b40 bit layout: mute 0x1, solo 0x2, mono 0x4,
             // muc 0x8, prg_c 0x10, prg_g 0x20, busa 0x1000, busa2 0x2000,
@@ -3479,16 +3290,6 @@ fn path_delay_ms(
             }
             if s.mono {
                 flags |= 0x4;
-            }
-            if s.mc {
-                flags |= 0x8;
-            }
-            // FUN_00528b40 emits prg_c from bit 0x10 and prg_g from bit 0x20.
-            if s.comp_prg {
-                flags |= 0x10;
-            }
-            if s.gate_prg {
-                flags |= 0x20;
             }
             if s.route[0] {
                 flags |= 0x1000;
@@ -3531,33 +3332,19 @@ fn path_delay_ms(
                     0
                 }
             ));
-            if i < 3 {
-                // FUN_00528b40 hardware strip format (0x569b60): all three
-                // panel pairs are absolute fields selected by paneltype.
-                text.push_str(&format!(
-                    "\t<Strip index='{}' paneltype='{}' Panel3Dx='{:.3}' Panel3Dy='{:.3}' ColorPanelx='{:.3}' ColorPanely='{:.3}' ModPanelx='{:.3}' ModPanely='{:.3}' audibility_c='{:.2}' audibility_g='{:.2}' />\n",
-                    i + 1,
-                    s.panel_type,
-                    s.intelli[0],
-                    s.intelli[1],
-                    s.color_panel[0],
-                    s.color_panel[1],
-                    s.mod_panel[0],
-                    s.mod_panel[1],
-                    s.comp,
-                    s.gate
-                ));
-            } else {
-                text.push_str(&format!(
-                    "\t<Strip index='{}' EQGain1='{:.2}' EQGain2='{:.2}' EQGain3='{:.2}' Panel3Dx='{:.3}' Panel3Dy='{:.3}' />\n",
-                    i + 1, s.eq[0], s.eq[1], s.eq[2], s.intelli[0], s.intelli[1]
-                ));
-            }
+            // Panel3Dx is the field the original console stored the strip's
+            // pan in, so it is still written to keep pan across a reload. The
+            // other legacy panel pairs, the paneltype selector and the
+            // compressor/gate knobs (audibility_c/g) are gone.
+            text.push_str(&format!(
+                "\t<Strip index='{}' Panel3Dx='{:.3}' Panel3Dy='0.000' />\n",
+                i + 1, s.pan
+            ));
         }
         for (i, b) in self.buses.iter().enumerate() {
             // FUN_00528b40 bus bits: mute 0x1, vaio 0x40000000, mono 0x4,
-            // cross 0x200, BusMode nibble at 4, EQon 0x100, SEL 0x1c000000,
-            // monitor 0x20000000.
+            // cross 0x200, EQon 0x100. BusMode, SEL and monitor are no longer
+            // exposed or written; the loader still ignores them if present.
             let mut flags: u32 = 0;
             if b.mute {
                 flags |= 0x1;
@@ -3571,27 +3358,17 @@ fn path_delay_ms(
             if b.mono == 2 {
                 flags |= 0x200;
             }
-            flags |= ((b.mode as u32) & 0xf) << 4;
             if b.eq_on {
                 flags |= 0x100;
             }
-            if b.sel {
-                flags |= 0x1000_0000;
-            }
-            if b.monitor {
-                flags |= 0x2000_0000;
-            }
             text.push_str(&format!(
-                "\t<Bus index='{}' mute='{}' vaio='{}' mono='{}' cross='{}' BusMode='{}' EQon='{}' SEL='{}' monitor='{}' dblevel='{:.2}' />\n",
+                "\t<Bus index='{}' mute='{}' vaio='{}' mono='{}' cross='{}' EQon='{}' dblevel='{:.2}' />\n",
                 i + 1,
                 flags & 1,
                 (flags >> 30) & 1,
                 if b.mono == 1 { 1 } else { 0 },
                 if b.mono == 2 { 1 } else { 0 },
-                (flags >> 4) & 0xf,
                 (flags >> 8) & 1,
-                (flags >> 28) & 1,
-                (flags >> 29) & 1,
                 b.gain_db
             ));
         }
@@ -3645,35 +3422,12 @@ fn path_delay_ms(
         text.push_str("</AudioMixerProParameters>\n");
         text.push_str("<AudioMixerProRecorder>\n");
         // The tape deck's end-of-file action is the recorder Loop flag
-        // (0x02000000, FUN_0052cd90 / FUN_0054bde0).
+        // (0x02000000, FUN_0052cd90 / FUN_0054bde0); it is the only recorder
+        // setting still used. The record arm, format and pre-record elements
+        // are not written any more: there is no recorder to arm.
         text.push_str(&format!(
-            "\t<RecordMode RecBus='0' DontPlay='0' Loop='{}' MultiTrack='0' TimerStop='{}' />\n",
-            self.tape.loop_playback as u8, self.tape.timer_stop
-        ));
-        // FUN_00529c80 writes only the first five input and first five bus
-        // arm bits even though FUN_0052cd90 reads eight of each.
-        let arm = self.tape.arm;
-        text.push_str(&format!(
-            "\t<RecordArm ArmIn1='{}' ArmIn2='{}' ArmIn3='{}' ArmIn4='{}' ArmIn5='{}' ArmBus1='{}' ArmBus2='{}' ArmBus3='{}' ArmBus4='{}' ArmBus5='{}' />\n",
-            arm & 1,
-            (arm >> 1) & 1,
-            (arm >> 2) & 1,
-            (arm >> 3) & 1,
-            (arm >> 4) & 1,
-            (arm >> 16) & 1,
-            (arm >> 17) & 1,
-            (arm >> 18) & 1,
-            (arm >> 19) & 1,
-            (arm >> 20) & 1
-        ));
-        text.push_str(&format!(
-            "\t<RecordParam FileType='{}' BitRes='{}' TargetSR='{}' nbChannel='{}' kbps='{}' preRecTime='{}' />\n",
-            self.tape.rec_file_type,
-            self.tape.rec_bit_depth,
-            self.tape.rec_target_sr,
-            self.tape.rec_channels,
-            self.tape.rec_kbps,
-            self.tape.rec_pre_rec
+            "\t<RecordMode Loop='{}' />\n",
+            self.tape.loop_playback as u8
         ));
         text.push_str("</AudioMixerProRecorder>\n");
         // Rebuild extension for state the original keeps in the registry
@@ -3685,12 +3439,11 @@ fn path_delay_ms(
             _ => "custom",
         };
         text.push_str(&format!(
-            "<AppOptions sampleRate='{}' buffer='{}' mainBuffer='{}' latencyProfile='{}' engine='{}' a1master='{}' limitRemote='{}' lock='{}' autoRestart='{}' autoRestartAll='{}' helpCaption='{}' loadOnStartup='{}' saveOnExit='{}' presetOnStartup='{}' />\n",
+            "<AppOptions sampleRate='{}' buffer='{}' mainBuffer='{}' latencyProfile='{}' a1master='{}' limitRemote='{}' lock='{}' autoRestart='{}' autoRestartAll='{}' helpCaption='{}' loadOnStartup='{}' saveOnExit='{}' presetOnStartup='{}' />\n",
             self.sample_rate,
             self.buffer,
             self.main_buffer,
             latency_profile,
-            self.engine_mode,
             self.a1_master as u8,
             self.limit_remote as u8,
             self.lock_gui as u8,
@@ -3771,12 +3524,6 @@ fn path_delay_ms(
             route,
             xml_escape(&self.tape.path)
         ));
-        for path in self.tape_recent.iter().take(6) {
-            text.push_str(&format!(
-                "<TapeRecent>{}</TapeRecent>\n",
-                xml_escape(&path.display().to_string())
-            ));
-        }
         // Rebuild extension: the internal streaming player. A scene without it
         // still loads; the element is simply absent.
         {
@@ -4276,13 +4023,13 @@ fn path_delay_ms(
                 if let Some(index) = self.startup_demo.take() {
                     if let Some(kind) = DemoKind::from_index(index) {
                         self.select_demo(kind);
-                        self.on_transport(Transport::Play);
+                        self.play_tape();
                     }
                 }
                 if std::env::args().any(|arg| arg == "--bus-demo") {
                     self.tape.route = [false, false, false, true, true, false];
                     self.select_demo(DemoKind::Track1);
-                    self.on_transport(Transport::Play);
+                    self.play_tape();
                 }
                 self.startup_step = StartupStep::Done;
                 diag_log("startup: done");
@@ -4349,8 +4096,6 @@ fn path_delay_ms(
         self.pending_auto_assign.clear();
         let mut tape_path = String::new();
         let mut tape_demo: i32 = -1;
-        let mut recent: Vec<(usize, PathBuf)> = Vec::new();
-        let mut recent_order = 0usize;
 
         // A scene may add virtual inputs past the original five. Discover the
         // highest strip referenced before applying labels/devices/VST slots.
@@ -4623,19 +4368,6 @@ fn path_delay_ms(
             if let Some(v) = bool_attr(attrs, "mono") {
                 s.mono = v;
             }
-            // FUN_0052b490: muc is forced off for strip index 4 (the fifth
-            // strip, param_1 == 4).
-            if let Some(v) = bool_attr(attrs, "muc") {
-                s.mc = v && i != 4;
-            }
-            // FUN_0052b490 restores the engine's program-active bits from
-            // prg_c (0x10) and prg_g (0x20).
-            if let Some(v) = bool_attr(attrs, "prg_c") {
-                s.comp_prg = v;
-            }
-            if let Some(v) = bool_attr(attrs, "prg_g") {
-                s.gate_prg = v;
-            }
             for (n, name) in ["busa", "busa2", "busa3", "busb", "busb2", "busb3"]
                 .iter()
                 .enumerate()
@@ -4651,76 +4383,25 @@ fn path_delay_ms(
             if let Some(v) = f32_attr(attrs, "dblimit") {
                 s.limit = v.clamp(LIMIT_MIN, GAIN_MAX);
             }
-            if let Some(v) = xml_attr(attrs, "karaoke").and_then(|v| v.parse::<i32>().ok()) {
-                s.karaoke = v.clamp(0, 4) as u8;
-            }
             if let Some(v) = bool_attr(attrs, "vaio") {
                 s.kind = if v { StripKind::Virtual } else { StripKind::Hardware };
             }
-            if let Some(v) = f32_attr(attrs, "audibility_c") {
-                s.comp = v.clamp(AUDIBILITY_MIN, AUDIBILITY_MAX);
-            }
-            if let Some(v) = f32_attr(attrs, "audibility_g") {
-                s.gate = v.clamp(AUDIBILITY_MIN, AUDIBILITY_MAX);
-            }
-            // FUN_0052b490 paneltype: clear both bits (mask 0xff0fffff), then
-            // 1 -> 0x100000 Color, 2 -> 0x200000 Mod/Fx; anything else Pan.
-            if let Some(v) = xml_attr(attrs, "paneltype").and_then(|v| v.parse::<i32>().ok()) {
-                s.panel_type = match v {
-                    1 => 1,
-                    2 => 2,
-                    _ => 0,
-                };
-            }
-            if let Some(v) = f32_attr(attrs, "ColorPanelx") {
-                s.color_panel[0] = v.clamp(PANEL_X_MIN, PANEL_X_MAX);
-            }
-            if let Some(v) = f32_attr(attrs, "ColorPanely") {
-                s.color_panel[1] = v.clamp(PANEL3D_Y_MIN, PANEL3D_Y_MAX);
-            }
-            if let Some(v) = f32_attr(attrs, "ModPanelx") {
-                s.mod_panel[0] = v.clamp(PANEL_X_MIN, PANEL_X_MAX);
-            }
-            if let Some(v) = f32_attr(attrs, "ModPanely") {
-                s.mod_panel[1] = v.clamp(PANEL3D_Y_MIN, PANEL3D_Y_MAX);
-            }
+            // Panel3Dx is where this format keeps the strip's pan. Everything
+            // else the original stored per strip (paneltype, the colour and
+            // modulation panel pairs, the compressor/gate knobs and the
+            // karaoke / M.C. flags) belongs to controls that no longer exist,
+            // so those elements and attributes are simply ignored.
             if let Some(v) = f32_attr(attrs, "Panel3Dx") {
-                s.intelli[0] = v.clamp(PANEL_X_MIN, PANEL_X_MAX);
-                s.pan = s.intelli[0];
+                s.pan = v.clamp(PANEL_X_MIN, PANEL_X_MAX);
             }
-            if let Some(v) = f32_attr(attrs, "Panel3Dy") {
-                // FUN_0052b490: hardware strips clamp panel y to 0..1, the
-                // virtual strips clamp it to -0.5..+0.5.
-                s.intelli[1] = if i < 3 {
-                    v.clamp(PANEL3D_Y_MIN, PANEL3D_Y_MAX)
-                } else {
-                    v.clamp(PANEL_Y_MIN, PANEL_Y_MAX)
-                };
-            }
-            if let Some(v) = f32_attr(attrs, "EQGain1") {
-                s.eq[0] = v.clamp(EQ_GAIN_MIN, EQ_GAIN_MAX);
-            }
-            if let Some(v) = f32_attr(attrs, "EQGain2") {
-                s.eq[1] = v.clamp(EQ_GAIN_MIN, EQ_GAIN_MAX);
-            }
-            if let Some(v) = f32_attr(attrs, "EQGain3") {
-                s.eq[2] = v.clamp(EQ_GAIN_MIN, EQ_GAIN_MAX);
-            }
-            // The strip's built-in pan, compressor, gate and 3-band EQ are no
-            // longer on the panel: every channel runs a VST3 insert instead.
-            // Their saved values are deliberately dropped, otherwise a scene
-            // would keep processors running that cannot be seen or adjusted.
-            s.pan = 0.0;
-            s.comp = 0.0;
-            s.gate = 0.0;
+            // The strip's built-in 3-band EQ is not on the panel either; it is
+            // deliberately dropped rather than restored behind the user's
+            // back.
             s.eq = [0.0, 0.0, 0.0];
-            s.intelli = [0.0, 0.0];
-            s.panel_type = 0;
-            s.color_panel = [0.0, 0.0];
-            s.mod_panel = [0.0, 0.0];
         }
 
-        // FUN_0052c030: bus elements. BusMode is stored as a nibble.
+        // FUN_0052c030: bus elements. BusMode, SEL and monitor are ignored:
+        // those controls are gone.
         for (attrs, _body) in xml_elements(text, "Bus") {
             if xml_attr(attrs, "cell").is_some() || xml_attr(attrs, "channel").is_some() {
                 continue; // matrix EQ elements, not a bus header
@@ -4744,17 +4425,8 @@ fn path_delay_ms(
                     b.mono = 2;
                 }
             }
-            if let Some(v) = xml_attr(attrs, "BusMode").and_then(|v| v.parse::<i32>().ok()) {
-                b.mode = (v & 0xf) as usize;
-            }
             if let Some(v) = bool_attr(attrs, "EQon") {
                 b.eq_on = v;
-            }
-            if let Some(v) = bool_attr(attrs, "SEL") {
-                b.sel = v;
-            }
-            if let Some(v) = bool_attr(attrs, "monitor") {
-                b.monitor = v;
             }
             if let Some(v) = xml_attr(attrs, "dblevel").and_then(|v| v.parse::<f32>().ok()) {
                 // FUN_0052c030 runs the bus level through atof only.
@@ -4780,66 +4452,16 @@ fn path_delay_ms(
             }
         }
 
-        if let Some((attrs, _)) = xml_elements(text, "VMOptions").first() {
-            if let Some(v) = bool_attr(attrs, "MonitorOnSEL") {
-                self.monitor_on_sel = v;
-            }
-        }
+        // <VMOptions> is ignored: MonitorOnSEL went with the "Monitor on BUS
+        // SEL" option and nothing else in it was used.
+
         if let Some((attrs, _)) = xml_elements(text, "RecordMode").first() {
+            // Only the end-of-file action is still used by the tape deck.
+            // TimerStop, RecBus, DontPlay, MultiTrack and the RecordParam /
+            // RecordArm elements belonged to the recorder, which is gone.
             if let Some(v) = bool_attr(attrs, "Loop") {
                 self.tape.loop_playback = v;
             }
-            // FUN_0052cd90: TimerStop is a number, floored at 0; it is not a
-            // flag like RecBus/DontPlay/Loop/MultiTrack (bits 0/24/25/26).
-            if let Some(v) = xml_attr(attrs, "TimerStop").and_then(|v| v.trim().parse::<i32>().ok()) {
-                self.tape.timer_stop = v.max(0);
-            }
-        }
-        if let Some((attrs, _)) = xml_elements(text, "RecordParam").first() {
-            // FUN_0052cd90 accepts FileType 1/2/3/100, BitRes>>3 in 1..4,
-            // TargetSR 22050/24000/32000/44100/48000/88200/96000/176400/
-            // 192000, nbChannel 2/4/6/8 (anything else becomes 2), one of the
-            // 14 kbps values, and preRecTime 0..20 s.
-            if let Some(v) = xml_attr(attrs, "FileType").and_then(|v| v.trim().parse::<i32>().ok()) {
-                if REC_FILE_TYPES.contains(&v) {
-                    self.tape.rec_file_type = v;
-                }
-            }
-            if let Some(v) = xml_attr(attrs, "BitRes").and_then(|v| v.trim().parse::<u32>().ok()) {
-                let index = v >> 3;
-                if (1..=4).contains(&index) {
-                    self.tape.rec_bit_depth = index * 8;
-                }
-            }
-            if let Some(v) = xml_attr(attrs, "TargetSR").and_then(|v| v.trim().parse::<u32>().ok()) {
-                if REC_TARGET_RATES.contains(&v) {
-                    self.tape.rec_target_sr = v;
-                }
-            }
-            if let Some(v) = xml_attr(attrs, "nbChannel").and_then(|v| v.trim().parse::<u32>().ok()) {
-                self.tape.rec_channels = if REC_CHANNELS.contains(&v) { v } else { 2 };
-            }
-            if let Some(v) = xml_attr(attrs, "kbps").and_then(|v| v.trim().parse::<u32>().ok()) {
-                if REC_KBPS.contains(&v) {
-                    self.tape.rec_kbps = v;
-                }
-            }
-            if let Some(v) = xml_attr(attrs, "preRecTime").and_then(|v| v.trim().parse::<i32>().ok()) {
-                self.tape.rec_pre_rec = v.clamp(0, REC_PRE_REC_MAX_S);
-            }
-        }
-        if let Some((attrs, _)) = xml_elements(text, "RecordArm").first() {
-            // FUN_0052cd90: ArmIn1-8 are bits 0..7 and ArmBus1-8 bits 16..23.
-            let mut arm = 0u32;
-            for n in 1..=8 {
-                if bool_attr(attrs, &format!("ArmIn{n}")).unwrap_or(false) {
-                    arm |= 1 << (n - 1);
-                }
-                if bool_attr(attrs, &format!("ArmBus{n}")).unwrap_or(false) {
-                    arm |= 1 << (15 + n);
-                }
-            }
-            self.tape.arm = arm;
         }
         // A1 master is part of the scene; a file that does not say so starts
         // with the switch off instead of inheriting the previous scene.
@@ -4863,9 +4485,6 @@ fn path_delay_ms(
                 if !has_latency_profile && self.main_buffer == 1024 {
                     self.main_buffer = 512;
                 }
-            }
-            if let Some(v) = xml_attr(attrs, "engine").and_then(|v| v.parse::<usize>().ok()) {
-                self.engine_mode = v.min(1);
             }
             if let Some(v) = bool_attr(attrs, "a1master") {
                 self.a1_master = v;
@@ -5033,13 +4652,6 @@ fn path_delay_ms(
             }
             tape_path = xml_unescape(body);
         }
-        for (_attrs, body) in xml_elements(text, "TapeRecent") {
-            let path = xml_unescape(body);
-            if !path.is_empty() {
-                recent.push((recent_order, PathBuf::from(path)));
-                recent_order += 1;
-            }
-        }
 
         // Rebuild extension: internal player (playlist, crossfade, strip).
         if let Some((attrs, body)) = xml_elements(text, "Player").first() {
@@ -5102,8 +4714,6 @@ fn path_delay_ms(
                 ));
             }
         }
-        recent.sort_by_key(|(i, _)| *i);
-        self.tape_recent = recent.into_iter().map(|(_, p)| p).take(6).collect();
     }
 
     /// 1.0 for the fader under the running light, fading for the two behind
@@ -5421,7 +5031,6 @@ fn path_delay_ms(
         };
         let mut tape_path = String::new();
         let mut tape_demo: i32 = -1;
-        let mut recent: Vec<(usize, PathBuf)> = Vec::new();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -5440,10 +5049,6 @@ fn path_delay_ms(
                 // FUN_00527ad0 rejects a main buffer above 2048 samples.
                 if let Ok(v) = value.parse::<u32>() {
                     self.main_buffer = v.min(MAIN_BUFFER_MAX);
-                }
-            } else if key == "engine" {
-                if let Ok(v) = value.parse::<usize>() {
-                    self.engine_mode = v.min(1);
                 }
             } else if key == "limit_remote" {
                 self.limit_remote = value == "1";
@@ -5465,12 +5070,6 @@ fn path_delay_ms(
                 tape_demo = value.parse().unwrap_or(-1);
             } else if key == "tape.loop" {
                 self.tape.loop_playback = value == "1";
-            } else if let Some(idx_s) = key.strip_prefix("tape.recent") {
-                if let Ok(idx) = idx_s.parse::<usize>() {
-                    if !value.is_empty() {
-                        recent.push((idx, PathBuf::from(value)));
-                    }
-                }
             } else if let Some(rest) = key.strip_prefix("strip") {
                 let Some((idx_s, field)) = rest.split_once('.') else {
                     continue;
@@ -5490,24 +5089,11 @@ fn path_delay_ms(
                         // FUN_0052b490 clamps the pan/panel x axis to
                         // -0.5..+0.5 (0x56dbe8 / 0x56dbe4).
                         s.pan = value.parse().unwrap_or(s.pan).clamp(PAN_MIN, PAN_MAX);
-                        s.intelli[0] = s.pan;
-                    }
-                    // audibility_c / audibility_g at +0x34 / +0x38, 0..10.
-                    "comp" => {
-                        s.comp = value.parse().unwrap_or(s.comp).clamp(AUDIBILITY_MIN, AUDIBILITY_MAX)
-                    }
-                    "gate" => {
-                        s.gate = value.parse().unwrap_or(s.gate).clamp(AUDIBILITY_MIN, AUDIBILITY_MAX)
                     }
                     "limit" => s.limit = value.parse().unwrap_or(s.limit).clamp(LIMIT_MIN, GAIN_MAX),
                     "mute" => s.mute = value == "1",
                     "solo" => s.solo = value == "1",
                     "mono" => s.mono = value == "1",
-                    // FUN_0052b490 forces muc off for strip index 4 (the
-                    // fifth strip, i.e. virtual strip 2): `param_1 == 4`.
-                    "mc" => s.mc = value == "1" && idx != 4,
-                    // FUN_0052b490 clamps the loaded karaoke value to 0..4.
-                    "k" => s.karaoke = value.parse().unwrap_or(s.karaoke).min(4),
                     "device" => s.device = value.to_string(),
                     // Source choice for a USB cable strip: 1 = read the cable's
                     // own buffer, 0 = Windows capture of its microphone endpoint.
@@ -5527,38 +5113,13 @@ fn path_delay_ms(
                         }
                     }
                     "panel" => {
-                        // The active panel pair selected by paneltype. X
-                        // clamps -0.5..+0.5; the hardware 3D panel clamps Y
-                        // to 0..1 (FUN_00541ce0 controls 0x114-0x116), while
-                        // a virtual pad clamps both axes to -0.5..+0.5.
+                        // The original's pan panel pair: X clamps -0.5..+0.5.
+                        // Only the pan part is still meaningful.
                         let vals: Vec<f32> =
                             value.split(',').filter_map(|p| p.parse().ok()).collect();
                         if vals.len() == 2 {
-                            let (ymin, ymax) = if s.kind == StripKind::Hardware {
-                                (PANEL3D_Y_MIN, PANEL3D_Y_MAX)
-                            } else {
-                                (PANEL_Y_MIN, PANEL_Y_MAX)
-                            };
-                            let pair = [
-                                vals[0].clamp(PANEL_X_MIN, PANEL_X_MAX),
-                                vals[1].clamp(ymin, ymax),
-                            ];
-                            match s.panel_type {
-                                1 => s.color_panel = pair,
-                                2 => s.mod_panel = pair,
-                                _ => {
-                                    s.intelli = pair;
-                                    s.pan = pair[0];
-                                }
-                            }
+                            s.pan = vals[0].clamp(PANEL_X_MIN, PANEL_X_MAX);
                         }
-                    }
-                    "paneltype" => {
-                        s.panel_type = match value.parse::<i32>().unwrap_or(0) {
-                            1 => 1,
-                            2 => 2,
-                            _ => 0,
-                        };
                     }
                     "route" => {
                         let vals: Vec<u8> =
@@ -5589,10 +5150,6 @@ fn path_delay_ms(
                     "mute" => b.mute = value == "1",
                     "mono" => b.mono = value.parse().unwrap_or(b.mono),
                     "eq" => b.eq_on = value == "1",
-                    "sel" => b.sel = value == "1",
-                    // FUN_0052c030 does BusMode = (value & 0xf) << 4, so the
-                    // stored nibble is always 0..15 (negative wraps too).
-                    "mode" => b.mode = value.parse::<usize>().unwrap_or(b.mode) % 16,
                     "device" => b.device = value.to_string(),
                     _ => {}
                 }
@@ -5613,8 +5170,6 @@ fn path_delay_ms(
                 ));
             }
         }
-        recent.sort_by_key(|(i, _)| *i);
-        self.tape_recent = recent.into_iter().map(|(_, p)| p).take(6).collect();
         self.toast("Settings loaded from mixer_settings.txt");
     }
 
@@ -5637,7 +5192,6 @@ fn path_delay_ms(
         self.audio.unload();
         self.tape = Tape::new();
         self.tape_error = None;
-        self.tape_info = None;
         self.vst_panel = None;
         self.picker = None;
         self.label_edit = None;
@@ -6145,7 +5699,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit Ãƒâ€šÃ‚Â· 48 kHz"), from the
+        // The endpoint's configured format ("24-bit ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6228,7 +5782,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui
@@ -6276,9 +5830,6 @@ Right click > Source to use the Windows capture stream instead."
             let mut reset_all = false;
             let mut reset_eq = false;
             let mut reset_pan = false;
-            let mut reset_panel = false;
-            let mut reset_comp = false;
-            let mut reset_gate = false;
             let mut copy_all = false;
             let mut paste = false;
             let mut toggle_apps = false;
@@ -6429,44 +5980,19 @@ Right click > Source to use the Windows capture stream instead."
                 }
             }
             if reset_all {
-                // FUN_00538b20 command 600: hardware resets the panel, the
-                // compressor and the gate; virtual resets the pan pair and the
-                // three EQ bands.
-                if self.strips[idx].kind == StripKind::Hardware {
-                    reset_panel = true;
-                    reset_comp = true;
-                    reset_gate = true;
-                } else {
-                    reset_pan = true;
-                    reset_eq = true;
-                }
+                // FUN_00538b20 command 600. What it used to reset beyond pan
+                // and the three EQ bands - the panel pair, the compressor and
+                // the gate - went with those controls.
+                reset_pan = true;
+                reset_eq = true;
             }
             if reset_eq {
                 // FUN_00538b20 0x25b: EQ fields +0x24/+0x28/+0x2c only.
                 self.strips[idx].eq = [0.0, 0.0, 0.0];
             }
             if reset_pan {
-                // FUN_00538b20 0x261: virtual pan pair +0x08/+0x0c only.
+                // FUN_00538b20 0x261: the pan pair +0x08/+0x0c only.
                 self.strips[idx].pan = 0.0;
-                self.strips[idx].intelli = [0.0, 0.0];
-            }
-            if reset_panel {
-                // FUN_00538b20 0x259: all six panel fields (+0x08..+0x1c).
-                self.strips[idx].pan = 0.0;
-                self.strips[idx].intelli = [0.0, 0.0];
-                self.strips[idx].color_panel = [0.0, 0.0];
-                self.strips[idx].mod_panel = [0.0, 0.0];
-            }
-            if reset_comp {
-                // FUN_00541510: compressor +0x34 knob -> 0, flag bit 0x10
-                // cleared, nine-dword preset at 0x584abc rewritten.
-                self.strips[idx].comp = 0.0;
-                self.strips[idx].comp_prg = false;
-            }
-            if reset_gate {
-                // FUN_00541510: gate +0x38 knob -> 0, flag bit 0x20 cleared.
-                self.strips[idx].gate = 0.0;
-                self.strips[idx].gate_prg = false;
             }
             if copy_all {
                 self.strip_clip = Some(StripClip::capture(&self.strips[idx]));
@@ -7011,9 +6537,6 @@ Right click > Source to use the Windows capture stream instead."
         let inner = card.shrink2(Vec2::new(5.0, 4.0));
         ui.painter().rect_filled(card, 5.0, Color32::from_rgb(24, 27, 33));
         ui.painter().rect_stroke(card, 5.0, Stroke::new(1.0, LINE));
-        if self.buses[idx].sel {
-            ui.painter().rect_stroke(card, 5.0, Stroke::new(1.0, accent.gamma_multiply(0.8)));
-        }
 
         let enabled = !self.lock_gui;
         let w = inner.width();
@@ -8153,83 +7676,36 @@ Right click > Source to use the Windows capture stream instead."
         }
     }
 
-    fn on_transport(&mut self, t: Transport) {
-        if self.lock_gui {
-            self.toast("Interface is locked - unlock it in the menu");
-            return;
-        }
-        match t {
-            Transport::Rew => {
-                self.tape.pos = (self.tape.pos - 10.0).max(0.0);
-                self.audio.seek(self.tape.pos);
-                self.toast("Recorder rewind");
+    /// Start the tape deck. The transport buttons are gone, so this is only
+    /// reached from the diagnostic switches that load generated material
+    /// (`--startup-demo`, `--bus-demo`).
+    fn play_tape(&mut self) {
+        if self.tape.file.starts_with("No file") {
+            self.toast("Choose an audio file first");
+        } else if !self.audio.available {
+            self.toast("No audio output device - check Windows sound output");
+        } else {
+            if !self.audio.has_source() {
+                self.reload_tape_audio();
             }
-            Transport::Ff => {
-                self.tape.pos = (self.tape.pos + 10.0).min(self.tape.len);
-                self.audio.seek(self.tape.pos);
-                self.toast("Recorder fast forward");
-            }
-            Transport::Play => {
-                if self.tape.file.starts_with("No file") {
-                    self.toast("Choose an audio file first");
-                } else if !self.audio.available {
-                    self.toast("No audio output device - check Windows sound output");
-                } else {
-                    if !self.audio.has_source() {
-                        self.reload_tape_audio();
-                    }
-                    if !self.audio.has_source() {
-                        self.toast("The audio file is no longer available");
-                    } else if self.tape.playing {
-                        self.tape.playing = false;
-                        self.audio.pause();
-                        self.toast("Tape paused");
-                    } else {
-                        if self.tape.pos >= self.tape.len - 0.01 {
-                            self.tape.pos = 0.0;
-                            self.audio.seek(0.0);
-                        }
-                        // FUN_0053e7b0 case 0x12f: before starting, the
-                        // playhead is pulled back to the start of its second:
-                        // position_ms = (position_ms / 1000) * 1000.
-                        let snapped =
-                            (self.tape.pos / TAPE_POS_GRID_S).floor() * TAPE_POS_GRID_S;
-                        if (snapped - self.tape.pos).abs() > 0.001 {
-                            self.tape.pos = snapped;
-                            self.audio.seek(snapped);
-                        }
-                        self.tape.playing = true;
-                        self.tape.recording = false;
-                        self.audio.play();
-                        self.toast(format!("Playing {}", self.tape.file));
-                    }
-                }
-            }
-            Transport::Stop => {
-                // FUN_0053e7b0 case 0x131 stops through FUN_004e6c80 with the
-                // current position, so the transport stays where it is and a
-                // later PLAY resumes there (after the whole-second snap).
-                let pos = self.tape.pos;
-                self.audio.pause();
-                self.audio.seek(pos);
-                self.tape.playing = false;
-                self.tape.recording = false;
-                self.tape.pos = pos;
-                self.toast("Recorder stop");
-            }
-            Transport::Rec => {
-                // Recording in the original writes through the virtual audio
-                // driver. This rebuild has no recorder engine, so REC keeps its
-                // original look and counter but does not create a file.
-                self.audio.stop();
-                self.tape.playing = false;
-                if self.tape.recording {
-                    self.tape.recording = false;
-                } else {
-                    self.tape.recording = true;
+            if !self.audio.has_source() {
+                self.toast("The audio file is no longer available");
+            } else {
+                if self.tape.pos >= self.tape.len - 0.01 {
                     self.tape.pos = 0.0;
-                    self.toast("Recording is not available in this rebuild");
+                    self.audio.seek(0.0);
                 }
+                // FUN_0053e7b0 case 0x12f: before starting, the playhead is
+                // pulled back to the start of its second:
+                // position_ms = (position_ms / 1000) * 1000.
+                let snapped = (self.tape.pos / TAPE_POS_GRID_S).floor() * TAPE_POS_GRID_S;
+                if (snapped - self.tape.pos).abs() > 0.001 {
+                    self.tape.pos = snapped;
+                    self.audio.seek(snapped);
+                }
+                self.tape.playing = true;
+                self.audio.play();
+                self.toast(format!("Playing {}", self.tape.file));
             }
         }
     }
@@ -8490,11 +7966,6 @@ Right click > Source to use the Windows capture stream instead."
                 .default_width(360.0)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Engine mode:");
-                        ui.selectable_value(&mut self.engine_mode, 0, "Normal");
-                        ui.selectable_value(&mut self.engine_mode, 1, "Swift");
-                    });
                     ui.horizontal(|ui| {
                         ui.label("Sample rate:");
                         egui::ComboBox::from_id_source("sr")
@@ -10422,9 +9893,6 @@ impl eframe::App for MixerApp {
                 }
             }
         }
-        if self.tape.recording {
-            self.tape.pos = (self.tape.pos + dt).min(600.0);
-        }
 
         // An audio file dropped on the console is loaded into the tape deck.
         if !self.lock_gui {
@@ -10921,85 +10389,6 @@ fn check_item(ui: &mut egui::Ui, label: &str, checked: bool) -> bool {
     resp.clicked()
 }
 
-fn draw_knob(
-    ui: &egui::Ui,
-    center: Pos2,
-    radius: f32,
-    value: &mut f32,
-    min: f32,
-    max: f32,
-    default: f32,
-    accent: Color32,
-    id: Id,
-    enabled: bool,
-    tip: &str,
-) -> bool {
-    let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.4));
-    let sense = if enabled { Sense::click_and_drag() } else { Sense::hover() };
-    let resp = ui.interact(rect, id, sense);
-    let mut changed = false;
-    // FUN_00541ce0 knobs (0x10b-0x136) use
-    //   new = value_at_grab + (grab_y - y) * 0.1
-    // i.e. upward movement increases the value by 0.1 per pixel.
-    let grab_id = id.with("knob-grab");
-    if enabled && resp.drag_started() {
-        let y = ui.input(|i| {
-            i.pointer
-                .press_origin()
-                .or_else(|| i.pointer.interact_pos())
-                .map(|p| p.y)
-                .unwrap_or(0.0)
-        });
-        ui.ctx().data_mut(|d| d.insert_temp(grab_id, (*value, y)));
-    }
-    if enabled && resp.dragged() {
-        if let Some((value_at_grab, grab_y)) =
-            ui.ctx().data(|d| d.get_temp::<(f32, f32)>(grab_id))
-        {
-            if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                *value = (value_at_grab + (grab_y - pos.y) * KNOB_STEP_PER_PX)
-                    .clamp(min, max);
-            }
-        }
-        changed = true;
-    }
-    if enabled && resp.double_clicked() {
-        *value = default;
-        changed = true;
-    }
-    if enabled && resp.hovered() {
-        // FUN_00542a60 only handles the ten faders (0xd4-0xdd); the original
-        // has no wheel case for knobs, EQ bands, compressors or gates.
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-    }
-    let p = ui.painter();
-    p.circle_filled(center, radius + 2.0, Color32::from_rgb(20, 23, 29));
-    p.circle_stroke(center, radius + 2.0, Stroke::new(1.0, LINE));
-    p.circle_filled(center, radius, TRACK);
-    let t = ((*value - min) / (max - min)).clamp(0.0, 1.0);
-    let ang = (135.0 + t * 270.0).to_radians();
-    let dir = Vec2::new(ang.cos(), ang.sin());
-    let col = if enabled { accent } else { FAINT };
-    p.line_segment(
-        [center + dir * radius * 0.25, center + dir * radius * 0.85],
-        Stroke::new(2.0, col),
-    );
-    p.circle_filled(center + dir * radius * 0.25, 1.3, col);
-    // arc ticks at the ends
-    for a in [135.0f32, 405.0] {
-        let d = Vec2::new(a.to_radians().cos(), a.to_radians().sin());
-        p.line_segment(
-            [center + d * (radius + 1.0), center + d * (radius + 3.0)],
-            Stroke::new(1.0, FAINT),
-        );
-    }
-    if resp.hovered() {
-        p.circle_stroke(center, radius + 2.0, Stroke::new(1.0, accent));
-    }
-    let _ = resp.on_hover_text(tip);
-    changed
-}
-
 
 fn fader(
     ui: &egui::Ui,
@@ -11343,15 +10732,6 @@ fn meter_widget(
     ));
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Transport {
-    Rew,
-    Ff,
-    Play,
-    Stop,
-    Rec,
-}
-
 /// One action requested from the player window. Collected inside the window
 /// closure and applied afterwards, so the player borrow is released first.
 enum PlayerAction {
@@ -11369,90 +10749,6 @@ enum PlayerAction {
     AddFile,
     SaveAs,
     Seek(u64),
-}
-
-fn transport_button(
-    ui: &egui::Ui,
-    rect: Rect,
-    t: Transport,
-    active: bool,
-    color: Color32,
-    enabled: bool,
-) -> bool {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let resp = ui.interact(rect, Id::new(("transport", t as u8)), sense);
-    let hovered = resp.hovered() && enabled;
-    let fill = if active {
-        color.gamma_multiply(0.85)
-    } else if hovered {
-        PANEL_HI
-    } else {
-        Color32::from_rgb(30, 34, 41)
-    };
-    let p = ui.painter();
-    p.rect_filled(rect, 3.0, fill);
-    p.rect_stroke(rect, 3.0, Stroke::new(1.0, if active { color } else { LINE }));
-    let c = rect.center();
-    let col = if active {
-        Color32::from_rgb(16, 17, 20)
-    } else if enabled {
-        TEXT
-    } else {
-        FAINT
-    };
-    match t {
-        Transport::Play => {
-            p.add(egui::Shape::convex_polygon(
-                vec![
-                    c + Vec2::new(-4.0, -6.0),
-                    c + Vec2::new(6.0, 0.0),
-                    c + Vec2::new(-4.0, 6.0),
-                ],
-                col,
-                Stroke::NONE,
-            ));
-        }
-        Transport::Stop => {
-            p.rect_filled(Rect::from_center_size(c, Vec2::splat(9.0)), 1.0, col);
-        }
-        Transport::Rec => {
-            p.circle_filled(c - Vec2::new(6.0, 0.0), 4.5, RED);
-            p.text(
-                c + Vec2::new(6.0, 0.0),
-                Align2::CENTER_CENTER,
-                "REC",
-                FontId::proportional(7.0),
-                col,
-            );
-        }
-        Transport::Rew => {
-            for dx in [-5.0f32, 1.0] {
-                p.add(egui::Shape::convex_polygon(
-                    vec![
-                        c + Vec2::new(dx + 4.0, -5.0),
-                        c + Vec2::new(dx - 4.0, 0.0),
-                        c + Vec2::new(dx + 4.0, 5.0),
-                    ],
-                    col,
-                    Stroke::NONE,
-                ));
-            }
-        }
-        Transport::Ff => {
-            for dx in [-1.0f32, 5.0] {
-                p.add(egui::Shape::convex_polygon(
-                    vec![
-                        c + Vec2::new(dx + 4.0, -5.0),
-                        c + Vec2::new(dx - 4.0, 0.0),
-                        c + Vec2::new(dx + 4.0, 5.0),
-                    ],
-                    col,
-                    Stroke::NONE,
-                ));
-            }
-        }
-    }
-    resp.clicked() && enabled
 }
 
 /// "Microphone (Virtual Cable 03)" -> "Virtual Cable 03", the part of a USB

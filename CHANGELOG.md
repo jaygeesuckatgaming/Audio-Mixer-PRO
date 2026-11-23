@@ -28,6 +28,13 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   on one source with no cable and no offset between strips. Each strip keeps its
   own VST, fader and bus routing; switching the mirror off restores the previous
   input of every strip.
+- **Scenes no longer carry dead console state.** The writer stopped emitting
+  `paneltype`, `ColorPanel*`, `ModPanel*`, `audibility_c/g`, `muc`, `prg_c/g`,
+  the bus `BusMode`/`SEL`/`monitor`, `<VMOptions MonitorOnSEL>`, `engine`,
+  `<RecordArm>` and `<RecordParam>`, and the reader ignores them in old files.
+  Pan still round-trips in `Panel3Dx`; `RecordMode Loop` is kept for the demo
+  tape. The "Engine mode: Normal/Swift" switch was removed from System
+  Settings: nothing read it.
 
 ## 1.0.1 — rev 2 (2026-11-23)
 
