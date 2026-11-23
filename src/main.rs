@@ -8288,22 +8288,58 @@ Right click > Source to use the Windows capture stream instead."
                         }
                         for (i, track) in tracks.iter().enumerate() {
                             let missing = !track.exists();
+                            let is_current = i == current;
+                            let is_playing = is_current && playing;
                             let length = track
                                 .duration_ms
                                 .map(player_clock)
                                 .unwrap_or_else(|| "--:--".to_string());
-                            let label = format!("{:>3}.  {}   {length}", i + 1, track.title);
+                            // A playing track is marked with a play symbol and a
+                            // green row; the loaded-but-paused one stays amber.
+                            let marker = if is_playing {
+                                "\u{25b6}"
+                            } else if is_current {
+                                "\u{2016}"
+                            } else {
+                                " "
+                            };
+                            let label = format!(
+                                "{marker} {:>3}.  {}   {length}",
+                                i + 1,
+                                track.title
+                            );
                             let colour = if missing {
                                 RED
-                            } else if i == current {
+                            } else if is_playing {
                                 GREEN
+                            } else if is_current {
+                                AMBER
                             } else {
                                 TEXT
                             };
-                            let response = ui.selectable_label(
-                                i == current,
-                                egui::RichText::new(label).size(10.0).color(colour),
-                            );
+                            let width = ui.available_width();
+                            let response = ui
+                                .scope(|ui| {
+                                    ui.visuals_mut().selection.bg_fill = if is_playing {
+                                        Color32::from_rgb(26, 66, 42)
+                                    } else {
+                                        Color32::from_rgb(52, 46, 26)
+                                    };
+                                    ui.visuals_mut().selection.stroke = Stroke::new(
+                                        1.0,
+                                        if is_playing { GREEN } else { AMBER },
+                                    );
+                                    ui.add_sized(
+                                        [width, 16.0],
+                                        egui::SelectableLabel::new(
+                                            is_current,
+                                            egui::RichText::new(label)
+                                                .size(10.0)
+                                                .color(colour),
+                                        ),
+                                    )
+                                })
+                                .inner;
                             if response.double_clicked() {
                                 action = Some(PlayerAction::Jump(i));
                             }
@@ -9395,12 +9431,13 @@ Right click > Source to use the Windows capture stream instead."
                         });
                     });
                     ui.add_space(6.0);
-                    ui.label("Version 2.1.2.2 (reconstruction)");
-                    ui.label("5 inputs: 3 hardware + 2 virtual");
-                    ui.label("5 buses: A1, A2, A3 physical + B1, B2 virtual");
-                    ui.label("Per-strip gain, pan, 3-band EQ, compressor, gate, limiter");
-                    ui.label("Per-bus gain, 6-band EQ, mono and 12 mix modes");
-                    ui.label("Tape deck with play, rewind, fast forward and WAV loading");
+                    ui.label(format!("Version {}", BUILD_FULL));
+                    ui.label("Up to 16 input strips, hardware or virtual");
+                    ui.label("6 buses: A1-A3 to devices, B1-B3 to virtual outputs");
+                    ui.label("Per-strip fader, pan, dynamics and a VST3/CLAP insert");
+                    ui.label("Optional external ASIO insert, one DAW per stereo pair");
+                    ui.label("Streaming music player: playlists, gapless playback, crossfade");
+                    ui.label("Virtual cables: kernel driver (experimental) and USB/IP");
                     ui.separator();
                     ui.label(
                         egui::RichText::new("Engine dynamics (fixed values)")
@@ -9451,14 +9488,33 @@ Right click > Source to use the Windows capture stream instead."
                     }
                     ui.label(
                         egui::RichText::new(
-                            "The console sends the tape deck's stereo material to your default \
-                             Windows output. The meters show real measured levels: hardware \
-                             strips follow the selected microphone or line input, Virtual 1 \
-                             follows the tape material, and BUS A1 follows the signal leaving \
-                             the output device. Nothing on the meters is generated.",
+                            "Meters show measured levels: a strip follows its input after the \
+                             fader and insert, a bus follows the mixed signal leaving it, and \
+                             A1 follows what reaches the output device.",
                         )
                         .size(10.0)
                         .color(DIM),
+                    );
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "WWASIO{} is a trademark of JayGee.",
+                            "\u{2122}"
+                        ))
+                        .size(9.0)
+                        .color(DIM),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "ASIO and VST are trademarks of Steinberg Media Technologies \
+                                 GmbH. The ASIO insert is an independent implementation of the \
+                                 published ASIO interface and is not endorsed by Steinberg.",
+                            )
+                            .size(9.0)
+                            .color(DIM),
+                        )
+                        .wrap(),
                     );
                     ui.add_space(4.0);
                     if ui.button("Close").clicked() {

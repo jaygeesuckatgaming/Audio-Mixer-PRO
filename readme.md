@@ -76,3 +76,8 @@ https://loudmax.blogspot.com/
 </div>
 
 </div>
+
+---
+
+WWASIO™ is a trademark of JayGee. Audio Mixer PRO is a product of JayGee.
+ASIO and VST are trademarks of Steinberg Media Technologies GmbH. The ASIO insert is an independent implementation of the published ASIO interface and is not endorsed by Steinberg.
