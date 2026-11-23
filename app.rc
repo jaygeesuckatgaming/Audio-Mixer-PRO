@@ -1,8 +1,8 @@
-IDI_ICON1 ICON "icons/Icon_2_48_48_1.ico"
+﻿IDI_ICON1 ICON "icons/Icon_2_48_48_1.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 1,0,1,0
+PRODUCTVERSION 1,0,1,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -12,13 +12,13 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "JayGee"
       VALUE "FileDescription", "Audio Mixer PRO"
-      VALUE "FileVersion", "1.0.0.0"
+      VALUE "FileVersion", "1.0.1.0"
       VALUE "InternalName", "audio_mixer_pro"
       VALUE "LegalCopyright", "Copyright (c) 2026 JayGee"
       VALUE "LegalTrademarks", "WWASIO is a trademark of JayGee"
       VALUE "OriginalFilename", "audio_mixer_pro.exe"
       VALUE "ProductName", "Audio Mixer PRO"
-      VALUE "ProductVersion", "1.0.0.0"
+      VALUE "ProductVersion", "1.0.1.0"
     END
   END
   BLOCK "VarFileInfo"

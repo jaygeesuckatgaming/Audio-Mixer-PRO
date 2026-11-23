@@ -3,7 +3,16 @@
 Audio Mixer PRO reports its build in the top bar as `<CHANNEL> · rev <REV>`.
 `REV` counts every published build of that release line.
 
-## 1.0 — rev 1 (unreleased)
+## 1.0.1 — rev 2 (2026-11-23)
+
+- **Fix: a plug-in's editor window could jump in front of whatever you clicked.**
+  The editor host re-sent keyboard focus to the plug-in's child window whenever
+  the mixer's thread had no focus — which is exactly the state after clicking
+  another application or the desktop — and `SetFocus` activates that window.
+  Focus is now only nudged while the editor itself is the active window, so
+  plug-in meters still start but the window stays where it was put.
+
+## 1.0 — rev 1 (2026-11-23)
 
 First stable release. The audio engine is the same code as Beta 6 rev 67;
 1.0 changes the identity, the licence and the packaging, not the sound.

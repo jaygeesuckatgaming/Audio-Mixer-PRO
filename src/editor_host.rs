@@ -297,8 +297,17 @@ impl EditorHost {
     /// own window has focus â€” which is why a right-click on the title bar used
     /// to bring the meters to life.
     fn ensure_child_focus(&mut self) {
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, GetFocus, SetFocus};
         if !self.focused {
+            return;
+        }
+        // Only touch focus while this editor is the active window of our own
+        // thread. Clicking another application (or the desktop) leaves the
+        // thread with no active window and GetFocus() returns 0; calling
+        // SetFocus then ACTIVATES this window, which dragged the plug-in's
+        // screen in front of whatever the person had just clicked.
+        let active = unsafe { GetActiveWindow() } as isize;
+        if active != self.hwnd {
             return;
         }
         let focus = unsafe { GetFocus() } as isize;
