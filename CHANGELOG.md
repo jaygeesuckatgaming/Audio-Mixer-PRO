@@ -30,6 +30,13 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   on one source with no cable and no offset between strips. Each strip keeps its
   own VST, fader and bus routing; switching the mirror off restores the previous
   input of every strip.
+- **The demo mirror no longer writes "PLAYER" into the scene.** While mirror was
+  on, every mirrored strip's input was set to the string `PLAYER`, and Save
+  Settings wrote that, so after a restart (the mirror itself is never saved)
+  every strip came back with a dead `PLAYER` input. The writer now stores the
+  device each mirrored strip had before the mirror went on, and a scene that
+  already contains `PLAYER` for a strip the player does not feed is repaired to
+  its empty/default input on load.
 - **A wedged device open is reported, not left amber.** If the Windows audio
   service stops answering, a bus-device open can block for minutes. The card
   used to sit on "opening the output ..." for the whole session; after 10 s it

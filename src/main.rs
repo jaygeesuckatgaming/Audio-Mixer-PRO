@@ -3228,9 +3228,24 @@ fn path_delay_ms(
         // FUN_00529c80 writes type only when the device name is present; an
         // empty input becomes name="-" with no type. An unassigned output also
         // carries its eight pOut patch numbers, each 0..=64.
+        // The demo mirror points strips at the player by writing "PLAYER" into
+        // their device field. That is a live state, not a device choice: write
+        // the device each mirrored strip had before the mirror went on, so a
+        // save during a demo does not leave the scene with dead inputs.
+        let scene_device = |i: usize| -> String {
+            let current = &self.strips[i].device;
+            if current == "PLAYER" {
+                if let Some((_, prev)) = self.player_mirror_prev.iter().find(|(j, _)| *j == i) {
+                    if !prev.trim().is_empty() {
+                        return prev.clone();
+                    }
+                }
+            }
+            current.clone()
+        };
         for i in 0..3 {
-            let name = xml_escape(&self.strips[i].device);
-            if self.strips[i].device.trim().is_empty() {
+            let device = scene_device(i);
+            if device.trim().is_empty() {
                 text.push_str(&format!(
                     "\t<InputDev index='{}' name=\"-\" />\n",
                     i + 1
@@ -3240,7 +3255,7 @@ fn path_delay_ms(
                     "\t<InputDev index='{}' type='{}' name=\"{}\" />\n",
                     i + 1,
                     self.input_types[i],
-                    name
+                    xml_escape(&device)
                 ));
             }
         }
@@ -3248,7 +3263,8 @@ fn path_delay_ms(
         // endpoint in the same element (indices 4+). The original's tag-driven
         // reader only knows 1-3 and ignores these.
         for i in 3..self.active_strips {
-            let name = if self.strips[i].device.trim().is_empty() {
+            let device = scene_device(i);
+            let name = if device.trim().is_empty() {
                 if i == 3 {
                     "Virtual 1 (VAIO)"
                 } else if i == 4 {
@@ -3257,7 +3273,7 @@ fn path_delay_ms(
                     "No input"
                 }
             } else {
-                self.strips[i].device.as_str()
+                device.as_str()
             };
             text.push_str(&format!(
                 "\t<InputDev index='{}' name=\"{}\" />\n",
@@ -4737,6 +4753,30 @@ fn path_delay_ms(
                 }
             }
             self.show_player = open;
+        }
+
+        // "PLAYER" is only a valid input while the player really feeds that
+        // strip. A scene saved with the demo mirror on has it written for every
+        // mirrored strip, and the mirror itself is never saved, so those strips
+        // would come back with a dead input. Give them their empty/default input
+        // back; the mirror is a session state, not a device choice.
+        for i in 0..self.active_strips.min(MAX_STRIPS) {
+            if self.strips[i].device != "PLAYER" {
+                continue;
+            }
+            let fed_by_player =
+                i == self.player_strip.min(MAX_STRIPS - 1) && self.player.is_some();
+            if !fed_by_player {
+                self.strips[i].device = if i < 3 {
+                    String::new()
+                } else if i == 3 {
+                    "Virtual 1 (VAIO)".to_string()
+                } else if i == 4 {
+                    "Virtual 2 (AUX)".to_string()
+                } else {
+                    "No input".to_string()
+                };
+            }
         }
 
         if tape_demo >= 0 {
@@ -7272,6 +7312,26 @@ Right click > Source to use the Windows capture stream instead."
                 if !device.is_empty() && device != "No input" && device != "PLAYER" {
                     self.spawn_capture_open(i, device);
                 }
+            }
+            // A strip that still points at "PLAYER" but is not the player's own
+            // strip has no source. That is a scene saved while a mirror was on
+            // (the mirror itself is not saved), so give it a usable empty input
+            // instead of a dead one.
+            for i in 0..self.active_strips.min(MAX_STRIPS) {
+                if i == primary || self.strips[i].device != "PLAYER" {
+                    continue;
+                }
+                self.audio.detach_input(i);
+                self.captures[i] = None;
+                self.strips[i].device = if i < 3 {
+                    String::new()
+                } else if i == 3 {
+                    "Virtual 1 (VAIO)".to_string()
+                } else if i == 4 {
+                    "Virtual 2 (AUX)".to_string()
+                } else {
+                    "No input".to_string()
+                };
             }
             self.player_mirror = false;
             self.toast("Player mirror off");
