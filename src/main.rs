@@ -6210,11 +6210,13 @@ Right click > Source to use the Windows capture stream instead."
                 // "1500.0 ms latency" when it actually reports 0 latency and a
                 // 1.5 s tail, which is why it stayed in phase with TDR Nova.
                 let (samples, tail) = self.vsts[idx].chain.latency();
+                let sr = self.sample_rate.max(1) as f32;
                 let text = if samples > 0 {
-                    format!(
-                        "{:.1} ms latency",
-                        (samples as f32 / self.sample_rate.max(1) as f32) * 1000.0
-                    )
+                    format!("{:.1} ms latency", samples as f32 / sr * 1000.0)
+                } else if tail > 0 {
+                    // No delay, but the plug-in keeps ringing: say so instead of
+                    // leaving the line blank (Spatial EQ: 0 ms, 1.5 s tail).
+                    format!("0 ms - {:.1} s tail", tail as f32 / sr)
                 } else {
                     String::new()
                 };
