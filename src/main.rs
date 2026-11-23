@@ -47,7 +47,6 @@ const TEAL: Color32 = Color32::from_rgb(70, 176, 154);
 const RED: Color32 = Color32::from_rgb(196, 68, 58);
 const YELLOW: Color32 = Color32::from_rgb(214, 178, 62);
 const GREEN: Color32 = Color32::from_rgb(86, 192, 124);
-const PURPLE: Color32 = Color32::from_rgb(146, 118, 208);
 
 const GAIN_MIN: f32 = -60.0;
 const GAIN_MAX: f32 = 12.0;
@@ -251,70 +250,6 @@ const OUT_PATCH_MAX: i32 = 64;
 // The console stores the tape position in milliseconds (scene +0x23c4/0x23c7),
 // so the rebuild's position in seconds is floored to the same 1 s grid.
 const TAPE_POS_GRID_S: f32 = 1.0;
-
-// BusMode is stored as bits 4..7 of the bus flag word. The numeric values
-// come from FUN_00528b40 / FUN_00539f00, so the array is in stored order
-// (2 = Repeat, 3 = Mixdown B), not in the order the mode button cycles.
-const MODE_NAMES: [&str; 12] = [
-    "NORMAL",
-    "MIX A",
-    "REPEAT",
-    "MIX B",
-    "COMPOSITE",
-    "TV MIX",
-    "UP 2.1",
-    "UP 4.1",
-    "UP 6.1",
-    "CENTER",
-    "LFE",
-    "REAR",
-];
-
-const MODE_HELP: [&str; 12] = [
-    "Normal: multichannel signal passes unchanged",
-    "Mixdown A: 5.1/7.1 folded to stereo (rear-left minus side-left)",
-    "Stereo repeat: channels 1+2 repeated to 3+4, 5+6, 7+8",
-    "Mixdown B: 5.1/7.1 folded to stereo (rear-left plus side-left)",
-    "Composite: BUS channels filled from selected inputs",
-    "TV Mix: 7.1 created from a stereo source",
-    "Upmix 2.1: stereo plus LFE (50% L+R)",
-    "Upmix 4.1: stereo plus LFE and rear channels",
-    "Upmix 6.1: stereo plus LFE, rear and side channels",
-    "Center only: L = R = centre channel",
-    "LFE only: L = R = sub-woofer channel",
-    "Rear only: L = rear-left, R = rear-right",
-];
-
-// FUN_0053e7b0 (bus mode button, controls 0x119-0x11d) advances the stored
-// BusMode value in this exact order: normal, A mix, B mix, repeat, composite,
-// TV mix, then the up-mixes and the three single-channel modes.
-fn next_bus_mode(mode: usize) -> usize {
-    match mode {
-        0 => 1,
-        1 => 3,
-        3 => 2,
-        2 => 4,
-        4 => 5,
-        5 => 6,
-        6 => 7,
-        7 => 8,
-        8 => 9,
-        9 => 10,
-        10 => 11,
-        11 => 0,
-        _ => 1,
-    }
-}
-
-// FUN_00539f00 treats BusMode 12..15 through the switch default, i.e. as
-// Normal. Keep the raw stored number but display the Normal slot.
-fn mode_slot(mode: usize) -> usize {
-    if mode < MODE_NAMES.len() {
-        mode
-    } else {
-        0
-    }
-}
 
 // The original's meters are fed by the engine's per-channel peak values
 // (FUN_00538130) and drawn in FUN_00537110; there is no synthetic motion in
@@ -5772,10 +5707,6 @@ fn path_delay_ms(
         let help_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
         bx -= 28.0;
         let lock_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
-        bx -= 30.0;
-        let r_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
-        bx -= 28.0;
-        let a_hit = Rect::from_min_size(Pos2::new(bx - 24.0, rect.top() + 7.0), Vec2::splat(24.0));
         let cables_hit = Rect::from_min_size(
             Pos2::new(rect.left() + 420.0, rect.top() + 7.0),
             Vec2::new(70.0, 24.0),
@@ -5794,7 +5725,7 @@ fn path_delay_ms(
         );
         let button_hits = [
             menu_hit, vban_hit, cables_hit, ducking_hit, player_hit, close_hit, min_hit, max_hit,
-            help_hit, lock_hit, r_hit, a_hit,
+            help_hit, lock_hit,
         ];
         let drag_strip = Rect::from_min_max(
             rect.min,
@@ -5924,30 +5855,6 @@ fn path_delay_ms(
             self.lock_gui = !self.lock_gui;
             let v = self.lock_gui;
             self.toast(if v { "Graphic interface locked" } else { "Graphic interface unlocked" });
-        }
-        x -= 30.0;
-        let rbox = Rect::from_min_size(Pos2::new(x - 24.0, rect.top() + 7.0), Vec2::new(24.0, 24.0));
-        p.rect_filled(rbox, 3.0, Color32::from_rgb(24, 34, 44));
-        p.rect_stroke(rbox, 3.0, Stroke::new(1.0, BLUE));
-        p.text(rbox.center(), Align2::CENTER_CENTER, "R", FontId::proportional(10.0), BLUE);
-        if ui
-            .interact(rbox, Id::new("rbox"), Sense::click())
-            .on_hover_text("Remote API: applications connected to the mixer")
-            .clicked()
-        {
-            self.toast("Remote API: 1 control application connected");
-        }
-        x -= 28.0;
-        let abox = Rect::from_min_size(Pos2::new(x - 24.0, rect.top() + 7.0), Vec2::new(24.0, 24.0));
-        p.rect_filled(abox, 3.0, Color32::from_rgb(24, 40, 32));
-        p.rect_stroke(abox, 3.0, Stroke::new(1.0, GREEN));
-        p.text(abox.center(), Align2::CENTER_CENTER, "A", FontId::proportional(10.0), GREEN);
-        if ui
-            .interact(abox, Id::new("abox"), Sense::click())
-            .on_hover_text("Audio callback: applications using the virtual inputs")
-            .clicked()
-        {
-            self.toast("Audio callback: 2 client applications connected");
         }
 
         // transient status message
@@ -6258,7 +6165,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit · 48 kHz"), from the
+        // The endpoint's configured format ("24-bit Â· 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6341,7 +6248,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit · 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit Â· 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui
@@ -6979,48 +6886,7 @@ Right click > Source to use the Windows capture stream instead."
                 }
             }
         }
-        // Centre-channel mute lives on the first virtual strip; karaoke on the
-        // second one (strings VInMuteC1 = M.C. Virtual Strip #4, VInMuteC2 =
-        // K Button Virtual Strip #5). Hardware inputs have neither button.
-        if idx == 3 {
-            let mc = self.strips[idx].mc;
-            let (c1, _) = chip(
-                ui,
-                Rect::from_min_size(Pos2::new(inner.left(), y + 18.0), Vec2::new(w, 16.0)),
-                "M.C.",
-                mc,
-                PURPLE,
-                enabled,
-                Id::new(("mc", idx)),
-                "Mute the centre channel (dialog) of a multichannel source",
-            );
-            if c1 {
-                self.strips[idx].mc = !mc;
-            }
-        } else if idx == 4 {
-            let k = self.strips[idx].karaoke;
-            let label = if k == 0 {
-                "K".to_string()
-            } else {
-                format!("K{}", k)
-            };
-            let (c2, _) = chip(
-                ui,
-                Rect::from_min_size(Pos2::new(inner.left(), y + 18.0), Vec2::new(w, 16.0)),
-                &label,
-                k > 0,
-                TEAL,
-                enabled,
-                Id::new(("karaoke", idx)),
-                "Karaoke: removes voice/centre; click cycles the processing",
-            );
-            if c2 {
-                // FUN_0053e7b0 (K button, control 0x515) cycles 0..4 and
-                // FUN_0052b490 clamps the stored karaoke value to 0..4.
-                self.strips[idx].karaoke = (k + 1) % 5;
-            }
-        }
-        y += 38.0;
+        y += 20.0;
 
         let ducked = self.duck.enabled
             && self.duck.source.is_some_and(|src| src < self.active_strips)
@@ -7420,48 +7286,13 @@ Right click > Source to use the Windows capture stream instead."
         let _ = hresp.on_hover_text(hover);
         y += header_h + 3.0;
 
-        // bus mode selector
-        let mode_rect = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, 18.0));
-        let (mclick, mresp) = mode_chip(
-            ui,
-            mode_rect,
-            MODE_NAMES[mode_slot(self.buses[idx].mode)],
-            accent,
-            enabled,
-            Id::new(("mode", idx)),
-            MODE_HELP[mode_slot(self.buses[idx].mode)],
-        );
-        if mclick {
-            // Stored BusMode values are not visited in numeric order by the
-            // original button (see next_bus_mode / FUN_0053e7b0).
-            self.buses[idx].mode = next_bus_mode(self.buses[idx].mode);
-            self.toast(format!(
-                "BUS {} mode: {}",
-                self.buses[idx].name,
-                MODE_NAMES[mode_slot(self.buses[idx].mode)]
-            ));
-        }
-        mresp.context_menu(|ui| {
-            ui.label("Bus mode");
-            for (i, name) in MODE_NAMES.iter().enumerate() {
-                if ui
-                    .selectable_label(self.buses[idx].mode == i, format!("{i}. {name}"))
-                    .clicked()
-                {
-                    self.buses[idx].mode = i;
-                    ui.close_menu();
-                }
-            }
-        });
-        y += 22.0;
-
         // buttons
         let g = 2.0;
         let bw = (w - g) / 2.0;
         let b = &self.buses[idx];
         let (c, resp) = chip(
             ui,
-            Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(bw, 17.0)),
+            Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, 17.0)),
             "EQ",
             b.eq_on,
             accent,
@@ -7492,22 +7323,6 @@ Right click > Source to use the Windows capture stream instead."
                 band.gain = 0.0;
             }
             self.toast(format!("BUS {} EQ flattened", self.buses[idx].name));
-        }
-        let (c, _) = chip(
-            ui,
-            Rect::from_min_size(Pos2::new(inner.left() + bw + g, y), Vec2::new(bw, 17.0)),
-            "SEL",
-            self.buses[idx].sel,
-            BLUE,
-            enabled,
-            Id::new(("bsel", idx)),
-            "Select this bus",
-        );
-        if c {
-            self.buses[idx].sel = !self.buses[idx].sel;
-            if self.monitor_on_sel {
-                self.buses[idx].monitor = self.buses[idx].sel;
-            }
         }
         // FUN_0053e7b0 cases 0x125-0x129 read bits 2 (0x4, mono) and 9
         // (0x200, L/R exchange) of the bus flag word. Pressing MONO walks
@@ -8744,9 +8559,6 @@ Right click > Source to use the Windows capture stream instead."
                         if check_item(right, "Show Contextual Help In Caption", self.help_caption) {
                             self.help_caption = !self.help_caption;
                         }
-                        if check_item(right, "Monitor on BUS SEL", self.monitor_on_sel) {
-                            self.monitor_on_sel = !self.monitor_on_sel;
-                        }
                         right.separator();
                         if menu_item(right, "About Box / License...", "", true) {
                             self.show_about = true;
@@ -8929,7 +8741,6 @@ Right click > Source to use the Windows capture stream instead."
                     ui.checkbox(&mut self.dev_srasio, "Use preferred ASIO sample rate");
                     ui.separator();
                     ui.checkbox(&mut self.limit_remote, "Limit Remote Gain to 0 dBfs");
-                    ui.checkbox(&mut self.monitor_on_sel, "Monitor on BUS SEL");
                     ui.checkbox(&mut self.help_caption, "Show contextual help in caption");
                     ui.add_space(4.0);
                     let patch = egui::RichText::new(
@@ -11297,41 +11108,6 @@ fn top_button(ui: &egui::Ui, rect: Rect, label: &str, active: bool, accent: Colo
     resp.clicked()
 }
 
-fn mode_chip(
-    ui: &egui::Ui,
-    rect: Rect,
-    label: &str,
-    accent: Color32,
-    enabled: bool,
-    id: Id,
-    tip: &str,
-) -> (bool, Response) {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let resp = ui.interact(rect, id, sense);
-    let hovered = resp.hovered() && enabled;
-    ui.painter().rect_filled(
-        rect,
-        2.5,
-        if hovered {
-            Color32::from_rgb(42, 48, 58)
-        } else {
-            Color32::from_rgb(27, 31, 38)
-        },
-    );
-    ui.painter()
-        .rect_stroke(rect, 2.5, Stroke::new(1.0, accent.gamma_multiply(0.55)));
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(7.6),
-        if enabled { accent } else { FAINT },
-    );
-    let clicked = resp.clicked() && enabled;
-    let resp = resp.on_hover_text(tip);
-    (clicked, resp)
-}
-
 fn draw_bus_eq_graph(
     ui: &egui::Ui,
     rect: Rect,
@@ -11862,14 +11638,14 @@ fn meter_widget(
     rect: Rect,
     meter: f32,
     peak: f32,
-    limit: &mut f32,
+    _limit: &mut f32,
     id: Id,
-    enabled: bool,
+    _enabled: bool,
     min_db: f32,
     span_db: f32,
     pad: f32,
 ) {
-    let sense = if enabled { Sense::click_and_drag() } else { Sense::hover() };
+    let sense = Sense::hover();
     let resp = ui.interact(rect, id, sense);
     let p = ui.painter();
     p.rect_filled(rect, 1.5, TRACK);
@@ -11930,48 +11706,9 @@ fn meter_widget(
             Stroke::new(1.0, Color32::from_rgb(240, 240, 210)),
         );
     }
-    // brickwall limiter threshold
-    let ly = gain_y(bar, *limit);
-    p.line_segment(
-        [Pos2::new(rect.left(), ly), Pos2::new(rect.left() + 4.0, ly)],
-        Stroke::new(1.5, RED),
-    );
-    // FUN_00541ce0 meter cells 200-205 (0xc8-0xcd):
-    //   new = limit_at_grab - (y - grab_y) * 78.0 / control_height
-    // (0x56de10 and the 0x57c770 height field, 234 px), clamped -40..+12.
-    // The rebuilt bar draws the same span, so one pixel is
-    // span_db / bar.height() dB rather than the 1 dB/px of the separate
-    // 60 px limiter controls 0x96-0x98.
-    let grab_id = id.with("limit-grab");
-    if enabled && resp.drag_started() {
-        let y = ui.input(|i| {
-            i.pointer
-                .press_origin()
-                .or_else(|| i.pointer.interact_pos())
-                .map(|p| p.y)
-                .unwrap_or(0.0)
-        });
-        ui.ctx().data_mut(|d| d.insert_temp(grab_id, (*limit, y)));
-    }
-    if enabled && resp.dragged() {
-        if let Some((limit_at_grab, grab_y)) =
-            ui.ctx().data(|d| d.get_temp::<(f32, f32)>(grab_id))
-        {
-            if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                let db_per_px = span_db / bar.height().max(1.0);
-                *limit = (limit_at_grab - (pos.y - grab_y) * db_per_px)
-                    .clamp(LIMIT_MIN, GAIN_MAX);
-            }
-        }
-    }
-    if enabled && resp.double_clicked() {
-        // FUN_00541510: a double click on a limiter control restores +12 dB
-        // (0x56db6c), not 0 dB.
-        *limit = GAIN_MAX;
-    }
     let shown_db = lin_to_db(meter).max(METER_FLOOR_DB);
     let _ = resp.on_hover_text(format!(
-        "Level {shown_db:.1} dB (scale {min_db:.0} to {:.0} dB) - drag to set the brickwall limit",
+        "Level {shown_db:.1} dB (scale {min_db:.0} to {:.0} dB)",
         min_db + span_db
     ));
 }
