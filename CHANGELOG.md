@@ -17,6 +17,12 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   for the playlist window, and which strip carries the player.
 - Removed the "Tape Recorder Options" window and the "Eject Cassette" menu item.
   The tape engine and built-in demo material stay for `--startup-demo`.
+- **Built-in COMP/GATE removed.** The strip's per-sample gate and compressor (fixed
+  threshold, one 0..10 knob, no UI since the rebuild) are gone; dynamics live in
+  the strip's VST/CLAP insert, which has real controls and metering. The engine
+  no longer writes `<StripComp>`/`<StripGate>`, `karaoke`, `prg_c`, `prg_g`,
+  `dblimit` or `muc`; scenes that contain them still load (the parser ignores
+  them).
 - **Player mirror (demo mode):** "Mirror to every strip" feeds the same decoded
   audio into every other strip's ring, so several plug-in windows can be shown
   on one source with no cable and no offset between strips. Each strip keeps its
