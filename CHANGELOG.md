@@ -30,6 +30,13 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   on one source with no cable and no offset between strips. Each strip keeps its
   own VST, fader and bus routing; switching the mirror off restores the previous
   input of every strip.
+- **Latency figure fixed: a plug-in's tail is not its latency.** The strip read
+  `(latency, tail)` from the host and displayed `max` of the two, so Spatial EQ
+  showed "1500.0 ms latency" while it actually reports **0 samples of latency
+  and a 72000-sample tail** (1.5 s of reverb). The insert now shows only the
+  latency, its tooltip and the status-bar breakdown name the tail separately,
+  and the tail is no longer added to the reported total. This is why a mirrored
+  Spatial EQ played in phase with TDR Nova's 1.8 ms.
 - **Top bar fits a narrow window.** At a large UI zoom a restored (not
   maximised) window can be under 1000 points wide, and the build label used to be
   drawn over the PLAYER button while a status message ran under `L ? X`. Below

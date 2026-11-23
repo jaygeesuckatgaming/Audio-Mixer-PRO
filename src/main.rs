@@ -1773,17 +1773,28 @@ impl MixerApp {
             .join("\n");
         let mut vst_ms = 0.0;
         let mut vst_count = 0usize;
+        let mut tail_s = 0.0f64;
         for slot in self.vsts.iter().take(self.active_strips) {
-            let (in_latency, out_latency) = slot.chain.latency();
-            let samples = in_latency.max(out_latency) as f64;
-            if samples > 0.0 {
-                vst_ms += samples / sr * 1000.0;
+            // (latency_samples, tail_samples): only the first is a delay.
+            let (latency, tail) = slot.chain.latency();
+            if latency > 0 {
+                vst_ms += latency as f64 / sr * 1000.0;
                 vst_count += 1;
             }
+            tail_s = tail_s.max(tail as f64 / sr);
         }
         let total = input_ms + block_ms + ring_ms + output_ms + vst_ms;
+        let tail_note = if tail_s > 0.0 {
+            format!(
+                "\nThe longest plug-in tail is {tail_s:.2} s (a reverb or look-ahead \
+                 buffer). A tail is not latency: it only says how long the plug-in \
+                 keeps ringing after the input stops."
+            )
+        } else {
+            String::new()
+        };
         let detail = format!(
-            "Estimated insert latency\ninput backlog {input_ms:.1} ms ({backlog_frames} frames, measured)\nmixer block {block_ms:.1} ms ({} frames)\noutput queue {ring_ms:.1} ms ({ring_frames} frames, monitoring bus)\noutput request {output_ms:.1} ms ({} frames, shared mode may round it up)\nplug-in latency {vst_ms:.1} ms across {vst_count} insert(s), not compensated\ntotal {total:.1} ms\n\nEvery bus ring right now:\n{per_bus}\n\nThe output queue is the cushion that absorbs a burst such as launching another\napp. A CPU spike also shows up in the input backlog; it is now slipped back to\nthe target over a few seconds instead of staying where it landed. The total\nfollows the monitoring bus; each bus's own depth is listed above.",
+            "Estimated insert latency\ninput backlog {input_ms:.1} ms ({backlog_frames} frames, measured)\nmixer block {block_ms:.1} ms ({} frames)\noutput queue {ring_ms:.1} ms ({ring_frames} frames, monitoring bus)\noutput request {output_ms:.1} ms ({} frames, shared mode may round it up)\nplug-in latency {vst_ms:.1} ms across {vst_count} insert(s), not compensated\ntotal {total:.1} ms{tail_note}\n\nEvery bus ring right now:\n{per_bus}\n\nThe output queue is the cushion that absorbs a burst such as launching another\napp. A CPU spike also shows up in the input backlog; it is now slipped back to\nthe target over a few seconds instead of staying where it landed. The total\nfollows the monitoring bus; each bus's own depth is listed above.",
             self.main_buffer, self.main_buffer
         );
         (total, detail)
@@ -6157,19 +6168,25 @@ Right click > Source to use the Windows capture stream instead."
                 state_color,
             );
 
-            let latency = if loaded {
-                let (in_latency, out_latency) = self.vsts[idx].chain.latency();
-                let samples = in_latency.max(out_latency);
-                if samples > 0 {
+            let (latency, tail) = if loaded {
+                // chain.latency() is (latency_samples, tail_samples). Only the
+                // first is processing delay; the second is how long the plug-in
+                // keeps ringing after the input stops (a reverb, a look-ahead
+                // buffer). Reading the tail as latency reported Spatial EQ as
+                // "1500.0 ms latency" when it actually reports 0 latency and a
+                // 1.5 s tail, which is why it stayed in phase with TDR Nova.
+                let (samples, tail) = self.vsts[idx].chain.latency();
+                let text = if samples > 0 {
                     format!(
                         "{:.1} ms latency",
                         (samples as f32 / self.sample_rate.max(1) as f32) * 1000.0
                     )
                 } else {
                     String::new()
-                }
+                };
+                (text, tail)
             } else {
-                String::new()
+                (String::new(), 0)
             };
 
             match self.vsts[idx].info.as_ref() {
@@ -6270,21 +6287,29 @@ Right click > Source to use the Windows capture stream instead."
             }
 
             let tip = match self.vsts[idx].info.as_ref() {
-                Some(info) => format!(
-                    "{}\n{} {}\n{}\n{} in / {} out{}\nClick: open its screen   Right click: {}",
-                    info.name,
-                    info.vendor,
-                    info.version,
-                    info.path.display(),
-                    info.audio_inputs,
-                    info.audio_outputs,
-                    if latency.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n{latency}")
-                    },
-                    if bypassed { "enable" } else { "bypass" }
-                ),
+                Some(info) => {
+                    let mut extra = String::new();
+                    if !latency.is_empty() {
+                        extra.push_str(&format!("\n{latency} (not compensated)"));
+                    }
+                    if tail > 0 {
+                        let secs = tail as f32 / self.sample_rate.max(1) as f32;
+                        extra.push_str(&format!(
+                            "\ntail {secs:.2} s (keeps ringing after the input stops)"
+                        ));
+                    }
+                    format!(
+                        "{}\n{} {}\n{}\n{} in / {} out{}\nClick: open its screen   Right click: {}",
+                        info.name,
+                        info.vendor,
+                        info.version,
+                        info.path.display(),
+                        info.audio_inputs,
+                        info.audio_outputs,
+                        extra,
+                        if bypassed { "enable" } else { "bypass" }
+                    )
+                }
                 None => format!(
                     "No plug-in on {}\nClick to choose one",
                     self.strip_label(idx)
@@ -8563,12 +8588,12 @@ Right click > Source to use the Windows capture stream instead."
                                 .map(|info| info.name.clone())
                                 .unwrap_or_else(|| "plug-in".to_string());
                             ui.label(format!(
-                                "{} - {}: {} samples ({:.1} ms), tail {}",
+                                "{} - {}: {} samples ({:.1} ms) latency, tail {:.2} s",
                                 self.strips[i].name,
                                 name,
                                 latency,
                                 latency as f32 / self.sample_rate.max(1) as f32 * 1000.0,
-                                tail
+                                tail as f32 / self.sample_rate.max(1) as f32
                             ));
                         }
                     }
