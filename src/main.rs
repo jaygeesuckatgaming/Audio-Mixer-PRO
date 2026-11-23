@@ -861,7 +861,6 @@ struct MixerApp {
     /// In-app clipboard used by the strip context menu's Copy All / Paste
     /// (FUN_00538860 commands 0x262 and 0x26c).
     strip_clip: Option<StripClip>,
-    tape_error: Option<String>,
     /// Internal streaming player: playlist, gapless playback and crossfade.
     /// It pushes decoded frames into the same ring a capture uses, so its strip
     /// gets the full channel strip (fader, EQ, dynamics, VST, insert, buses).
@@ -1447,7 +1446,6 @@ impl MixerApp {
             label_edit: None,
             label_buf: String::new(),
             strip_clip: None,
-            tape_error: None,
             player: None,
             player_strip: MAX_STRIPS - 1,
             player_attached: usize::MAX,
@@ -2255,7 +2253,6 @@ fn path_delay_ms(
         self.tape.len = audio::DEMO_LEN_SECS;
         self.tape.pos = 0.0;
         self.tape.playing = false;
-        self.tape_error = None;
         if self.audio.available {
             self.toast(format!("{} selected - press Play", kind.file_name()));
         } else {
@@ -2279,7 +2276,6 @@ fn path_delay_ms(
                 self.tape.len = info.duration.max(0.1);
                 self.tape.pos = 0.0;
                 self.tape.playing = false;
-                self.tape_error = None;
                 if self.audio.available {
                     self.toast(format!(
                         "Loaded {} ({}) - press Play",
@@ -2292,7 +2288,6 @@ fn path_delay_ms(
                 true
             }
             Err(err) => {
-                self.tape_error = Some(format!("{display}: {err}"));
                 self.toast_for(format!("Could not load {display}: {err}"), 9.0);
                 false
             }
@@ -4708,10 +4703,6 @@ fn path_delay_ms(
                 self.load_wav_file(PathBuf::from(&tape_path));
             } else {
                 self.tape.path = tape_path;
-                self.tape_error = Some(format!(
-                    "The saved file is no longer on disk: {}",
-                    self.tape.path
-                ));
             }
         }
     }
@@ -5164,10 +5155,6 @@ fn path_delay_ms(
                 self.load_wav_file(PathBuf::from(&tape_path));
             } else {
                 self.tape.path = tape_path;
-                self.tape_error = Some(format!(
-                    "The saved file is no longer on disk: {}",
-                    self.tape.path
-                ));
             }
         }
         self.toast("Settings loaded from mixer_settings.txt");
@@ -5191,7 +5178,6 @@ fn path_delay_ms(
         self.buses = (0..audio::MAX_BUSES).map(Bus::new).collect();
         self.audio.unload();
         self.tape = Tape::new();
-        self.tape_error = None;
         self.vst_panel = None;
         self.picker = None;
         self.label_edit = None;
@@ -9891,20 +9877,6 @@ impl eframe::App for MixerApp {
                     self.tape.pos = 0.0;
                     self.tape.playing = false;
                 }
-            }
-        }
-
-        // An audio file dropped on the console is loaded into the tape deck.
-        if !self.lock_gui {
-            let dropped: Vec<PathBuf> = ctx.input(|i| {
-                i.raw
-                    .dropped_files
-                    .iter()
-                    .filter_map(|f| f.path.clone())
-                    .collect()
-            });
-            if let Some(path) = dropped.into_iter().next() {
-                self.load_wav_file(path);
             }
         }
 

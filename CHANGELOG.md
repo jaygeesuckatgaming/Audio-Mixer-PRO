@@ -16,7 +16,9 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   bar now shows the current track, elapsed/total, previous/play/next, a button
   for the playlist window, and which strip carries the player.
 - Removed the "Tape Recorder Options" window and the "Eject Cassette" menu item.
-  The tape engine and built-in demo material stay for `--startup-demo`.
+  The tape engine and built-in demo material stay for `--startup-demo`. A file
+  dropped from Explorer now only goes to the player playlist; it used to be
+  loaded into the hidden tape deck as well.
 - **Built-in COMP/GATE removed.** The strip's per-sample gate and compressor (fixed
   threshold, one 0..10 knob, no UI since the rebuild) are gone; dynamics live in
   the strip's VST/CLAP insert, which has real controls and metering. The engine
