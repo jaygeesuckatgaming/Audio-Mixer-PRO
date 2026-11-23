@@ -30,6 +30,13 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   on one source with no cable and no offset between strips. Each strip keeps its
   own VST, fader and bus routing; switching the mirror off restores the previous
   input of every strip.
+- **Buses no longer stay dark when the device list is slow.** If the output
+  enumeration was wedged inside the audio service (a cable attaching, a wedged
+  endpoint), the empty list made every bus resolve to "no device", so the cards
+  stayed dim with no error while the meters still moved. Buses now open from
+  their saved device names when the list is not available, and the probe times
+  out after 5 s and is retried every 20 s instead of blocking the input probe
+  and the bus routing for the rest of the session.
 - **Latency figure fixed: a plug-in's tail is not its latency.** The strip read
   `(latency, tail)` from the host and displayed `max` of the two, so Spatial EQ
   showed "1500.0 ms latency" while it actually reports **0 samples of latency

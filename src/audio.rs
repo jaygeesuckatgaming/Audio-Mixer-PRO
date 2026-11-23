@@ -2305,6 +2305,15 @@ impl AudioEngine {
             if name.is_empty() {
                 return None;
             }
+            // An empty list means the output probe has not answered: a wedged
+            // or re-enumerating audio service, not "this device is gone".
+            // Resolving against it used to route every bus to nothing, so the
+            // mixer went silent with dim bus lights and no error. Try the saved
+            // name instead; if the endpoint really is missing the open worker
+            // fails, the card shows the error and it is retried every 3 s.
+            if names.is_empty() {
+                return Some(name.to_string());
+            }
             if let Some(exact) = names.iter().find(|n| n.eq_ignore_ascii_case(name)) {
                 return Some(exact.clone());
             }

@@ -185,6 +185,10 @@ const OUT_PATCH_MAX: i32 = 64;
 // The console stores the tape position in milliseconds (scene +0x23c4/0x23c7),
 // so the rebuild's position in seconds is floored to the same 1 s grid.
 const TAPE_POS_GRID_S: f32 = 1.0;
+/// How long an output-device enumeration may stay unanswered before it is
+/// treated as wedged inside the audio service. Buses keep playing from their
+/// saved device names while this holds; a fresh probe is tried after a pause.
+const DEVICE_PROBE_TIMEOUT_S: f64 = 5.0;
 
 // The original's meters are fed by the engine's per-channel peak values
 // (FUN_00538130) and drawn in FUN_00537110; there is no synthetic motion in
@@ -939,6 +943,8 @@ struct MixerApp {
     /// Last time each probe was started, so a picker that asks every frame
     /// cannot spawn a thread and enumerate devices at frame rate.
     devices_probe_at: f64,
+    /// When a probe that never answered may be replaced by a new one.
+    devices_probe_retry_at: f64,
     inputs_probe_at: f64,
     last_inputs: Vec<String>,
     /// Set once the saved captures have been applied from a probed list, so a
@@ -1489,6 +1495,7 @@ impl MixerApp {
             devices_probe: None,
             inputs_probe: None,
             devices_probe_at: 0.0,
+            devices_probe_retry_at: 0.0,
             inputs_probe_at: 0.0,
             last_inputs: Vec::new(),
             inputs_applied: false,
@@ -2756,12 +2763,36 @@ fn path_delay_ms(
         // tick instead of stacking more audio calls behind it.
         if let Some(probe) = self.devices_probe.take() {
             match probe.try_recv() {
-                Ok(devices) => self.handle_device_list(devices),
+                Ok(devices) => {
+                    self.devices_probe_retry_at = 0.0;
+                    self.handle_device_list(devices)
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    self.devices_probe = Some(probe);
+                    // An enumeration that has not answered for seconds is wedged
+                    // inside the audio service (a cable re-enumerating, a wedged
+                    // endpoint). Dropping the receiver abandons that thread; a
+                    // fresh probe is started after a cool-down, because a second
+                    // wedged call would only stack up. Bus outputs keep running
+                    // meanwhile: they open from the saved names, not this list.
+                    if self.time - self.devices_probe_at > DEVICE_PROBE_TIMEOUT_S {
+                        if self.time >= self.devices_probe_retry_at {
+                            self.devices_probe_retry_at = self.time + 20.0;
+                            diag_log(
+                                "audio: output device probe not answering; bus devices kept",
+                            );
+                        }
+                        self.probe_inputs_now();
+                    } else {
+                        self.devices_probe = Some(probe);
+                    }
                     return;
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // The probe thread died without a result. Try again later
+                    // instead of never probing again.
+                    self.devices_probe_retry_at = self.time + 5.0;
+                    return;
+                }
             }
         }
         self.poll_clock += dt;
@@ -2910,15 +2941,18 @@ fn path_delay_ms(
             }
             self.last_group_report = groups;
         }
-        let (sender, receiver) = std::sync::mpsc::channel();
-        if std::thread::Builder::new()
-            .name("device-probe".to_string())
-            .spawn(move || {
-                let _ = sender.send(AudioEngine::output_devices());
-            })
-            .is_ok()
-        {
-            self.devices_probe = Some(receiver);
+        if self.time >= self.devices_probe_retry_at {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            if std::thread::Builder::new()
+                .name("device-probe".to_string())
+                .spawn(move || {
+                    let _ = sender.send(AudioEngine::output_devices());
+                })
+                .is_ok()
+            {
+                self.devices_probe = Some(receiver);
+                self.devices_probe_at = self.time;
+            }
         }
         // Refresh the capture list on the same cadence: a cable attached after
         // start-up (or a device plugged in later) only becomes visible here, and
