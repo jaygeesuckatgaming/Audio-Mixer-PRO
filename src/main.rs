@@ -7472,14 +7472,14 @@ Right click > Source to use the Windows capture stream instead."
         p.text(
             Pos2::new(inner.left(), row_y + 2.0),
             Align2::LEFT_TOP,
-            "PLAYER",
+            "MUSIC",
             FontId::proportional(9.5),
             AMBER,
         );
         p.text(
             Pos2::new(inner.left(), row_y + 12.0),
             Align2::LEFT_TOP,
-            "MUSIC",
+            "PLAYER",
             FontId::proportional(6.5),
             FAINT,
         );
