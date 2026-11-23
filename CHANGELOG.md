@@ -30,6 +30,12 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   on one source with no cable and no offset between strips. Each strip keeps its
   own VST, fader and bus routing; switching the mirror off restores the previous
   input of every strip.
+- **Top bar fits a narrow window.** At a large UI zoom a restored (not
+  maximised) window can be under 1000 points wide, and the build label used to be
+  drawn over the PLAYER button while a status message ran under `L ? X`. Below
+  that width the SCENE badge is dropped, CABLES/DUCKING/PLAYER move into its
+  space, and the build label and status message are placed in the strip before
+  the window controls (or left out when it is too small).
 - **Scenes no longer carry dead console state.** The writer stopped emitting
   `paneltype`, `ColorPanel*`, `ModPanel*`, `audibility_c/g`, `muc`, `prg_c/g`,
   the bus `BusMode`/`SEL`/`monitor`, `<VMOptions MonitorOnSEL>`, `engine`,
