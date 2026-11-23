@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 Audio Mixer PRO reports its build in the top bar as `<CHANNEL> Â· rev <REV>`.
 `REV` counts every published build of that release line.
@@ -30,6 +30,7 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   on one source with no cable and no offset between strips. Each strip keeps its
   own VST, fader and bus routing; switching the mirror off restores the previous
   input of every strip.
+- **The live latency readout is back.** The old status bar carried latency ~N ms; the MUSIC PLAYER bar replaced it and the figure was only left in the diagnostics report. It now sits at the right end of the bar's second row (dim, amber from 150 ms, red from 250 ms) and its tooltip is the same breakdown as before: input backlog, mixer block, output queue, output request, plug-in latency and the total.
 - **The demo mirror no longer writes "PLAYER" into the scene.** While mirror was
   on, every mirrored strip's input was set to the string `PLAYER`, and Save
   Settings wrote that, so after a restart (the mirror itself is never saved)

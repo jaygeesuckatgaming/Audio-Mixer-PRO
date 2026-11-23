@@ -7202,6 +7202,46 @@ Right click > Source to use the Windows capture stream instead."
                 Color32::from_rgb(26, 20, 10),
             );
         }
+
+        // Latency, on the free second row at the right end, where the old
+        // status bar had it. Hovering it opens the same breakdown the
+        // diagnostics report carries: input backlog, mixer block, output
+        // queue, device request and plug-in latency.
+        if self.audio.available {
+            let (latency, detail) = self.latency_report();
+            let text = if latency >= 1.0 {
+                format!("latency ~{latency:.0} ms")
+            } else {
+                "latency ~0 ms".to_string()
+            };
+            let colour = if latency >= 250.0 {
+                RED
+            } else if latency >= 150.0 {
+                AMBER
+            } else {
+                DIM
+            };
+            let font = FontId::proportional(8.0);
+            let width = p
+                .layout_no_wrap(text.clone(), font.clone(), colour)
+                .size()
+                .x;
+            let baseline = row_y + 30.0;
+            p.text(
+                Pos2::new(inner.right() - 2.0, baseline),
+                Align2::RIGHT_TOP,
+                text,
+                font,
+                colour,
+            );
+            let hit = Rect::from_min_size(
+                Pos2::new(inner.right() - 2.0 - width - 4.0, baseline - 2.0),
+                Vec2::new(width + 8.0, 14.0),
+            );
+            let _ = ui
+                .interact(hit, Id::new("latency_readout"), Sense::hover())
+                .on_hover_text(detail);
+        }
     }
     fn ensure_player(&mut self) {
         if self.player.is_none() {
