@@ -59,6 +59,13 @@ const APPS_ROW_H: f32 = 22.0;
 const APPS_VISIBLE_ROWS: usize = 3;
 const APPS_BLOCK_H: f32 = APPS_HEADER_H + APPS_ROW_H * APPS_VISIBLE_ROWS as f32;
 
+/// Strip and bus card header: strip/bus name, device line, and a reserved line
+/// for the endpoint format Windows reports. That third line is kept even when
+/// the format is unknown (no device connected, or the property scan has not
+/// answered yet), so every card - and both kinds of card - starts its EQ and
+/// fader at the same height instead of jumping by a line.
+const CARD_HEADER_H: f32 = 35.0;
+
 // Menu command ids from FUN_0052faa0, handled by FUN_00543640.
 const CMD_RESTART_ENGINE: u32 = 80; // 0x50
 const CMD_AUTO_RESTART_A1: u32 = 85; // 0x55
@@ -6143,7 +6150,7 @@ fn path_delay_ms(
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
         let endpoint_format = self.endpoint_formats.get(&self.strips[idx].device);
-        let header_h = if endpoint_format.is_some() { 35.0 } else { 26.0 };
+        let header_h = CARD_HEADER_H;
 
         // header (click = choose device, right click = strip menu)
         let header = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, header_h));
@@ -7034,7 +7041,7 @@ Right click > Source to use the Windows capture stream instead."
                 self.endpoint_formats.get(&name)
             }
         };
-        let header_h = if bus_format.is_some() { 35.0 } else { 26.0 };
+        let header_h = CARD_HEADER_H;
 
         let header = Rect::from_min_size(Pos2::new(inner.left(), y), Vec2::new(w, header_h));
         let hresp = ui.interact(header, Id::new(("bus_head", idx)), Sense::click());
