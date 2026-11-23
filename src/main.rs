@@ -2509,8 +2509,6 @@ fn path_delay_ms(
                 i,
                 s.gain_db,
                 s.pan,
-                s.comp,
-                s.gate,
                 s.mute,
                 s.solo,
                 s.mono,
@@ -3507,51 +3505,24 @@ fn path_delay_ms(
                 flags |= 0x4000_0000;
             }
             text.push_str(&format!(
-                "\t<Strip index='{}' mute='{}' vaio='{}' solo='{}' mono='{}' muc='{}' prg_c='{}' prg_g='{}' busa='{}' busa2='{}' busa3='{}' busb='{}' busb2='{}' busb3='{}' karaoke='{}' dblevel='{:.2}' dblimit='{:.2}' direct='{}' />\n",
+                "\t<Strip index='{}' mute='{}' vaio='{}' solo='{}' mono='{}' busa='{}' busa2='{}' busa3='{}' busb='{}' busb2='{}' busb3='{}' dblevel='{:.2}' direct='{}' />\n",
                 i + 1,
                 flags & 1,
                 (flags >> 30) & 1,
                 (flags >> 1) & 1,
                 (flags >> 2) & 1,
-                (flags >> 3) & 1,
-                (flags >> 4) & 1,
-                (flags >> 5) & 1,
                 (flags >> 12) & 1,
                 (flags >> 13) & 1,
                 (flags >> 14) & 1,
                 (flags >> 16) & 1,
                 (flags >> 17) & 1,
                 (flags >> 18) & 1,
-                s.karaoke,
                 s.gain_db,
-                s.limit,
                 if self.strip_direct.get(i).copied().unwrap_or(true) {
                     1
                 } else {
                     0
                 }
-            ));
-            text.push_str(&format!(
-                "\t<StripComp index='{}' gainin='{:.2}' attack='{:.1}' release='{:.1}' knee='{:.2}' comprate='{:.3}' threshold='{:.2}' automakeup='{}' gainout='{:.2}' />\n",
-                i + 1,
-                COMP_GAININ_DB,
-                COMP_ATTACK_MS,
-                COMP_RELEASE_MS,
-                COMP_KNEE,
-                COMP_RATIO,
-                COMP_THRESHOLD_DB,
-                COMP_AUTOMAKEUP,
-                COMP_GAINOUT_DB
-            ));
-            text.push_str(&format!(
-                "\t<StripGate index='{}' thresin='{:.2}' damping='{:.2}' bpsidechain='{:.0}' attack='{:.1}' hold='{:.1}' release='{:.1}' />\n",
-                i + 1,
-                GATE_THRESHOLD_DB,
-                GATE_DAMPING_DB,
-                GATE_SIDECHAIN_PCT,
-                GATE_ATTACK_MS,
-                GATE_HOLD_MS,
-                GATE_RELEASE_MS
             ));
             if i < 3 {
                 // FUN_00528b40 hardware strip format (0x569b60): all three
@@ -7625,7 +7596,7 @@ Right click > Source to use the Windows capture stream instead."
             .any(|s| s.solo);
         let s = &self.strips[strip];
         self.audio.set_strip(
-            strip, s.gain_db, s.pan, s.comp, s.gate, s.mute, s.solo, s.mono, s.route, any_solo,
+            strip, s.gain_db, s.pan, s.mute, s.solo, s.mono, s.route, any_solo,
         );
         self.audio.attach_input(strip, input);
         self.player_attached = strip;
@@ -7664,7 +7635,7 @@ Right click > Source to use the Windows capture stream instead."
                     .any(|s| s.solo);
                 let s = &self.strips[i];
                 self.audio.set_strip(
-                    i, s.gain_db, s.pan, 0.0, 0.0, s.mute, s.solo, s.mono, s.route, any_solo,
+                    i, s.gain_db, s.pan, s.mute, s.solo, s.mono, s.route, any_solo,
                 );
                 self.audio.attach_input(i, Arc::clone(&ring));
                 rings.push(ring);
@@ -9141,46 +9112,10 @@ Right click > Source to use the Windows capture stream instead."
                     ui.label(format!("Version {}", BUILD_FULL));
                     ui.label("Up to 16 input strips, hardware or virtual");
                     ui.label("6 buses: A1-A3 to devices, B1-B3 to virtual outputs");
-                    ui.label("Per-strip fader, pan, dynamics and a VST3/CLAP insert");
+                    ui.label("Per-strip fader, pan and a VST3/CLAP insert (dynamics, EQ, colour)");
                     ui.label("Optional external ASIO insert, one DAW per stereo pair");
                     ui.label("Streaming music player: playlists, gapless playback, crossfade");
                     ui.label("Virtual cables: kernel driver (experimental) and USB/IP");
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Engine dynamics (fixed values)")
-                            .size(10.0)
-                            .color(DIM),
-                    );
-                    ui.label(format!(
-                        "Compressor: I/O {:.1}/{:.1} dB, {:.0} ms attack, {:.0} ms release, \
-                         {:.2} knee, {:.3} ratio, {:.0} dB threshold, auto make-up {}",
-                        COMP_GAININ_DB,
-                        COMP_GAINOUT_DB,
-                        COMP_ATTACK_MS,
-                        COMP_RELEASE_MS,
-                        COMP_KNEE,
-                        COMP_RATIO,
-                        COMP_THRESHOLD_DB,
-                        if COMP_AUTOMAKEUP != 0 { "on" } else { "off" }
-                    ));
-                    ui.label(format!(
-                        "Gate: {:.0} dB threshold, {:.0} dB damping, {:.0}% side-chain, \
-                         {:.0} ms attack, {:.0} ms hold, {:.0} ms release",
-                        GATE_THRESHOLD_DB,
-                        GATE_DAMPING_DB,
-                        GATE_SIDECHAIN_PCT,
-                        GATE_ATTACK_MS,
-                        GATE_HOLD_MS,
-                        GATE_RELEASE_MS
-                    ));
-                    ui.label(
-                        egui::RichText::new(
-                            "COMP and GATE are the original's 0..10 audibility knobs; \
-                             these engine values are fixed and are not saved in the scene.",
-                        )
-                        .size(9.0)
-                        .color(DIM),
-                    );
                     ui.separator();
                     if self.audio.available {
                         ui.label(format!(

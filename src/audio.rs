@@ -1,4 +1,4 @@
-use crate::vban::TxRing;
+﻿use crate::vban::TxRing;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
 use std::collections::VecDeque;
@@ -72,7 +72,7 @@ fn bus_cushion_frames(device: &str) -> usize {
 /// Consumption multiplier applied by an output callback's rate servo: below the
 /// target fill it reads a little slower so the mixer refills the cushion, above
 /// it a little faster. `trim` is carried by the caller and integrated there; the
-/// result is clamped to `±SERVO_TRIM`, so it can never be heard as a pitch shift
+/// result is clamped to `Â±SERVO_TRIM`, so it can never be heard as a pitch shift
 /// beyond a few cents.
 fn servo_step(base_step: f32, trim: f32) -> f32 {
     base_step * (1.0 - trim.clamp(-SERVO_TRIM, SERVO_TRIM))
@@ -633,10 +633,6 @@ fn strip_route_mask(index: usize) -> u32 {
 struct StripMix {
     gain_db: AtomicU32,
     pan: AtomicU32,
-    /// Comp knob, 0..10 (`audibility_c`). 0 = bypass.
-    comp: AtomicU32,
-    /// Gate knob, 0..10 (`audibility_g`). 0 = bypass.
-    gate: AtomicU32,
     /// Virtual-strip 3-band EQ (low shelf, mid bell, high shelf), dB.
     eq: [AtomicU32; 3],
     /// bit 0 mute, bit 1 solo, bit 2 mono
@@ -650,8 +646,6 @@ impl StripMix {
         Self {
             gain_db: f32_atomic(0.0),
             pan: f32_atomic(0.0),
-            comp: f32_atomic(0.0),
-            gate: f32_atomic(0.0),
             eq: std::array::from_fn(|_| f32_atomic(0.0)),
             flags: AtomicU32::new(0),
             route: AtomicU32::new(1),
@@ -753,8 +747,6 @@ struct Shared {
     duck_source_level: AtomicU32,
     /// Live per-strip dynamics meters: compressor reduction (negative dB) and
     /// gate attenuation (0 dB open, about -60 dB closed).
-    strip_comp_gr: [AtomicU32; MAX_STRIPS],
-    strip_gate_att: [AtomicU32; MAX_STRIPS],
     /// Mixer blocks that missed their deadline, and bus streams that ran out of
     /// queued audio. Both are zero on a healthy session; a burst (starting a
     /// heavy app) shows up here before it is audible.
@@ -845,8 +837,6 @@ impl Shared {
             duck_release_ms: f32_atomic(300.0),
             duck_gain_db: f32_atomic(0.0),
             duck_source_level: f32_atomic(0.0),
-            strip_comp_gr: std::array::from_fn(|_| f32_atomic(0.0)),
-            strip_gate_att: std::array::from_fn(|_| f32_atomic(0.0)),
             error: Mutex::new(None),
         }
     }
@@ -983,12 +973,6 @@ struct Dsp {
     duck_env: f32,
     duck_gain: f32,
     /// Per-strip dynamics: detector envelopes, gains and gate state.
-    comp_env: [f32; MAX_STRIPS],
-    comp_gain: [f32; MAX_STRIPS],
-    gate_env: [f32; MAX_STRIPS],
-    gate_gain: [f32; MAX_STRIPS],
-    gate_hold: [u32; MAX_STRIPS],
-    gate_open: [bool; MAX_STRIPS],
     /// Virtual-strip 3-band EQ: three biquads per channel per strip.
     strip_eq_l: [[Biquad; 3]; MAX_STRIPS],
     strip_eq_r: [[Biquad; 3]; MAX_STRIPS],
@@ -1023,12 +1007,6 @@ impl Dsp {
             inserts: crate::asio_insert::Inserts::new(rate.max(8000.0) as u32),
             duck_env: 0.0,
             duck_gain: 1.0,
-            comp_env: [0.0; MAX_STRIPS],
-            comp_gain: [1.0; MAX_STRIPS],
-            gate_env: [0.0; MAX_STRIPS],
-            gate_gain: [1.0; MAX_STRIPS],
-            gate_hold: [0; MAX_STRIPS],
-            gate_open: [true; MAX_STRIPS],
             strip_eq_l: std::array::from_fn(|_| [Biquad::identity(); 3]),
             strip_eq_r: std::array::from_fn(|_| [Biquad::identity(); 3]),
             strip_eq_gain: [[0.0; 3]; MAX_STRIPS],
@@ -1140,8 +1118,6 @@ impl Dsp {
         let mut strip_on = [false; MAX_STRIPS];
         let mut strip_gain = [0.0f32; MAX_STRIPS];
         let mut strip_pan = [0.0f32; MAX_STRIPS];
-        let mut strip_comp = [0.0f32; MAX_STRIPS];
-        let mut strip_gate = [0.0f32; MAX_STRIPS];
         let mut strip_flags = [0u32; MAX_STRIPS];
         let mut strip_route = [0u32; MAX_STRIPS];
         for i in 0..strip_count {
@@ -1149,8 +1125,6 @@ impl Dsp {
             strip_flags[i] = s.flags.load(Ordering::Relaxed);
             strip_gain[i] = db_to_lin(load_f32(&s.gain_db));
             strip_pan[i] = load_f32(&s.pan);
-            strip_comp[i] = load_f32(&s.comp).clamp(0.0, 10.0);
-            strip_gate[i] = load_f32(&s.gate).clamp(0.0, 10.0);
             // A strip is read when it is routed to any bus this callback
             // renders (A1, B1 or B2), it is not muted and, if any strip is
             // soloed, it is one of the soloed strips.
@@ -1188,23 +1162,6 @@ impl Dsp {
         let level_attack = one_pole(5.0, sample_rate);
         let level_release = one_pole(80.0, sample_rate);
 
-        // Dynamics coefficients and fixed parameters. 0 on a knob = bypass.
-        let comp_det_attack = one_pole(5.0, sample_rate);
-        let comp_det_release = one_pole(100.0, sample_rate);
-        let comp_attack = one_pole(10.0, sample_rate);
-        let comp_release = one_pole(150.0, sample_rate);
-        let gate_det_attack = one_pole(1.0, sample_rate);
-        let gate_det_release = one_pole(20.0, sample_rate);
-        let gate_attack = one_pole(1.0, sample_rate);
-        let gate_release = one_pole(250.0, sample_rate);
-        let gate_hold_samples = (sample_rate * 0.120) as u32;
-        let gate_closed_gain = db_to_lin(-60.0);
-        let mut comp_makeup = [1.0f32; MAX_STRIPS];
-        let mut gate_threshold = [0.0f32; MAX_STRIPS];
-        for i in 0..MAX_STRIPS {
-            comp_makeup[i] = db_to_lin(0.6 * strip_comp[i]);
-            gate_threshold[i] = db_to_lin(-55.0 + 3.5 * strip_gate[i]);
-        }
 
         // Take a private reference to each capture stream, then one lock per
         // stream for the whole callback. No lock is taken per frame.
@@ -1260,7 +1217,7 @@ impl Dsp {
             }
             // Pre-FX insert: send the dry block, then use the returned one in its
             // place. The return belongs to an earlier block, so the strip is a
-            // block or two late — inherent to an external insert.
+            // block or two late â€” inherent to an external insert.
             let insert = shared.inserts.get(i);
             if insert_active {
                 if let Some((pair, false)) = insert {
@@ -1436,95 +1393,6 @@ impl Dsp {
                         self.readers[i].next(ring, input_rates[i], sample_rate as u32)
                     };
 
-                    // Gate/expander then compressor, pre-fader, on the strips
-                    // that own those knobs. 0 on a knob bypasses that stage.
-                    if i < DYNAMICS_STRIPS {
-                        if strip_gate[i] > 0.0 {
-                            let level = s[0].abs().max(s[1].abs());
-                            let coeff = if level > self.gate_env[i] {
-                                gate_det_attack
-                            } else {
-                                gate_det_release
-                            };
-                            self.gate_env[i] += (level - self.gate_env[i]) * coeff;
-                            if self.gate_open[i] {
-                                if self.gate_env[i] < gate_threshold[i] * 0.5 {
-                                    self.gate_hold[i] += 1;
-                                    if self.gate_hold[i] >= gate_hold_samples {
-                                        self.gate_open[i] = false;
-                                        self.gate_hold[i] = 0;
-                                    }
-                                } else {
-                                    self.gate_hold[i] = 0;
-                                }
-                            } else if self.gate_env[i] > gate_threshold[i] {
-                                self.gate_open[i] = true;
-                                self.gate_hold[i] = 0;
-                            }
-                            let target = if self.gate_open[i] {
-                                1.0
-                            } else {
-                                gate_closed_gain
-                            };
-                            let coeff = if target > self.gate_gain[i] {
-                                gate_attack
-                            } else {
-                                gate_release
-                            };
-                            self.gate_gain[i] += (target - self.gate_gain[i]) * coeff;
-                            s[0] *= self.gate_gain[i];
-                            s[1] *= self.gate_gain[i];
-                        } else {
-                            self.gate_gain[i] = 1.0;
-                            self.gate_open[i] = true;
-                            self.gate_env[i] = 0.0;
-                        }
-
-                        if strip_comp[i] > 0.0 {
-                            let level = s[0].abs().max(s[1].abs());
-                            let coeff = if level > self.comp_env[i] {
-                                comp_det_attack
-                            } else {
-                                comp_det_release
-                            };
-                            self.comp_env[i] += (level - self.comp_env[i]) * coeff;
-
-                            // Fixed -24 dBFS threshold, 6 dB soft knee and a
-                            // ratio taken from the knob (1:1 at 0, 11:1 at 10).
-                            let level_db = lin_to_db(self.comp_env[i]);
-                            let over = level_db + 24.0;
-                            let ratio = 1.0 + strip_comp[i];
-                            let slope = 1.0 - 1.0 / ratio;
-                            let knee = 6.0f32;
-                            let reduction_db = if over <= -knee * 0.5 {
-                                0.0
-                            } else if over < knee * 0.5 {
-                                let t = over + knee * 0.5;
-                                (t * t) / (2.0 * knee) * slope
-                            } else {
-                                over * slope
-                            };
-                            let target = db_to_lin(-reduction_db);
-                            let coeff = if target < self.comp_gain[i] {
-                                comp_attack
-                            } else {
-                                comp_release
-                            };
-                            self.comp_gain[i] += (target - self.comp_gain[i]) * coeff;
-                            let applied = self.comp_gain[i] * comp_makeup[i];
-                            s[0] *= applied;
-                            s[1] *= applied;
-                        } else {
-                            self.comp_gain[i] = 1.0;
-                            self.comp_env[i] = 0.0;
-                        }
-                    } else {
-                        self.gate_gain[i] = 1.0;
-                        self.gate_open[i] = true;
-                        self.gate_env[i] = 0.0;
-                        self.comp_gain[i] = 1.0;
-                        self.comp_env[i] = 0.0;
-                    }
 
                     if i >= DYNAMICS_STRIPS && self.strip_eq_ready[i] {
                         let mut l = s[0];
@@ -1714,20 +1582,6 @@ impl Dsp {
             .to_bits(),
             Ordering::Relaxed,
         );
-        for i in 0..MAX_STRIPS {
-            let reduction = if strip_comp[i] > 0.0 {
-                lin_to_db(self.comp_gain[i])
-            } else {
-                0.0
-            };
-            let attenuation = if strip_gate[i] > 0.0 {
-                lin_to_db(self.gate_gain[i])
-            } else {
-                0.0
-            };
-            shared.strip_comp_gr[i].store(reduction.to_bits(), Ordering::Relaxed);
-            shared.strip_gate_att[i].store(attenuation.to_bits(), Ordering::Relaxed);
-        }
         shared
             .source_peak
             .store(source_peak.to_bits(), Ordering::Relaxed);
@@ -2715,23 +2569,6 @@ impl AudioEngine {
         load_f32(&self.shared.duck_source_level)
     }
 
-    /// Live compressor gain reduction for a strip (negative dB, 0.0 = idle).
-    pub fn strip_comp_gr_db(&self, index: usize) -> f32 {
-        self.shared
-            .strip_comp_gr
-            .get(index)
-            .map(load_f32)
-            .unwrap_or(0.0)
-    }
-
-    /// Live gate attenuation for a strip (0 dB open, about -60 dB closed).
-    pub fn strip_gate_att_db(&self, index: usize) -> f32 {
-        self.shared
-            .strip_gate_att
-            .get(index)
-            .map(load_f32)
-            .unwrap_or(0.0)
-    }
 
     pub fn bus_peak(&self, index: usize) -> f32 {
         if index >= MAX_BUSES {
@@ -2828,8 +2665,6 @@ impl AudioEngine {
         index: usize,
         gain_db: f32,
         pan: f32,
-        comp: f32,
-        gate: f32,
         mute: bool,
         solo: bool,
         mono: bool,
@@ -2842,10 +2677,6 @@ impl AudioEngine {
         let s = &self.shared.strips[index];
         s.gain_db.store(gain_db.to_bits(), Ordering::Relaxed);
         s.pan.store(pan.to_bits(), Ordering::Relaxed);
-        s.comp
-            .store(comp.clamp(0.0, 10.0).to_bits(), Ordering::Relaxed);
-        s.gate
-            .store(gate.clamp(0.0, 10.0).to_bits(), Ordering::Relaxed);
         let mut flags = 0u32;
         if mute {
             flags |= 1;
@@ -5559,28 +5390,10 @@ pub fn dynamics_selftest(report_path: &Path) {
     }
 
     let mut dsp = Dsp::new(48_000.0);
-    let mut run = |ring: &Arc<InputShared>,
-                   strip: usize,
-                   comp: f32,
-                   gate: f32,
-                   level: f32,
-                   frames: usize|
-     -> f32 {
-        // Fresh envelopes and buffers per phase so nothing leaks across.
-        dsp.comp_env[strip] = 0.0;
-        dsp.comp_gain[strip] = 1.0;
-        dsp.gate_env[strip] = 0.0;
-        dsp.gate_gain[strip] = 1.0;
-        dsp.gate_hold[strip] = 0;
-        dsp.gate_open[strip] = true;
+    let mut run = |ring: &Arc<InputShared>, strip: usize, level: f32, frames: usize| -> f32 {
+        // Fresh reader and ring per phase so nothing leaks across.
         dsp.readers[strip] = InputReader::new();
         *lock_source(&ring.ring) = SampleRing::new();
-        shared.strips[strip]
-            .comp
-            .store(comp.to_bits(), Ordering::Relaxed);
-        shared.strips[strip]
-            .gate
-            .store(gate.to_bits(), Ordering::Relaxed);
 
         let block = 512usize;
         let mut buffer = vec![0.0f32; block * 2];
@@ -5604,52 +5417,19 @@ pub fn dynamics_selftest(report_path: &Path) {
         peak
     };
 
-    let pan_center = std::f32::consts::FRAC_1_SQRT_2;
-    let reference = run(&hardware, 0, 0.0, 0.0, 0.5, 24_000);
-    let compressed = run(&hardware, 0, 8.0, 0.0, 0.5, 24_000);
-    let quiet_comp = run(&hardware, 0, 8.0, 0.0, 0.01, 48_000);
-    let gate_closed = run(&hardware, 0, 0.0, 8.0, 0.005_6, 48_000);
-    let gate_open = run(&hardware, 0, 0.0, 8.0, 0.316, 24_000);
-    let virtual_passthrough = run(&virtuals, 3, 8.0, 8.0, 0.5, 24_000);
+    let reference = run(&hardware, 0, 0.5, 24_000);
+    let virtual_passthrough = run(&virtuals, 3, 0.5, 24_000);
 
-    let expected_quiet = 0.01 * pan_center * db_to_lin(0.6 * 8.0);
-    let expected_loud = 0.316 * pan_center;
-
-    let comp_db = 20.0 * (compressed / reference.max(1e-9)).log10();
     let pass_reference = reference > 0.3;
-    let pass_comp = comp_db < -4.0;
-    let pass_release = (quiet_comp - expected_quiet).abs() < expected_quiet * 0.25;
-    let pass_gate_closed = gate_closed < 0.001;
-    let pass_gate_open = (gate_open - expected_loud).abs() < expected_loud * 0.15;
     let pass_virtual = (virtual_passthrough - reference).abs() < reference * 0.02;
 
     let mut report = String::new();
     report.push_str(&format!("reference peak {reference:.4}\n"));
     report.push_str(&format!(
-        "compressor peak {compressed:.4}  reduction {comp_db:.2} dB  pass {pass_comp}\n"
-    ));
-    report.push_str(&format!(
-        "compressor release peak {quiet_comp:.4} (expected {expected_quiet:.4})  pass {pass_release}\n"
-    ));
-    report.push_str(&format!(
-        "gate closed peak {gate_closed:.5}  pass {pass_gate_closed}\n"
-    ));
-    report.push_str(&format!(
-        "gate open peak {gate_open:.4} (expected {expected_loud:.4})  pass {pass_gate_open}\n"
-    ));
-    report.push_str(&format!(
         "virtual strip peak {virtual_passthrough:.4}  pass {pass_virtual}\n"
     ));
     report.push_str(&format!("reference pass {pass_reference}\n"));
-    report.push_str(&format!(
-        "PASS {}\n",
-        pass_reference
-            && pass_comp
-            && pass_release
-            && pass_gate_closed
-            && pass_gate_open
-            && pass_virtual
-    ));
+    report.push_str(&format!("PASS {}\n", pass_reference && pass_virtual));
     let _ = std::fs::write(report_path, report);
 }
 
