@@ -2903,6 +2903,16 @@ const INPUT_SLIP_FRAMES_PER_SEC: usize = 250;
 /// of the picture (up to 5 ms/s). The trim holds the steady state; only a real
 /// spike is worth any content loss.
 const INPUT_SLIP_ABOVE_MS: f32 = 60.0;
+/// Time constant of the fill average that feeds the trim integrator. Long
+/// enough to remove the 10 ms device-period swing, short enough that a real
+/// backlog change still moves the trim within a few seconds.
+const INPUT_FILL_AVG_S: f32 = 0.5;
+/// Fill band inside which the trim integrator is left alone, as a fraction of
+/// the target. A capture path that only delivers whole device periods settles
+/// below the nominal target; without this band the integrator winds up to its
+/// clamp and plays the source slow for ever (240 ms of drift per minute).
+const INPUT_FILL_BAND_LOW: f32 = 0.30;
+const INPUT_FILL_BAND_HIGH: f32 = 1.10;
 
 /// Interleaved stereo frames waiting to be mixed into the output. The capture
 /// callback appends, the output callback consumes. A short ring keeps the
@@ -3066,14 +3076,6 @@ impl InputShared {
         lock_source(&self.ring).fill()
     }
 
-    /// Drop the oldest frames so the ring holds `target` again. Used by the
-    /// player before it feeds a ring whose reader has fallen behind: the
-    /// alternative (skipping the block for that ring) loses audio and makes the
-    /// strip stutter, which is what broke the mirror.
-    pub(crate) fn drain_to(&self, target: usize) {
-        lock_source(&self.ring).trim_to(target);
-    }
-
     /// Frames the mixer has consumed since this input was created.
     pub(crate) fn played_frames(&self) -> u64 {
         self.pushed
@@ -3135,6 +3137,11 @@ struct InputReader {
     /// log: a steady skip rate is what makes the audio creep ahead of a picture.
     skipped: u64,
     starved_total: u64,
+    /// Half-second average of the ring fill. The trim integrator uses this
+    /// instead of the instantaneous value, which swings by a whole device
+    /// period (480 frames) and biases the trim by hundreds of ppm.
+    fill_avg: f32,
+    fill_smoothed: bool,
 }
 
 impl InputReader {
@@ -3149,6 +3156,8 @@ impl InputReader {
             trim: 0.0,
             skipped: 0,
             starved_total: 0,
+            fill_avg: 0.0,
+            fill_smoothed: false,
         }
     }
 
@@ -3179,8 +3188,42 @@ impl InputReader {
         // fill is far from target; once it settles it carries the steady clock
         // mismatch, so the ring no longer slides toward empty.
         //
-        let error = ((target as f32 - ring.fill() as f32) / target as f32).clamp(-1.0, 1.0);
-        self.trim = (self.trim + error * INPUT_TRIM_STEP).clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
+        // Integrate against a smoothed fill, not the instantaneous one. A
+        // capture stream arrives in whole device periods (480 frames = 10 ms),
+        // so the raw fill swings by that much around the target every period;
+        // feeding that swing into the integrator biases it, and the reader then
+        // plays a few hundred ppm fast for ever - which is exactly the audio
+        // creeping ahead of a video picture (24 ms/min on a cable strip). The
+        // average over half a second leaves the real clock difference, which is
+        // what the trim is for.
+        let fill = ring.fill() as f32;
+        if !self.fill_smoothed {
+            self.fill_avg = fill;
+            self.fill_smoothed = true;
+        }
+        let blend = (1.0 / (output_rate as f32 * INPUT_FILL_AVG_S)).clamp(1e-6, 1.0);
+        self.fill_avg += (fill - self.fill_avg) * blend;
+        // Dead band. A capture path that only ever delivers single device
+        // periods settles somewhere below the nominal target (here ~10-16 ms
+        // against a 20 ms target), and asking for "slower, refill" for ever made
+        // the trim wind up to its clamp: the reader then played 0.4 % slow for
+        // the whole session, which is 240 ms of "audio late" per minute. Inside
+        // the band the ring is stable enough and the trim is left alone, so the
+        // content keeps the source's own rate. A real clock difference moves the
+        // fill out of the band within seconds and is still corrected.
+        let low = target as f32 * INPUT_FILL_BAND_LOW;
+        let high_band = target as f32 * INPUT_FILL_BAND_HIGH;
+        let error = if self.fill_avg >= low && self.fill_avg <= high_band {
+            0.0
+        } else {
+            ((target as f32 - self.fill_avg) / target as f32).clamp(-1.0, 1.0)
+        };
+        // Anti-windup: at a limit, only integrate back towards zero.
+        let pushing_out =
+            (self.trim >= INPUT_TRIM_MAX && error > 0.0) || (self.trim <= -INPUT_TRIM_MAX && error < 0.0);
+        if !pushing_out {
+            self.trim = (self.trim + error * INPUT_TRIM_STEP).clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
+        }
         let ratio = ratio * (1.0 - self.trim);
         self.phase += ratio;
         while self.phase >= 1.0 {
