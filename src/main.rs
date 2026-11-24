@@ -11391,9 +11391,56 @@ fn epoch_ms() -> u64 {
 /// the log is the only way to tell what happened.
 static UI_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// True when this is the only console running. The named mutex is released by
+/// the kernel when the process exits, so a crash cannot leave the name behind.
+/// A second launch explains itself instead of quietly fighting for the devices.
+#[cfg(windows)]
+fn single_instance() -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let name: Vec<u16> = "Local\\AudioMixerProSingleInstance\0".encode_utf16().collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
+    if handle.is_null() {
+        return true; // cannot create it: do not block a legitimate launch
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+        let text: Vec<u16> = "Audio Mixer PRO is already running.\n\nA second copy fights for the \
+            same virtual cables and output devices, which is heard as stutter and distortion, so \
+            this one will close."
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let caption: Vec<u16> = "Audio Mixer PRO\0".encode_utf16().collect();
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                caption.as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        return false;
+    }
+    // Deliberately leaked: the OS closes it when this process ends.
+    true
+}
+
+#[cfg(not(windows))]
+fn single_instance() -> bool {
+    true
+}
+
 fn main() -> eframe::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     install_panic_log();
+    // One console per machine. A second copy attaches the same virtual cables
+    // and opens the same output devices, which is heard as stutter and garble
+    // and is very hard to diagnose from the sound alone.
+    if !single_instance() {
+        return Ok(());
+    }
     diag_log(format!("main: entry pid {}", std::process::id()));
     // Watchdog: a frame that never returns still has working audio threads, so
     // record the stall while it is happening. Measured cause of one such stall:
