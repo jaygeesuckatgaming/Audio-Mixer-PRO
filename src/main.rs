@@ -2282,9 +2282,25 @@ fn path_delay_ms(
                 self.vsts[slot].error = None;
             }
             Err(err) => {
-                diag_log(format!("vst[{slot}] load failed: {err}"));
-                self.vsts[slot].error = Some(err.clone());
-                self.toast(format!("VST on {label}: {err}"));
+                // A plug-in with no editor of its own is not a failure: it is
+                // loaded and processing, it simply has no window. Painting the
+                // insert red for that made a working GUI-less plug-in look
+                // broken (the Leveler hit this every time it was clicked).
+                let no_editor = err.contains("no screen") || err.contains("no editor");
+                if no_editor {
+                    let name = self.vsts[slot]
+                        .info
+                        .as_ref()
+                        .map(|info| info.name.clone())
+                        .unwrap_or_else(|| "Plug-in".to_string());
+                    self.toast(format!(
+                        "{name}: no editor window - it is running, controls are in the insert panel"
+                    ));
+                } else {
+                    diag_log(format!("vst[{slot}] load failed: {err}"));
+                    self.vsts[slot].error = Some(err.clone());
+                    self.toast(format!("VST on {label}: {err}"));
+                }
             }
         }
     }
