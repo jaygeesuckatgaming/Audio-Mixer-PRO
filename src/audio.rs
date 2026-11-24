@@ -2907,6 +2907,12 @@ const INPUT_SLIP_ABOVE_MS: f32 = 60.0;
 /// enough to remove the 10 ms device-period swing, short enough that a real
 /// backlog change still moves the trim within a few seconds.
 const INPUT_FILL_AVG_S: f32 = 0.5;
+/// Fill band inside which the trim integrator is left alone, as a fraction of
+/// the target. A capture path that only delivers whole device periods settles
+/// below the nominal target; without this band the integrator winds up to its
+/// clamp and plays the source slow for ever (240 ms of drift per minute).
+const INPUT_FILL_BAND_LOW: f32 = 0.30;
+const INPUT_FILL_BAND_HIGH: f32 = 1.10;
 
 /// Interleaved stereo frames waiting to be mixed into the output. The capture
 /// callback appends, the output callback consumes. A short ring keeps the
@@ -3197,8 +3203,27 @@ impl InputReader {
         }
         let blend = (1.0 / (output_rate as f32 * INPUT_FILL_AVG_S)).clamp(1e-6, 1.0);
         self.fill_avg += (fill - self.fill_avg) * blend;
-        let error = ((target as f32 - self.fill_avg) / target as f32).clamp(-1.0, 1.0);
-        self.trim = (self.trim + error * INPUT_TRIM_STEP).clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
+        // Dead band. A capture path that only ever delivers single device
+        // periods settles somewhere below the nominal target (here ~10-16 ms
+        // against a 20 ms target), and asking for "slower, refill" for ever made
+        // the trim wind up to its clamp: the reader then played 0.4 % slow for
+        // the whole session, which is 240 ms of "audio late" per minute. Inside
+        // the band the ring is stable enough and the trim is left alone, so the
+        // content keeps the source's own rate. A real clock difference moves the
+        // fill out of the band within seconds and is still corrected.
+        let low = target as f32 * INPUT_FILL_BAND_LOW;
+        let high_band = target as f32 * INPUT_FILL_BAND_HIGH;
+        let error = if self.fill_avg >= low && self.fill_avg <= high_band {
+            0.0
+        } else {
+            ((target as f32 - self.fill_avg) / target as f32).clamp(-1.0, 1.0)
+        };
+        // Anti-windup: at a limit, only integrate back towards zero.
+        let pushing_out =
+            (self.trim >= INPUT_TRIM_MAX && error > 0.0) || (self.trim <= -INPUT_TRIM_MAX && error < 0.0);
+        if !pushing_out {
+            self.trim = (self.trim + error * INPUT_TRIM_STEP).clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
+        }
         let ratio = ratio * (1.0 - self.trim);
         self.phase += ratio;
         while self.phase >= 1.0 {
