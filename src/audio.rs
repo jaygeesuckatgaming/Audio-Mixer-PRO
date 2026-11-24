@@ -2903,6 +2903,10 @@ const INPUT_SLIP_FRAMES_PER_SEC: usize = 250;
 /// of the picture (up to 5 ms/s). The trim holds the steady state; only a real
 /// spike is worth any content loss.
 const INPUT_SLIP_ABOVE_MS: f32 = 60.0;
+/// Time constant of the fill average that feeds the trim integrator. Long
+/// enough to remove the 10 ms device-period swing, short enough that a real
+/// backlog change still moves the trim within a few seconds.
+const INPUT_FILL_AVG_S: f32 = 0.5;
 
 /// Interleaved stereo frames waiting to be mixed into the output. The capture
 /// callback appends, the output callback consumes. A short ring keeps the
@@ -3121,6 +3125,11 @@ struct InputReader {
     /// log: a steady skip rate is what makes the audio creep ahead of a picture.
     skipped: u64,
     starved_total: u64,
+    /// Half-second average of the ring fill. The trim integrator uses this
+    /// instead of the instantaneous value, which swings by a whole device
+    /// period (480 frames) and biases the trim by hundreds of ppm.
+    fill_avg: f32,
+    fill_smoothed: bool,
 }
 
 impl InputReader {
@@ -3135,6 +3144,8 @@ impl InputReader {
             trim: 0.0,
             skipped: 0,
             starved_total: 0,
+            fill_avg: 0.0,
+            fill_smoothed: false,
         }
     }
 
@@ -3164,7 +3175,23 @@ impl InputReader {
         // trim is at most 0.4 % (under seven cents) and only reached while the
         // fill is far from target; once it settles it carries the steady clock
         // mismatch, so the ring no longer slides toward empty.
-        let error = ((target as f32 - ring.fill() as f32) / target as f32).clamp(-1.0, 1.0);
+        //
+        // Integrate against a smoothed fill, not the instantaneous one. A
+        // capture stream arrives in whole device periods (480 frames = 10 ms),
+        // so the raw fill swings by that much around the target every period;
+        // feeding that swing into the integrator biases it, and the reader then
+        // plays a few hundred ppm fast for ever - which is exactly the audio
+        // creeping ahead of a video picture (24 ms/min on a cable strip). The
+        // average over half a second leaves the real clock difference, which is
+        // what the trim is for.
+        let fill = ring.fill() as f32;
+        if !self.fill_smoothed {
+            self.fill_avg = fill;
+            self.fill_smoothed = true;
+        }
+        let blend = (1.0 / (output_rate as f32 * INPUT_FILL_AVG_S)).clamp(1e-6, 1.0);
+        self.fill_avg += (fill - self.fill_avg) * blend;
+        let error = ((target as f32 - self.fill_avg) / target as f32).clamp(-1.0, 1.0);
         self.trim = (self.trim + error * INPUT_TRIM_STEP).clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
         let ratio = ratio * (1.0 - self.trim);
         self.phase += ratio;
