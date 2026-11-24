@@ -922,6 +922,13 @@ struct MixerApp {
     latency_ms_shown: f64,
     latency_detail_shown: String,
     latency_tick: f64,
+    /// One sample per second, the last ten: the bar shows their average so the
+    /// number does not flicker while the ring fill moves.
+    latency_samples: std::collections::VecDeque<f64>,
+    latency_log_tick: f64,
+    /// Previous per-strip skip/starve counters, for the rates in the log.
+    reader_skipped_prev: [u64; audio::MAX_STRIPS],
+    reader_starved_prev: [u64; audio::MAX_STRIPS],
     /// Last output-queue depth written to the log, so growth is visible without
     /// hovering the status bar.
     last_ring_logged: usize,
@@ -1488,6 +1495,10 @@ impl MixerApp {
             latency_ms_shown: 0.0,
             latency_detail_shown: String::new(),
             latency_tick: 1.0,
+            latency_samples: std::collections::VecDeque::new(),
+            latency_log_tick: 0.0,
+            reader_skipped_prev: [0; audio::MAX_STRIPS],
+            reader_starved_prev: [0; audio::MAX_STRIPS],
             last_ring_logged: 0,
             outputs_empty_logged_at: -60.0,
             hooks_logged: false,
@@ -1742,6 +1753,76 @@ impl MixerApp {
             }
         }
         app
+    }
+
+    /// Keep the latency readout and the periodic latency log current. The
+    /// report locks every plug-in slot, so it is sampled once a second rather
+    /// than every frame; the bar shows the average of the last ten samples.
+    fn poll_latency(&mut self, dt: f64) {
+        if self.safe_mode || !self.audio.available {
+            return;
+        }
+        self.latency_tick += dt;
+        if self.latency_tick >= 1.0 {
+            self.latency_tick = 0.0;
+            let (total, detail) = self.latency_report();
+            self.latency_ms_shown = total;
+            self.latency_detail_shown = detail;
+            self.latency_samples.push_back(total);
+            while self.latency_samples.len() > 10 {
+                self.latency_samples.pop_front();
+            }
+        }
+        self.latency_log_tick += dt;
+        if self.latency_log_tick >= 10.0 {
+            self.latency_log_tick = 0.0;
+            self.log_latency();
+        }
+    }
+
+    /// Ten-second summary: the total plus, per strip, the reader's servo state.
+    /// A steady skip rate or a large trim is what makes the audio drift against
+    /// a picture paced by another clock, so both are logged with the drift they
+    /// imply in milliseconds per minute.
+    fn log_latency(&mut self) {
+        if self.latency_samples.is_empty() {
+            return;
+        }
+        let samples = self.latency_samples.len() as f64;
+        let avg = self.latency_samples.iter().sum::<f64>() / samples;
+        let peak = self
+            .latency_samples
+            .iter()
+            .cloned()
+            .fold(0.0_f64, f64::max);
+        diag_log(format!(
+            "audio: latency now {:.0} ms, 10 s avg {:.0} ms, peak {:.0} ms",
+            self.latency_ms_shown, avg, peak
+        ));
+        let sr = self.sample_rate.max(1) as f64;
+        for i in 0..self.active_strips.min(audio::MAX_STRIPS) {
+            let (fill, trim, skipped, starved) = self.audio.strip_reader_stats(i);
+            let skipped_now = skipped.saturating_sub(self.reader_skipped_prev[i]);
+            let starved_now = starved.saturating_sub(self.reader_starved_prev[i]);
+            self.reader_skipped_prev[i] = skipped;
+            self.reader_starved_prev[i] = starved;
+            if fill == 0 && skipped_now == 0 && starved_now == 0 && trim.abs() < 1e-6 {
+                continue;
+            }
+            diag_log(format!(
+                "audio: strip {} '{}': fill {:.1} ms, trim {:+.3} %, drift {:+.0} ms/min, skip {}/s, starve {}/s",
+                i + 1,
+                self.strips[i].name,
+                fill as f64 / sr * 1000.0,
+                trim as f64 * 100.0,
+                // Positive trim means the reader consumes fewer source frames
+                // per output frame, so the audio falls behind by that fraction
+                // of real time; report the sign the listener would notice.
+                -(trim as f64) * 60_000.0,
+                skipped_now / 10,
+                starved_now / 10,
+            ));
+        }
     }
 
     /// The strip's own label, used in the selector and in toasts.
@@ -7204,19 +7285,22 @@ Right click > Source to use the Windows capture stream instead."
         }
 
         // Latency, on the free second row at the right end, where the old
-        // status bar had it. Hovering it opens the same breakdown the
-        // diagnostics report carries: input backlog, mixer block, output
-        // queue, device request and plug-in latency.
-        if self.audio.available {
-            let (latency, detail) = self.latency_report();
-            let text = if latency >= 1.0 {
-                format!("latency ~{latency:.0} ms")
-            } else {
-                "latency ~0 ms".to_string()
-            };
-            let colour = if latency >= 250.0 {
+        // status bar had it. The figure is the 10 s average (sampled once a
+        // second, so it does not flicker); hovering opens the same breakdown
+        // the diagnostics report carries, plus the current and peak values.
+        if self.audio.available && !self.latency_samples.is_empty() {
+            let now = self.latency_ms_shown;
+            let avg = self.latency_samples.iter().sum::<f64>()
+                / self.latency_samples.len() as f64;
+            let peak = self
+                .latency_samples
+                .iter()
+                .cloned()
+                .fold(0.0_f64, f64::max);
+            let text = format!("latency ~{avg:.0} ms");
+            let colour = if avg >= 250.0 {
                 RED
-            } else if latency >= 150.0 {
+            } else if avg >= 150.0 {
                 AMBER
             } else {
                 DIM
@@ -7238,9 +7322,13 @@ Right click > Source to use the Windows capture stream instead."
                 Pos2::new(inner.right() - 2.0 - width - 4.0, baseline - 2.0),
                 Vec2::new(width + 8.0, 14.0),
             );
+            let tip = format!(
+                "now {now:.0} ms, 10 s avg {avg:.0} ms, peak {peak:.0} ms\n\n{}",
+                self.latency_detail_shown
+            );
             let _ = ui
                 .interact(hit, Id::new("latency_readout"), Sense::hover())
-                .on_hover_text(detail);
+                .on_hover_text(tip);
         }
     }
     fn ensure_player(&mut self) {
@@ -10080,6 +10168,7 @@ impl eframe::App for MixerApp {
         }
 
         self.update_meters(dt);
+        self.poll_latency(dt as f64);
         if self.meter_log {
             self.meter_clock += dt as f64;
             if self.meter_clock >= 1.0 {

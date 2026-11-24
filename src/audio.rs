@@ -733,6 +733,14 @@ struct Shared {
     /// Deepest capture backlog across the routed strips, in frames. This is the
     /// part of the latency a CPU spike inflates.
     strip_backlog: AtomicUsize,
+    /// Per-strip capture reader state, published for the periodic latency log:
+    /// ring fill in frames, servo trim (f32 bits, 0.001 = the reader is playing
+    /// the source 0.1 % fast), frames skipped to shed a spike and starved
+    /// frames, both cumulative.
+    strip_fill: [AtomicUsize; MAX_STRIPS],
+    strip_trim: [AtomicU32; MAX_STRIPS],
+    strip_skipped: [AtomicU64; MAX_STRIPS],
+    strip_starved: [AtomicU64; MAX_STRIPS],
     /// One VST3 insert per input strip (up to MAX_STRIPS independent slots).
     /// This is a rebuild extension (the original console has no VST loader);
     /// see vst.rs.
@@ -824,6 +832,10 @@ impl Shared {
             callback_frames: AtomicUsize::new(0),
             callback_load: f32_atomic(0.0),
             strip_backlog: AtomicUsize::new(0),
+            strip_fill: std::array::from_fn(|_| AtomicUsize::new(0)),
+            strip_trim: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
+            strip_skipped: std::array::from_fn(|_| AtomicU64::new(0)),
+            strip_starved: std::array::from_fn(|_| AtomicU64::new(0)),
             mixer_late: AtomicU64::new(0),
             bus_underruns: std::array::from_fn(|_| AtomicU64::new(0)),
             bus_callback_frames: std::array::from_fn(|_| AtomicUsize::new(0)),
@@ -1222,6 +1234,13 @@ impl Dsp {
                 self.vst_in_l[i][frame] = s[0];
                 self.vst_in_r[i][frame] = s[1];
             }
+            // Publish the reader state once per block for the latency log: a
+            // steady skip rate or a large trim is what makes the audio drift
+            // against a picture that is paced by another clock.
+            shared.strip_fill[i].store(ring.fill(), Ordering::Relaxed);
+            shared.strip_trim[i].store(self.readers[i].trim.to_bits(), Ordering::Relaxed);
+            shared.strip_skipped[i].store(self.readers[i].skipped, Ordering::Relaxed);
+            shared.strip_starved[i].store(self.readers[i].starved_total, Ordering::Relaxed);
             // Pre-FX insert: send the dry block, then use the returned one in its
             // place. The return belongs to an earlier block, so the strip is a
             // block or two late â€” inherent to an external insert.
@@ -2777,6 +2796,22 @@ impl AudioEngine {
         load_f32(&self.shared.source_peak)
     }
 
+    /// Capture-reader state for one strip: ring fill in frames, servo trim
+    /// (0.001 = the source is being played 0.1 % fast), and cumulative frames
+    /// skipped to shed a spike / held because the ring ran empty. Used by the
+    /// periodic latency log to tell a clock mismatch from a spike recovery.
+    pub fn strip_reader_stats(&self, strip: usize) -> (usize, f32, u64, u64) {
+        if strip >= MAX_STRIPS {
+            return (0, 0.0, 0, 0);
+        }
+        (
+            self.shared.strip_fill[strip].load(Ordering::Relaxed),
+            f32::from_bits(self.shared.strip_trim[strip].load(Ordering::Relaxed)),
+            self.shared.strip_skipped[strip].load(Ordering::Relaxed),
+            self.shared.strip_starved[strip].load(Ordering::Relaxed),
+        )
+    }
+
     pub fn output_devices() -> Vec<String> {
         let host = cpal::default_host();
         host.output_devices()
@@ -2861,6 +2896,13 @@ const INPUT_TARGET_HYSTERESIS_MS: f32 = 20.0;
 /// 5 ms/s returns a 15 ms spike to the target in about three seconds and is far
 /// too small a rate change to hear, unlike the old single hard trim.
 const INPUT_SLIP_FRAMES_PER_SEC: usize = 250;
+/// How far above the target the fill must be before frames are skipped. This is
+/// a spike threshold, not the servo's band: the cable endpoints deliver in
+/// bursts and sit above `INPUT_TARGET_MS + hysteresis` as a matter of course, so
+/// using that band here made the skip run permanently and pushed the audio ahead
+/// of the picture (up to 5 ms/s). The trim holds the steady state; only a real
+/// spike is worth any content loss.
+const INPUT_SLIP_ABOVE_MS: f32 = 60.0;
 
 /// Interleaved stereo frames waiting to be mixed into the output. The capture
 /// callback appends, the output callback consumes. A short ring keeps the
@@ -3074,6 +3116,11 @@ struct InputReader {
     /// which is especially audible on a direct cable tap because it has no
     /// engine buffer behind it.
     trim: f32,
+    /// Frames skipped to shed a spike, and frames that had to be held because
+    /// the ring ran empty, both cumulative. Published for the periodic latency
+    /// log: a steady skip rate is what makes the audio creep ahead of a picture.
+    skipped: u64,
+    starved_total: u64,
 }
 
 impl InputReader {
@@ -3086,13 +3133,18 @@ impl InputReader {
             drift_tick: 0,
             starve: 0,
             trim: 0.0,
+            skipped: 0,
+            starved_total: 0,
         }
     }
 
     fn next(&mut self, ring: &mut SampleRing, input_rate: u32, output_rate: u32) -> [f32; 2] {
         let output_rate = output_rate.max(1);
         let target = (output_rate as f32 * INPUT_TARGET_MS / 1000.0) as usize;
-        let high = target + (output_rate as f32 * INPUT_TARGET_HYSTERESIS_MS / 1000.0) as usize;
+        // Spike-only slip threshold; see the block below. Kept well above the
+        // servo's tolerated band so the steady state never skips frames.
+        let slip_above =
+            target + (output_rate as f32 * INPUT_SLIP_ABOVE_MS / 1000.0) as usize;
 
         if !self.ready {
             // A capture stream can start with a large backlog (a virtual cable
@@ -3123,6 +3175,7 @@ impl InputReader {
                 self.starve = 0;
             } else {
                 self.starve = self.starve.saturating_add(1);
+                self.starved_total = self.starved_total.saturating_add(1);
                 if self.starve > output_rate / 10 {
                     self.prev = [0.0, 0.0];
                     self.cur = [0.0, 0.0];
@@ -3136,18 +3189,20 @@ impl InputReader {
         // the ring; playing that backlog out afterwards would leave the strip
         // permanently behind by however long the spike lasted.
         //
-        // Slip single frames out while the fill is above the tolerated band
-        // instead of chopping the whole backlog in one discontinuity: at a few
-        // hundred frames per second the rate change is inaudible and the strip
-        // is back at the target within a couple of seconds. Parking the excess
-        // (the old behaviour) is what made the latency readout climb and stay
-        // there.
-        if ring.fill() > high {
+        // This only fires for a real spike, well above the servo's own band. It
+        // used to trigger at target + hysteresis (40 ms), which a bursty cable
+        // endpoint sits above permanently: the skip then ran continuously at up
+        // to 250 frames a second, advancing the audio ~5 ms per second, which is
+        // heard as the sound creeping ahead of a video picture. The trim below
+        // handles the steady clock mismatch; this handles only the spike.
+        if ring.fill() > slip_above {
             self.drift_tick = self.drift_tick.saturating_add(1);
             let slip = (output_rate as usize / INPUT_SLIP_FRAMES_PER_SEC).max(1) as u32;
             if self.drift_tick >= slip {
                 self.drift_tick = 0;
-                let _ = ring.pop();
+                if ring.pop().is_some() {
+                    self.skipped = self.skipped.saturating_add(1);
+                }
             }
         } else {
             self.drift_tick = 0;

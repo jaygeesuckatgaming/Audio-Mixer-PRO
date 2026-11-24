@@ -38,6 +38,7 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   device each mirrored strip had before the mirror went on, and a scene that
   already contains `PLAYER` for a strip the player does not feed is repaired to
   its empty/default input on load.
+- **Capture slip no longer runs in the steady state.** The backlog controller skipped a frame whenever the capture ring sat above 	arget + 20 ms; a cable endpoint delivers in bursts and sits there permanently, so the skip ran at up to 250 frames a second and advanced the audio ~5 ms per second - heard as the sound slowly getting ahead of a video picture. Skipping now only happens above 	arget + 60 ms (a real CPU spike); the trim holds the steady state. The 10-second log now carries the reader's fill, trim (with the drift in ms/min it implies), skip and starve rates, and the bottom-bar readout shows a 10 s average plus the peak in its tooltip.
 - **A wedged device open is reported, not left amber.** If the Windows audio
   service stops answering, a bus-device open can block for minutes. The card
   used to sit on "opening the output ..." for the whole session; after 10 s it
