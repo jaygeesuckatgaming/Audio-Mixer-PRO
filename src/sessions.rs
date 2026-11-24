@@ -572,6 +572,45 @@ unsafe fn hicon_to_rgba(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -
     })
 }
 
+/// State of Windows' default playback endpoint: `Some((muted, volume))` with the
+/// volume in 0..=1, or `None` when it cannot be read.
+///
+/// A muted endpoint or a slider at zero is indistinguishable from a dead mixer:
+/// the meters move (the audio really is being rendered) and nothing is heard.
+/// The console checks this at start-up and says so in a toast.
+#[cfg(windows)]
+pub fn default_output_state() -> Option<(bool, f32)> {
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+
+    unsafe {
+        // Ref-counted per thread; a second call is a no-op, so there is no
+        // matching CoUninitialize here (the UI thread may own that count).
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let enumerator = CoCreateInstance::<_, IMMDeviceEnumerator>(
+            &MMDeviceEnumerator,
+            None::<&windows::core::IUnknown>,
+            CLSCTX_ALL,
+        )
+        .ok()?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
+        let muted = volume.GetMute().map(|v| v.as_bool()).unwrap_or(false);
+        let level = volume.GetMasterVolumeLevelScalar().unwrap_or(1.0);
+        Some((muted, level))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn default_output_state() -> Option<(bool, f32)> {
+    None
+}
+
 /// Diagnostic used by `--apps-selftest`: every cable endpoint, and the sessions
 /// Windows reports on it right now.
 #[cfg(windows)]
