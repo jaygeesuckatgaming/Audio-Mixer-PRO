@@ -798,12 +798,15 @@ fn worker(
             }
             input.set_rate(rate_now as u32);
             input.push_block(&chunk);
-            let resync = ring_target / 2;
+            // Mirrors get every block, exactly as the player's own ring does.
+            // They used to be trimmed when they reached the 30 ms push target,
+            // but the player fills to 30 and each reader drains back toward 20,
+            // so whichever strip happened to be highest was trimmed every few
+            // seconds - that strip lost ~20 ms of audio and its meter jumped
+            // while the others were smooth. The ring drops its own oldest
+            // frames if it ever overflows, so no trim is needed here.
             for mirror in &mirrors {
                 mirror.set_rate(rate_now as u32);
-                if mirror.ring_fill() >= ring_target {
-                    mirror.drain_to(resync);
-                }
                 mirror.push_block(&chunk);
             }
             let played = input.played_frames().saturating_sub(played_base);
