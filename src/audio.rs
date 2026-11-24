@@ -3076,6 +3076,14 @@ impl InputShared {
         lock_source(&self.ring).fill()
     }
 
+    /// Drop the oldest frames so the ring holds `target` again. Used by the
+    /// player before it feeds a ring whose reader has fallen behind: the
+    /// alternative (skipping the block for that ring) loses audio and makes the
+    /// strip stutter, which is what broke the mirror.
+    pub(crate) fn drain_to(&self, target: usize) {
+        lock_source(&self.ring).trim_to(target);
+    }
+
     /// Frames the mixer has consumed since this input was created.
     pub(crate) fn played_frames(&self) -> u64 {
         self.pushed

@@ -797,15 +797,22 @@ fn worker(
             // at 00:00, nothing was fed anywhere, and every strip starved. A
             // ring that is full is now skipped on its own until its reader
             // drains it.
+            // Every ring gets every block, so all strips stay sample-aligned.
+            // A ring whose reader has fallen behind is trimmed back to half the
+            // target first (oldest audio dropped) instead of skipping the block:
+            // skipping dropped audio in that strip and made the mirror stutter.
+            let resync = ring_target / 2;
             input.set_rate(rate_now as u32);
-            if input.ring_fill() < ring_target {
-                input.push_block(&chunk);
+            if input.ring_fill() >= ring_target {
+                input.drain_to(resync);
             }
+            input.push_block(&chunk);
             for mirror in &mirrors {
                 mirror.set_rate(rate_now as u32);
-                if mirror.ring_fill() < ring_target {
-                    mirror.push_block(&chunk);
+                if mirror.ring_fill() >= ring_target {
+                    mirror.drain_to(resync);
                 }
+                mirror.push_block(&chunk);
             }
             let played = input.played_frames().saturating_sub(played_base);
             let ms = position_base_ms + (played as f64 * 1000.0 / rate_now as f64) as u64;
