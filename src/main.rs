@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+﻿#![windows_subsystem = "windows"]
 
 mod audio;
 mod asio_insert;
@@ -5917,7 +5917,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit · 48 kHz"), from the
+        // The endpoint's configured format ("24-bit Â· 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6000,7 +6000,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit · 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit Â· 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui
@@ -11391,21 +11391,50 @@ fn epoch_ms() -> u64 {
 /// the log is the only way to tell what happened.
 static UI_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// True when this is the only console running. The named mutex is released by
-/// the kernel when the process exits, so a crash cannot leave the name behind.
-/// A second launch explains itself instead of quietly fighting for the devices.
+/// True when this is the only console running. The check walks the process
+/// list for another `audio_mixer_pro.exe`: a named mutex was tried first, but a
+/// stale error code made a first launch claim "already running", so this uses
+/// the process list itself, which cannot false-positive on a fresh start.
 #[cfg(windows)]
 fn single_instance() -> bool {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
 
-    let name: Vec<u16> = "Local\\AudioMixerProSingleInstance\0".encode_utf16().collect();
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
-    if handle.is_null() {
-        return true; // cannot create it: do not block a legitimate launch
-    }
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return true;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let me = std::process::id();
+        let mut other = false;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID != me {
+                    let name = String::from_utf16_lossy(&entry.szExeFile)
+                        .trim_end_matches('\0')
+                        .to_ascii_lowercase();
+                    if name == "audio_mixer_pro.exe" {
+                        other = true;
+                        break;
+                    }
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        if !other {
+            return true;
+        }
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONINFORMATION, MB_OK,
+        };
         let text: Vec<u16> = "Audio Mixer PRO is already running.\n\nA second copy fights for the \
             same virtual cables and output devices, which is heard as stutter and distortion, so \
             this one will close."
@@ -11413,18 +11442,14 @@ fn single_instance() -> bool {
             .chain(std::iter::once(0))
             .collect();
         let caption: Vec<u16> = "Audio Mixer PRO\0".encode_utf16().collect();
-        unsafe {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                text.as_ptr(),
-                caption.as_ptr(),
-                MB_OK | MB_ICONINFORMATION,
-            );
-        }
-        return false;
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+        false
     }
-    // Deliberately leaked: the OS closes it when this process ends.
-    true
 }
 
 #[cfg(not(windows))]
