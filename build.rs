@@ -21,6 +21,11 @@ fn main() {
     println!("cargo:rerun-if-changed=REV");
     println!("cargo:rerun-if-changed=CHANNEL");
     println!("cargo:rerun-if-changed=.git/HEAD");
+    // HEAD holds "ref: refs/heads/main" and does not change on a commit, so the
+    // branch ref has to be watched too or the build string keeps the commit the
+    // crate was last rebuilt for.
+    println!("cargo:rerun-if-changed=.git/refs/heads/main");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
 
     // The window shows this. `CHANNEL` is the release line ("Beta 6") and `REV`
     // the build number, both kept in step with VERSION.txt; the short hash goes
