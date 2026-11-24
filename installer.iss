@@ -8,11 +8,11 @@
 ;   3. From this folder:
 ;        "C:\Program Files\Inno Setup 7\ISCC.exe" installer.iss
 ;      or override the version / source folder:
-;        ISCC.exe /DMyAppVersion=1.0.0 /DPkgDir="..\distribution\Audio Mixer PRO 1.0" installer.iss
+;        ISCC.exe /DMyAppVersion=1.1.0 /DPkgDir="..\distribution\Audio Mixer PRO 1.1" installer.iss
 ;
 ; Signing (optional but recommended for a public release):
 ;     signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 ^
-;         /a "..\distribution\Audio Mixer PRO 1.0 Setup.exe"
+;         /a "..\distribution\Audio Mixer PRO 1.1 Setup.exe"
 ;
 ; The kernel driver is deliberately NOT installed by this script. It is
 ; experimental and test-signed, needs `bcdedit /set testsigning on` and a
@@ -26,12 +26,12 @@
 #define MyAppURL "https://github.com/jaygeesuckatgaming/Audio-Mixer-PRO"
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.1.0"
 #endif
 
 ; Folder holding the staged package (must contain "Audio Mixer PRO\audio_mixer_pro.exe").
 #ifndef PkgDir
-  #define PkgDir "..\distribution\Audio Mixer PRO Beta"
+  #define PkgDir "..\distribution\Audio Mixer PRO 1.1"
 #endif
 
 [Setup]

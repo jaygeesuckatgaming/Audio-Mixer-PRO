@@ -5917,7 +5917,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz"), from the
+        // The endpoint's configured format ("24-bit · 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6000,7 +6000,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit · 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui

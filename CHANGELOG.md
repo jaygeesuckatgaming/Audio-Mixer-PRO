@@ -1,11 +1,12 @@
 # Changelog
 
-Audio Mixer PRO reports its build in the top bar as `<CHANNEL> Â· rev <REV>`.
+Audio Mixer PRO reports its build in the top bar as `<CHANNEL> · rev <REV>`.
 `REV` counts every published build of that release line.
 
-## 1.1 â€” unreleased
+## 1.1 — rev 1 (2026-11-24)
 
-Interface cleanup, plus a demo feature for showing several plug-ins at once.
+Interface cleanup, a demo feature for showing several plug-ins at once, and the
+latency readout and drift fixes below.
 
 - **Removed controls that did nothing:** the `A` and `R` top-bar buttons (they
   only showed hardcoded toasts), the strip `K` (karaoke) and `M.C.` buttons, the
@@ -77,16 +78,16 @@ Interface cleanup, plus a demo feature for showing several plug-ins at once.
   tape. The "Engine mode: Normal/Swift" switch was removed from System
   Settings: nothing read it.
 
-## 1.0.1 â€” rev 2 (2026-11-23)
+## 1.0.1 — rev 2 (2026-11-23)
 
 - **Fix: a plug-in's editor window could jump in front of whatever you clicked.**
   The editor host re-sent keyboard focus to the plug-in's child window whenever
-  the mixer's thread had no focus â€” which is exactly the state after clicking
-  another application or the desktop â€” and `SetFocus` activates that window.
+  the mixer's thread had no focus — which is exactly the state after clicking
+  another application or the desktop — and `SetFocus` activates that window.
   Focus is now only nudged while the editor itself is the active window, so
   plug-in meters still start but the window stays where it was put.
 
-## 1.0 â€” rev 1 (2026-11-23)
+## 1.0 — rev 1 (2026-11-23)
 
 First stable release. The audio engine is the same code as Beta 6 rev 67;
 1.0 changes the identity, the licence and the packaging, not the sound.
@@ -94,7 +95,7 @@ First stable release. The audio engine is the same code as Beta 6 rev 67;
 - **MIT licence** (`LICENSE`) and `THIRD-PARTY-NOTICES.txt`.
 - **Playlist highlight**: the playing track is drawn with a green row and a play
   marker; the loaded-but-paused track is amber with a pause marker.
-- Version reported as `1.0 Â· rev 1`; `Cargo.toml` and the Windows file
+- Version reported as `1.0 · rev 1`; `Cargo.toml` and the Windows file
   version move to 1.0.0.
 - Documentation refresh: this changelog, an updated `README.txt`, a
   `QUICK START` section and the known issues below.
@@ -102,14 +103,14 @@ First stable release. The audio engine is the same code as Beta 6 rev 67;
 - Known issues carried into 1.0: occasional clicks with several heavy inserts,
   and the virtual cable driver remains experimental and test-signed.
 
-## Beta 6 â€” rev 67
+## Beta 6 — rev 67
 
 - `PLAYER` button in the top bar, right of `DUCKING`. It lights while the player
   window is open and creates the player (and its strip) on first use.
 - The transient status message moved right and is narrower so it cannot cover
   the new button.
 
-## Beta 6 â€” rev 66
+## Beta 6 — rev 66
 
 - **Fix: Add Files... is genuinely multi-select.** The dialog was given
   `OFN_NONETWORKBUTTON`'s value (`0x20000`) where `OFN_ALLOWMULTISELECT`
@@ -117,7 +118,7 @@ First stable release. The audio engine is the same code as Beta 6 rev 67;
   one file was returned. The result buffer decoder is now a separate function
   with tests for the one-file and folder-plus-names layouts.
 
-## Beta 6 â€” rev 65
+## Beta 6 — rev 65
 
 - **Add Files... selects several files at once.**
 - **Drag & drop from Explorer**: audio files, folders (three levels deep,
@@ -127,7 +128,7 @@ First stable release. The audio engine is the same code as Beta 6 rev 67;
 - The player can be moved to another strip from its Strip picker; the previous
   strip returns to `No input`.
 
-## Beta 6 â€” rev 64
+## Beta 6 — rev 64
 
 - **Internal streaming player** (`MENU > Player...`). Decodes on a worker thread
   into the same ring an input capture uses, so the player feeds one strip and
@@ -141,17 +142,17 @@ First stable release. The audio engine is the same code as Beta 6 rev 67;
   paused.
 - Transport: play/pause/stop, previous/next, scrub, double-click to play,
   right-click to remove, add a file, save as XSPF, repeat OFF/ONE/ALL, shuffle.
-- **Crossfade** 0â€“10 s (default 3 s), equal-power; 0 gives a gapless join.
+- **Crossfade** 0–10 s (default 3 s), equal-power; 0 gives a gapless join.
 - 750 ms decode-ahead absorbs disk and CPU hiccups.
 - FLAC and OGG/Vorbis decoding.
 
 Why it exists: while VLC played into a virtual cable, VLC's own Windows audio
-session dropped to 0.000 for 0.4â€“1.9 s every two to five minutes, and the mixer
+session dropped to 0.000 for 0.4–1.9 s every two to five minutes, and the mixer
 faithfully passed the silence on. The same material played through the ASIO
 insert from Waveform had no dips, which located the fault in the Windows audio
 path rather than in the console.
 
-## Beta 6 â€” rev 63
+## Beta 6 — rev 63
 
 - `Insert 1` / `Insert 2` buttons under every strip header, with the active pair
   green and `PRE`/`POST`.
@@ -160,19 +161,19 @@ path rather than in the console.
   timer.
 - The external ASIO insert assignment is saved in the scene.
 
-## Beta 6 â€” rev 58
+## Beta 6 — rev 58
 
-- Build identity in the top bar (`Beta 6 Â· rev 58`) with the commit in the
+- Build identity in the top bar (`Beta 6 · rev 58`) with the commit in the
   tooltip.
 - Direct cable taps are the default: a strip reads the cable driver's own
   buffer instead of opening a Windows capture stream, removing one buffer, one
   clock and the USB round trip from the input path.
-- Endpoint format shown on every strip and bus ("32-bit Â· 48 kHz").
+- Endpoint format shown on every strip and bus ("32-bit · 48 kHz").
 - Diagnostics report: one text file with build, devices, cables, plug-ins,
   latency and the last few hundred log lines, from the CABLES panel or
   `--diagnostics <path>`.
 - Output streams keep their ring cushion again (rate servo with an integrator).
-- Bus limiter transparent below about âˆ’0.9 dBFS.
+- Bus limiter transparent below about -0.9 dBFS.
 - Empty device lists no longer close every output stream.
 - Plug-in windows no longer freeze the console; vsync off, 30 fps pacing, UI
   watchdog.
@@ -180,7 +181,7 @@ path rather than in the console.
 - Reattach removes stale USB device nodes before attaching.
 - Smaller executable (10.4 MB) after repairing an encoding fault.
 
-## Beta 5 â€” rev 42
+## Beta 5 — rev 42
 
 - Fixes: clicks with a loaded insert (lock collision played dry blocks),
   distortion with gain-adding inserts (tanh limiter), silence on a starved bus
@@ -191,5 +192,5 @@ path rather than in the console.
 
 ## Earlier betas
 
-Release notes for Beta 1â€“4 are in the `distribution` folder with their
+Release notes for Beta 1–4 are in the `distribution` folder with their
 packages.

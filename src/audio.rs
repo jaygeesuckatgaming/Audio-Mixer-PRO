@@ -1,4 +1,4 @@
-﻿use crate::vban::TxRing;
+use crate::vban::TxRing;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
 use std::collections::VecDeque;
@@ -79,7 +79,7 @@ fn bus_cushion_frames(device: &str) -> usize {
 /// Consumption multiplier applied by an output callback's rate servo: below the
 /// target fill it reads a little slower so the mixer refills the cushion, above
 /// it a little faster. `trim` is carried by the caller and integrated there; the
-/// result is clamped to `Â±SERVO_TRIM`, so it can never be heard as a pitch shift
+/// result is clamped to `±SERVO_TRIM`, so it can never be heard as a pitch shift
 /// beyond a few cents.
 fn servo_step(base_step: f32, trim: f32) -> f32 {
     base_step * (1.0 - trim.clamp(-SERVO_TRIM, SERVO_TRIM))
@@ -1243,7 +1243,7 @@ impl Dsp {
             shared.strip_starved[i].store(self.readers[i].starved_total, Ordering::Relaxed);
             // Pre-FX insert: send the dry block, then use the returned one in its
             // place. The return belongs to an earlier block, so the strip is a
-            // block or two late â€” inherent to an external insert.
+            // block or two late — inherent to an external insert.
             let insert = shared.inserts.get(i);
             if insert_active {
                 if let Some((pair, false)) = insert {
