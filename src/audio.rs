@@ -3077,6 +3077,12 @@ impl InputShared {
             .saturating_sub(self.ring_fill() as u64)
     }
 
+    /// Frames this input's producer has delivered since it opened, whatever the
+    /// producer is (capture callback, tap drain, player, VBAN).
+    pub(crate) fn pushed_frames(&self) -> u64 {
+        self.pushed.load(Ordering::Relaxed)
+    }
+
     /// Rate the producer delivers at.
     pub(crate) fn rate(&self) -> u32 {
         self.rate.load(Ordering::Relaxed).max(1)
@@ -3526,9 +3532,11 @@ where
                     envelope.push([l, r]);
                 }
                 shared.peak.store(peak.to_bits(), Ordering::Relaxed);
+                let frames = data.len() / channels.max(1);
                 shared
                     .frames
-                    .store(data.len() / channels.max(1), Ordering::Relaxed);
+                    .store(frames, Ordering::Relaxed);
+                shared.pushed.fetch_add(frames as u64, Ordering::Relaxed);
             },
             move |err| {
                 *lock_source(&error_shared.error) = Some(format!("Audio input error: {err}"));
@@ -3854,6 +3862,9 @@ fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
         input.rate.store(rate.max(1), Ordering::Relaxed);
         let frames = whole / frame_bytes;
         input.frames.fetch_add(frames, Ordering::Relaxed);
+        input
+            .pushed
+            .fetch_add(frames as u64, Ordering::Relaxed);
         shared.tap_frames[strip].fetch_add(frames as u64, Ordering::Relaxed);
     }
 }

@@ -1,4 +1,4 @@
-﻿#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 
 mod audio;
 mod asio_insert;
@@ -929,6 +929,11 @@ struct MixerApp {
     /// Previous per-strip skip/starve counters, for the rates in the log.
     reader_skipped_prev: [u64; audio::MAX_STRIPS],
     reader_starved_prev: [u64; audio::MAX_STRIPS],
+    reader_pushed_prev: [u64; audio::MAX_STRIPS],
+    /// Windows default output watchdog: a muted endpoint or a slider at zero
+    /// looks exactly like a dead mixer, so it is called out in a toast.
+    output_check_tick: f64,
+    output_silent: bool,
     /// Last output-queue depth written to the log, so growth is visible without
     /// hovering the status bar.
     last_ring_logged: usize,
@@ -1499,6 +1504,9 @@ impl MixerApp {
             latency_log_tick: 0.0,
             reader_skipped_prev: [0; audio::MAX_STRIPS],
             reader_starved_prev: [0; audio::MAX_STRIPS],
+            reader_pushed_prev: [0; audio::MAX_STRIPS],
+            output_check_tick: 5.0,
+            output_silent: false,
             last_ring_logged: 0,
             outputs_empty_logged_at: -60.0,
             hooks_logged: false,
@@ -1778,6 +1786,27 @@ impl MixerApp {
             self.latency_log_tick = 0.0;
             self.log_latency();
         }
+
+        // A muted Windows endpoint, or its slider at zero, renders silently: the
+        // meters move and nothing is heard. Say so once per silent episode.
+        self.output_check_tick += dt;
+        if self.output_check_tick >= 5.0 {
+            self.output_check_tick = 0.0;
+            if let Some((muted, level)) = sessions::default_output_state() {
+                let silent = muted || level < 0.01;
+                if silent && !self.output_silent {
+                    self.output_silent = true;
+                    let why = if muted { "muted" } else { "at 0 % volume" };
+                    diag_log(format!("audio: Windows default output is {why}"));
+                    self.toast_for(
+                        format!("Windows output is {why} - raise the volume in Windows Sound"),
+                        12.0,
+                    );
+                } else if !silent {
+                    self.output_silent = false;
+                }
+            }
+        }
     }
 
     /// Ten-second summary: the total plus, per strip, the reader's servo state.
@@ -1809,8 +1838,16 @@ impl MixerApp {
             if fill == 0 && skipped_now == 0 && starved_now == 0 && trim.abs() < 1e-6 {
                 continue;
             }
+            let stream = self
+                .captures
+                .get(i)
+                .and_then(|capture| capture.as_ref())
+                .map(|capture| capture.shared().pushed_frames())
+                .unwrap_or(0);
+            let delivered = stream.saturating_sub(self.reader_pushed_prev[i]) / 10;
+            self.reader_pushed_prev[i] = stream;
             diag_log(format!(
-                "audio: strip {} '{}': fill {:.1} ms, trim {:+.3} %, drift {:+.0} ms/min, skip {}/s, starve {}/s",
+                "audio: strip {} '{}': fill {:.1} ms, trim {:+.3} %, drift {:+.0} ms/min, stream {delivered} frames/s, skip {}/s, starve {}/s",
                 i + 1,
                 self.strips[i].name,
                 fill as f64 / sr * 1000.0,
