@@ -1,4 +1,4 @@
-//! Internal streaming player.
+﻿//! Internal streaming player.
 //!
 //! Decodes a playlist on a worker thread and pushes stereo frames into the same
 //! ring an input capture uses, so a strip reads the player exactly like a cable:
@@ -790,29 +790,34 @@ fn worker(
                     chunk.push(frame);
                 }
             }
-            // Each ring is gated on its own fill. This used to test the deepest
-            // fill across the player's ring and every mirror, so one mirrored
-            // strip whose ring sat above the target stopped the push to all of
-            // them - including the player's own strip. The transport then froze
-            // at 00:00, nothing was fed anywhere, and every strip starved. A
-            // ring that is full is now skipped on its own until its reader
-            // drains it.
-            // Every ring gets every block, so all strips stay sample-aligned.
-            // A ring whose reader has fallen behind is trimmed back to half the
-            // target first (oldest audio dropped) instead of skipping the block:
-            // skipping dropped audio in that strip and made the mirror stutter.
-            let resync = ring_target / 2;
-            input.set_rate(rate_now as u32);
-            if input.ring_fill() >= ring_target {
-                input.drain_to(resync);
-            }
-            input.push_block(&chunk);
-            for mirror in &mirrors {
-                mirror.set_rate(rate_now as u32);
-                if mirror.ring_fill() >= ring_target {
-                    mirror.drain_to(resync);
+            // The primary ring keeps the back-pressure it always had: if its
+            // reader has not made room, wait for it rather than pushing and
+            // trimming, because a chunk taken here is a chunk the strip plays.
+            // Mirror rings never gate the primary any more, and they are trimmed
+            // to catch up instead of skipping blocks, so they cannot stall the
+            // player either.
+            if input.ring_fill() < ring_target {
+                input.set_rate(rate_now as u32);
+                input.push_block(&chunk);
+                let resync = ring_target / 2;
+                for mirror in &mirrors {
+                    mirror.set_rate(rate_now as u32);
+                    if mirror.ring_fill() >= ring_target {
+                        mirror.drain_to(resync);
+                    }
+                    mirror.push_block(&chunk);
                 }
-                mirror.push_block(&chunk);
+                let played = input.played_frames().saturating_sub(played_base);
+                let ms = position_base_ms + (played as f64 * 1000.0 / rate_now as f64) as u64;
+                shared.position_ms.store(ms, Ordering::Relaxed);
+                shared.index.store(p.cur_index, Ordering::Relaxed);
+            } else {
+                // Hand the chunk back: nothing may be lost just because the
+                // primary ring is momentarily full.
+                for frame in chunk.into_iter().rev() {
+                    pending.push_front(frame);
+                }
+                std::thread::sleep(Duration::from_millis(2));
             }
             let played = input.played_frames().saturating_sub(played_base);
             let ms = position_base_ms + (played as f64 * 1000.0 / rate_now as f64) as u64;
