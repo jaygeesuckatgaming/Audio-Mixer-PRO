@@ -1,4 +1,4 @@
-﻿#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 
 mod audio;
 mod asio_insert;
@@ -11391,81 +11391,9 @@ fn epoch_ms() -> u64 {
 /// the log is the only way to tell what happened.
 static UI_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// True when this is the only console running. The check walks the process
-/// list for another `audio_mixer_pro.exe`: a named mutex was tried first, but a
-/// stale error code made a first launch claim "already running", so this uses
-/// the process list itself, which cannot false-positive on a fresh start.
-#[cfg(windows)]
-fn single_instance() -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
-
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return true;
-        }
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let me = std::process::id();
-        let mut other = false;
-        if Process32FirstW(snapshot, &mut entry) != 0 {
-            loop {
-                if entry.th32ProcessID != me {
-                    let name = String::from_utf16_lossy(&entry.szExeFile)
-                        .trim_end_matches('\0')
-                        .to_ascii_lowercase();
-                    if name == "audio_mixer_pro.exe" {
-                        other = true;
-                        break;
-                    }
-                }
-                if Process32NextW(snapshot, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snapshot);
-        if !other {
-            return true;
-        }
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            MessageBoxW, MB_ICONINFORMATION, MB_OK,
-        };
-        let text: Vec<u16> = "Audio Mixer PRO is already running.\n\nA second copy fights for the \
-            same virtual cables and output devices, which is heard as stutter and distortion, so \
-            this one will close."
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let caption: Vec<u16> = "Audio Mixer PRO\0".encode_utf16().collect();
-        MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            caption.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-        false
-    }
-}
-
-#[cfg(not(windows))]
-fn single_instance() -> bool {
-    true
-}
-
 fn main() -> eframe::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     install_panic_log();
-    // One console per machine. A second copy attaches the same virtual cables
-    // and opens the same output devices, which is heard as stutter and garble
-    // and is very hard to diagnose from the sound alone.
-    if !single_instance() {
-        return Ok(());
-    }
     diag_log(format!("main: entry pid {}", std::process::id()));
     // Watchdog: a frame that never returns still has working audio threads, so
     // record the stall while it is happening. Measured cause of one such stall:
