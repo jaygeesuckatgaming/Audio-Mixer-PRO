@@ -782,12 +782,7 @@ fn worker(
         // mark (it slips frames above 40 ms), so the cushion lives here.
         let ring_target = (rate_now * RING_TARGET_MS as usize / 1000).max(256);
         let mirrors = lock(&targets).clone();
-        let fill = mirrors
-            .iter()
-            .fold(input.ring_fill(), |deepest, target| {
-                deepest.max(target.ring_fill())
-            });
-        if !pending.is_empty() && fill < ring_target {
+        if !pending.is_empty() {
             let take = pending.len().min(PUSH_BLOCK);
             let mut chunk: Vec<[f32; 2]> = Vec::with_capacity(take);
             for _ in 0..take {
@@ -795,11 +790,22 @@ fn worker(
                     chunk.push(frame);
                 }
             }
+            // Each ring is gated on its own fill. This used to test the deepest
+            // fill across the player's ring and every mirror, so one mirrored
+            // strip whose ring sat above the target stopped the push to all of
+            // them - including the player's own strip. The transport then froze
+            // at 00:00, nothing was fed anywhere, and every strip starved. A
+            // ring that is full is now skipped on its own until its reader
+            // drains it.
             input.set_rate(rate_now as u32);
-            input.push_block(&chunk);
+            if input.ring_fill() < ring_target {
+                input.push_block(&chunk);
+            }
             for mirror in &mirrors {
                 mirror.set_rate(rate_now as u32);
-                mirror.push_block(&chunk);
+                if mirror.ring_fill() < ring_target {
+                    mirror.push_block(&chunk);
+                }
             }
             let played = input.played_frames().saturating_sub(played_base);
             let ms = position_base_ms + (played as f64 * 1000.0 / rate_now as f64) as u64;
@@ -807,6 +813,12 @@ fn worker(
             shared.index.store(p.cur_index, Ordering::Relaxed);
         } else {
             std::thread::sleep(Duration::from_millis(2));
+        }
+        // A ring that stops being drained must not make the decoder queue grow
+        // without bound: keep a couple of blocks of slack and drop the oldest.
+        if pending.len() > PUSH_BLOCK * 4 {
+            let excess = pending.len() - PUSH_BLOCK * 2;
+            pending.drain(..excess);
         }
         if ended {
             pending.clear();
