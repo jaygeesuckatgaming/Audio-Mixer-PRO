@@ -3070,6 +3070,12 @@ impl InputShared {
             .fetch_add(frames.len() as u64, Ordering::Relaxed);
     }
 
+    /// Drop the oldest frames so the ring holds `target` again. The player uses
+    /// this on a mirror ring whose reader has fallen behind, instead of skipping
+    /// the block (which loses audio and makes that strip stutter).
+    pub(crate) fn drain_to(&self, target: usize) {
+        lock_source(&self.ring).trim_to(target);
+    }
     /// Frames waiting in the ring. The player uses this for back-pressure and
     /// for its playback clock (`pushed - fill` = frames the mixer consumed).
     pub(crate) fn ring_fill(&self) -> usize {

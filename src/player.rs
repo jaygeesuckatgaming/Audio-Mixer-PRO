@@ -782,12 +782,13 @@ fn worker(
         // mark (it slips frames above 40 ms), so the cushion lives here.
         let ring_target = (rate_now * RING_TARGET_MS as usize / 1000).max(256);
         let mirrors = lock(&targets).clone();
-        let fill = mirrors
-            .iter()
-            .fold(input.ring_fill(), |deepest, target| {
-                deepest.max(target.ring_fill())
-            });
-        if !pending.is_empty() && fill < ring_target {
+        // Only the player's own ring gates the push. Testing the deepest ring
+        // across the player and every mirror meant one mirrored strip whose
+        // ring filled above the target stopped the player feeding its own strip
+        // too: playback ran for a few seconds, then the transport froze and
+        // every strip starved. Mirrors are fed every block and trimmed to catch
+        // up instead; the primary path is exactly as it was before the mirror.
+        if !pending.is_empty() && input.ring_fill() < ring_target {
             let take = pending.len().min(PUSH_BLOCK);
             let mut chunk: Vec<[f32; 2]> = Vec::with_capacity(take);
             for _ in 0..take {
@@ -797,8 +798,12 @@ fn worker(
             }
             input.set_rate(rate_now as u32);
             input.push_block(&chunk);
+            let resync = ring_target / 2;
             for mirror in &mirrors {
                 mirror.set_rate(rate_now as u32);
+                if mirror.ring_fill() >= ring_target {
+                    mirror.drain_to(resync);
+                }
                 mirror.push_block(&chunk);
             }
             let played = input.played_frames().saturating_sub(played_base);
