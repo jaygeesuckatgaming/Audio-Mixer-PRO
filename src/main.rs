@@ -9495,7 +9495,12 @@ Right click > Source to use the Windows capture stream instead."
                 self.remove_vst(slot);
             }
             if do_open_editor {
-                self.open_vst_editor(slot);
+                // Same rule as the insert panel: the plug-in's own window if it
+                // has one, otherwise the console's parameter list.
+                if !self.open_vst_editor(slot) {
+                    self.param_cache = self.vsts[slot].chain.parameters();
+                    self.param_editor = Some(slot);
+                }
             }
             if let Some(bypass) = new_bypass {
                 self.vsts[slot].bypass = bypass;
