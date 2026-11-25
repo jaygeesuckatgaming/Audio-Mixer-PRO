@@ -807,6 +807,15 @@ fn worker(
             // frames if it ever overflows, so no trim is needed here.
             for mirror in &mirrors {
                 mirror.set_rate(rate_now as u32);
+                // Runaway guard only: a mirror ring that reaches 4x the push
+                // target (120 ms) is stuck, not merely ahead of its reader, so
+                // it is drained back to the cushion. The old trim at 30 ms fired
+                // in normal use (the player fills to 30, the reader drains to
+                // 20), which made whichever strip was highest jump every few
+                // seconds; this threshold leaves the steady state alone.
+                if mirror.ring_fill() >= ring_target * 4 {
+                    mirror.drain_to(ring_target / 2);
+                }
                 mirror.push_block(&chunk);
             }
             let played = input.played_frames().saturating_sub(played_base);
