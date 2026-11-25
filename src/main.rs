@@ -8361,10 +8361,14 @@ Right click > Source to use the Windows capture stream instead."
                 });
             });
 
+        let touched = !changes.is_empty();
         for (id, value) in changes {
             let _ = self.vsts[idx].chain.set_parameter(id, value);
         }
-        if refresh {
+        if refresh || touched {
+            // Re-read after a move so the readout next to each slider (the
+            // plug-in's own "−14.0 dB" text) follows the value, not the value
+            // it had when the window opened.
             self.param_cache = self.vsts[idx].chain.parameters();
         } else {
             // Keep the cache in step with what was just moved, so reopening
