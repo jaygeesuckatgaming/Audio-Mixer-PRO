@@ -10850,12 +10850,32 @@ impl eframe::App for MixerApp {
         self.draw_resize_grip(ctx);
         self.handle_shot(ctx);
 
-        // 30 fps. Vsync is off (it hung the window in the NVIDIA driver), so the
-        // UI has to pace itself: at 16 ms it held a full core and starved the
-        // mixer thread, which showed up as late blocks and A1 underruns. 30 fps
-        // still moves the smoothed meters smoothly and leaves the audio thread
-        // room.
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        // Repaint pacing. Vsync is off (it hung the window in the NVIDIA
+        // driver), so the UI has to pace itself: at 16 ms it held a full core
+        // and starved the mixer thread, which showed up as late blocks and A1
+        // underruns. 30 fps while the console has focus moves the smoothed
+        // meters smoothly and leaves the audio thread room.
+        //
+        // While it does not have focus there is nothing to animate at 30 fps,
+        // and that redraw is real load on a machine that is decoding video in
+        // the foreground - Chromium's low-delay presentation shows every stall
+        // as the picture falling behind the sound. So: 4 fps unfocused, 1 fps
+        // minimised. Input (a click, a key, a hotkey) wakes it immediately, so
+        // it never feels unresponsive.
+        let (focused, minimized) = ctx.input(|i| {
+            (
+                i.focused,
+                i.viewport().minimized.unwrap_or(false),
+            )
+        });
+        let interval = if minimized {
+            1000
+        } else if focused {
+            33
+        } else {
+            250
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(interval));
     }
 }
 
