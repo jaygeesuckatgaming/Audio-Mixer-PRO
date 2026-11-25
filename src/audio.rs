@@ -58,14 +58,12 @@ const USB_CABLE_CUSHION_FRAMES: usize = 2880;
 /// the target fill. 0.5 % is under nine cents, and it is only reached while a
 /// ring is recovering; the steady trim is whatever nulls the clock mismatch.
 const SERVO_TRIM: f32 = 0.005;
-/// Integrator gain per callback: the steady trim it accumulates absorbs the
-/// device/mixer clock mismatch, so the fill converges on the target instead of
-/// settling wherever a proportional term happens to balance. At 100 callbacks a
-/// second this moves the trim 0.08 % per second.
-const SERVO_KI: f32 = 0.0008;
-/// Proportional gain per callback: damps the integrator so the fill does not
-/// overshoot while it converges.
-const SERVO_KP: f32 = 0.001;
+/// Proportional gain per callback. The fill is an integrator of the trim, so a
+/// proportional term alone is a stable first-order loop; it settles with a
+/// small steady-state error rather than winding up (the old integrator here made
+/// the loop a double integrator and it swung the mixer period by thousands of
+/// ppm, which moved the delay audibly).
+const SERVO_KP: f32 = 0.01;
 
 /// Ring depth the callback keeps queued for this endpoint.
 fn bus_cushion_frames(device: &str) -> usize {
@@ -2947,7 +2945,11 @@ pub const INPUT_TARGET_MS: f32 = 80.0;
 /// ahead of and behind the picture every few seconds. 8e-9 takes ~10 s for a
 /// full-range correction, which is imperceptible and stable.
 const INPUT_TRIM_MAX: f32 = 0.004;
-const INPUT_TRIM_STEP: f32 = 8.0e-9;
+/// Proportional gain of the fill loop (see `InputReader::next`): a normalized
+/// fill error of 1 asks for a 1 % rate correction, so the loop settles in about
+/// eight seconds and a real clock difference shows up as a few per cent of
+/// steady-state fill error instead of a wind-up.
+const INPUT_TRIM_KP: f32 = 0.01;
 /// Extra fill tolerated before the drift controller starts slipping frames out.
 /// It has to sit above the backlog a healthy capture settles at, or the slip runs
 /// permanently: 250 single-frame removals a second is a continuous stream of
@@ -3303,40 +3305,26 @@ impl InputReader {
         }
 
         let ratio = (input_rate.max(1) as f32) / (output_rate as f32);
-        // Hold the fill at the target instead of letting drift decide it.
+        // Hold the fill at the target with a **proportional** loop.
         //
-        // Diagnostic build: the rate modulation is switched off. The rings are
-        // stable (the log shows the A1 ring flat at 22-31 ms), but both servos
-        // were limit-cycling - the strip trim swung +-3500 ppm and the A1 master
-        // trim +-3000 ppm - and that modulation moves the delay by tens of ms,
-        // which is what is heard as the sound sliding against the picture. With
-        // the servo out of the loop the only rate error left is the real clock
-        // mismatch (measured at ~7 ppm, i.e. 4 ms in ten minutes), so the offset
-        // should hold still. That tells us in one run whether to redesign the
-        // controller or leave it out and top the cushion up occasionally.
-        const INPUT_SERVO_ENABLED: bool = false;
-        if INPUT_SERVO_ENABLED {
-            let fill = ring.fill() as f32;
-            if !self.fill_smoothed {
-                self.fill_avg = fill;
-                self.fill_smoothed = true;
-            }
-            let blend = (1.0 / (output_rate as f32 * INPUT_FILL_AVG_S)).clamp(1e-6, 1.0);
-            self.fill_avg += (fill - self.fill_avg) * blend;
-            let low = target as f32 * INPUT_FILL_BAND_LOW;
-            let high_band = target as f32 * INPUT_FILL_BAND_HIGH;
-            let error = if self.fill_avg >= low && self.fill_avg <= high_band {
-                0.0
-            } else {
-                ((target as f32 - self.fill_avg) / target as f32).clamp(-1.0, 1.0)
-            };
-            let pushing_out = (self.trim >= INPUT_TRIM_MAX && error > 0.0)
-                || (self.trim <= -INPUT_TRIM_MAX && error < 0.0);
-            if !pushing_out {
-                self.trim = (self.trim + error * INPUT_TRIM_STEP)
-                    .clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
-            }
+        // The plant is an integrator (fill changes at the rate the trim
+        // imposes), so a pure integrator - what this was - makes a double
+        // integrator with no damping: it swung its whole +-0.4 % range and the
+        // delay moved by tens of ms, which is heard as the sound sliding against
+        // the picture. P on an integrator plant is a first-order loop: the fill
+        // converges with a time constant of target/(Kp*rate) ~ 8 s and cannot
+        // oscillate. The price is a small steady-state error (a 1000 ppm clock
+        // difference leaves the fill ~10 % below target), which is why the
+        // cushion is generous.
+        let fill = ring.fill() as f32;
+        if !self.fill_smoothed {
+            self.fill_avg = fill;
+            self.fill_smoothed = true;
         }
+        let blend = (1.0 / (output_rate as f32 * INPUT_FILL_AVG_S)).clamp(1e-6, 1.0);
+        self.fill_avg += (fill - self.fill_avg) * blend;
+        let error = ((target as f32 - self.fill_avg) / target as f32).clamp(-1.0, 1.0);
+        self.trim = (error * INPUT_TRIM_KP).clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
         let ratio = ratio * (1.0 - self.trim);
         self.phase += ratio;
         while self.phase >= 1.0 {
@@ -4246,18 +4234,13 @@ where
                 let target = (cushion as f32 * 0.75).max(1.0);
                 let fill = rings.iter().map(|ring| ring.len()).min().unwrap_or(0);
                 let error = ((target - fill as f32) / target).clamp(-1.0, 1.0);
-                // Diagnostic build: like the strip servo, this one is switched
-                // off. It was modulating the mixer period by +-3000 ppm, which
-                // swings the delay between the console and the speakers; with it
-                // out, production runs at nominal and the ring only moves by the
-                // real clock difference (a few ppm).
-                const BUS_SERVO_ENABLED: bool = false;
-                let trim = if BUS_SERVO_ENABLED {
-                    servo_trim = (servo_trim + error * SERVO_KI).clamp(-SERVO_TRIM, SERVO_TRIM);
-                    (servo_trim + error * SERVO_KP).clamp(-SERVO_TRIM, SERVO_TRIM)
-                } else {
-                    0.0
-                };
+                // Proportional only, for the same reason as the strip reader:
+                // the plant is an integrator, so P is a stable first-order loop
+                // while the old integrator made it a double integrator that
+                // swung the mixer period by thousands of ppm. `servo_trim` is
+                // kept for the log but is no longer integrated.
+                servo_trim = error * SERVO_KP;
+                let trim = servo_trim.clamp(-SERVO_TRIM, SERVO_TRIM);
                 let master_group = buses.contains(&0) && shared.a1_master.load(Ordering::Relaxed);
                 let step = if master_group {
                     // A1 is the clock reference: publish the correction for the
@@ -5153,22 +5136,15 @@ mod latency_tests {
     fn servo_refills_a_low_ring_and_brakes_a_full_one() {
         let cushion = USB_CABLE_CUSHION_FRAMES;
         let target = (cushion as f32 * 0.75) as usize;
-        // The integrator moves toward "read slower" while the ring is short and
-        // toward "read faster" while it is over the target.
-        let mut trim = 0.0f32;
-        for _ in 0..100 {
-            let error = ((target as f32 - 0.0) / target as f32).clamp(-1.0, 1.0);
-            trim = (trim + error * SERVO_KI).clamp(-SERVO_TRIM, SERVO_TRIM);
-        }
-        assert!(trim > 0.0);
-        assert!(servo_step(1.0, trim) < 1.0);
-        let mut trim = 0.0f32;
-        for _ in 0..100 {
-            let error = ((target as f32 - cushion as f32) / target as f32).clamp(-1.0, 1.0);
-            trim = (trim + error * SERVO_KI).clamp(-SERVO_TRIM, SERVO_TRIM);
-        }
-        assert!(trim < 0.0);
-        assert!(servo_step(1.0, trim) > 1.0);
+        // Proportional loop: a short ring asks for a slower read (trim > 0), an
+        // over-full ring for a faster one (trim < 0). No integrator, so nothing
+        // can wind up and swing the delay.
+        let short = ((target as f32 - 0.0) / target as f32).clamp(-1.0, 1.0) * SERVO_KP;
+        assert!(short > 0.0);
+        assert!(servo_step(1.0, short) < 1.0);
+        let full = ((target as f32 - cushion as f32) / target as f32).clamp(-1.0, 1.0) * SERVO_KP;
+        assert!(full < 0.0);
+        assert!(servo_step(1.0, full) > 1.0);
         // No trim, no change; and the trim never exceeds SERVO_TRIM.
         assert!((servo_step(1.0, 0.0) - 1.0).abs() < 1e-6);
         for trim in [-1.0f32, -0.2, 0.2, 1.0] {
@@ -5228,7 +5204,6 @@ mod latency_tests {
     }
 
     #[test]
-    #[ignore = "rate servo is disabled in this build (INPUT_SERVO_ENABLED = false)"]
     fn reader_slips_a_spike_backlog_back_toward_the_target() {
         let mut ring = SampleRing::new();
         for _ in 0..5_000 {
