@@ -1,4 +1,4 @@
-//! Internal streaming player.
+﻿//! Internal streaming player.
 //!
 //! Decodes a playlist on a worker thread and pushes stereo frames into the same
 //! ring an input capture uses, so a strip reads the player exactly like a cable:
@@ -25,11 +25,16 @@ use symphonia::core::units::Time;
 
 use crate::audio::InputShared;
 
-const PUSH_BLOCK: usize = 1024;
+// Frames per push into the strip ring. 256 (5.3 ms at 48 kHz) instead of
+// 1024 (21 ms): the worker only pushes while the ring is below the target,
+// so a coarse block overshot the cushion by up to a whole block, and every
+// mirrored ring inherited that overshoot - the latency readout then moved
+// between 29 and 75 ms per strip while playing.
+const PUSH_BLOCK: usize = 256;
 /// How far ahead of the player the strip ring is fed. The input reader holds its
 /// own target at 20 ms and starts slipping frames above 40 ms, so the player
 /// keeps the ring under that and holds its real cushion in its own queue.
-const RING_TARGET_MS: u32 = 30;
+const RING_TARGET_MS: u32 = 25;
 /// Decoded audio the worker keeps queued in front of the ring. A slow disk or a
 /// CPU spike is absorbed here; the strip never sees it.
 const DECODE_AHEAD_MS: usize = 750;
