@@ -2935,7 +2935,7 @@ const INPUT_BUFFER_FRAMES: u32 = 512;
 /// and starved (up to ~360 frames a second), and every starvation holds samples
 /// and shifts the audio against the picture. 40 ms is two device periods plus a
 /// margin - still a small constant offset, but no longer riding the edge.
-pub const INPUT_TARGET_MS: f32 = 40.0;
+pub const INPUT_TARGET_MS: f32 = 80.0;
 /// Input ring servo: the most it may trim the read rate away from the device's
 /// (7 cents, reached only while the fill is recovering) and the integrator step
 /// per output frame.
@@ -3303,46 +3303,39 @@ impl InputReader {
         }
 
         let ratio = (input_rate.max(1) as f32) / (output_rate as f32);
-        // Hold the fill at the target instead of letting drift decide it. The
-        // trim is at most 0.4 % (under seven cents) and only reached while the
-        // fill is far from target; once it settles it carries the steady clock
-        // mismatch, so the ring no longer slides toward empty.
+        // Hold the fill at the target instead of letting drift decide it.
         //
-        // Integrate against a smoothed fill, not the instantaneous one. A
-        // capture stream arrives in whole device periods (480 frames = 10 ms),
-        // so the raw fill swings by that much around the target every period;
-        // feeding that swing into the integrator biases it, and the reader then
-        // plays a few hundred ppm fast for ever - which is exactly the audio
-        // creeping ahead of a video picture (24 ms/min on a cable strip). The
-        // average over half a second leaves the real clock difference, which is
-        // what the trim is for.
-        let fill = ring.fill() as f32;
-        if !self.fill_smoothed {
-            self.fill_avg = fill;
-            self.fill_smoothed = true;
-        }
-        let blend = (1.0 / (output_rate as f32 * INPUT_FILL_AVG_S)).clamp(1e-6, 1.0);
-        self.fill_avg += (fill - self.fill_avg) * blend;
-        // Dead band. A capture path that only ever delivers single device
-        // periods settles somewhere below the nominal target (here ~10-16 ms
-        // against a 20 ms target), and asking for "slower, refill" for ever made
-        // the trim wind up to its clamp: the reader then played 0.4 % slow for
-        // the whole session, which is 240 ms of "audio late" per minute. Inside
-        // the band the ring is stable enough and the trim is left alone, so the
-        // content keeps the source's own rate. A real clock difference moves the
-        // fill out of the band within seconds and is still corrected.
-        let low = target as f32 * INPUT_FILL_BAND_LOW;
-        let high_band = target as f32 * INPUT_FILL_BAND_HIGH;
-        let error = if self.fill_avg >= low && self.fill_avg <= high_band {
-            0.0
-        } else {
-            ((target as f32 - self.fill_avg) / target as f32).clamp(-1.0, 1.0)
-        };
-        // Anti-windup: at a limit, only integrate back towards zero.
-        let pushing_out =
-            (self.trim >= INPUT_TRIM_MAX && error > 0.0) || (self.trim <= -INPUT_TRIM_MAX && error < 0.0);
-        if !pushing_out {
-            self.trim = (self.trim + error * INPUT_TRIM_STEP).clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
+        // Diagnostic build: the rate modulation is switched off. The rings are
+        // stable (the log shows the A1 ring flat at 22-31 ms), but both servos
+        // were limit-cycling - the strip trim swung +-3500 ppm and the A1 master
+        // trim +-3000 ppm - and that modulation moves the delay by tens of ms,
+        // which is what is heard as the sound sliding against the picture. With
+        // the servo out of the loop the only rate error left is the real clock
+        // mismatch (measured at ~7 ppm, i.e. 4 ms in ten minutes), so the offset
+        // should hold still. That tells us in one run whether to redesign the
+        // controller or leave it out and top the cushion up occasionally.
+        const INPUT_SERVO_ENABLED: bool = false;
+        if INPUT_SERVO_ENABLED {
+            let fill = ring.fill() as f32;
+            if !self.fill_smoothed {
+                self.fill_avg = fill;
+                self.fill_smoothed = true;
+            }
+            let blend = (1.0 / (output_rate as f32 * INPUT_FILL_AVG_S)).clamp(1e-6, 1.0);
+            self.fill_avg += (fill - self.fill_avg) * blend;
+            let low = target as f32 * INPUT_FILL_BAND_LOW;
+            let high_band = target as f32 * INPUT_FILL_BAND_HIGH;
+            let error = if self.fill_avg >= low && self.fill_avg <= high_band {
+                0.0
+            } else {
+                ((target as f32 - self.fill_avg) / target as f32).clamp(-1.0, 1.0)
+            };
+            let pushing_out = (self.trim >= INPUT_TRIM_MAX && error > 0.0)
+                || (self.trim <= -INPUT_TRIM_MAX && error < 0.0);
+            if !pushing_out {
+                self.trim = (self.trim + error * INPUT_TRIM_STEP)
+                    .clamp(-INPUT_TRIM_MAX, INPUT_TRIM_MAX);
+            }
         }
         let ratio = ratio * (1.0 - self.trim);
         self.phase += ratio;
@@ -4253,8 +4246,18 @@ where
                 let target = (cushion as f32 * 0.75).max(1.0);
                 let fill = rings.iter().map(|ring| ring.len()).min().unwrap_or(0);
                 let error = ((target - fill as f32) / target).clamp(-1.0, 1.0);
-                servo_trim = (servo_trim + error * SERVO_KI).clamp(-SERVO_TRIM, SERVO_TRIM);
-                let trim = (servo_trim + error * SERVO_KP).clamp(-SERVO_TRIM, SERVO_TRIM);
+                // Diagnostic build: like the strip servo, this one is switched
+                // off. It was modulating the mixer period by +-3000 ppm, which
+                // swings the delay between the console and the speakers; with it
+                // out, production runs at nominal and the ring only moves by the
+                // real clock difference (a few ppm).
+                const BUS_SERVO_ENABLED: bool = false;
+                let trim = if BUS_SERVO_ENABLED {
+                    servo_trim = (servo_trim + error * SERVO_KI).clamp(-SERVO_TRIM, SERVO_TRIM);
+                    (servo_trim + error * SERVO_KP).clamp(-SERVO_TRIM, SERVO_TRIM)
+                } else {
+                    0.0
+                };
                 let master_group = buses.contains(&0) && shared.a1_master.load(Ordering::Relaxed);
                 let step = if master_group {
                     // A1 is the clock reference: publish the correction for the
@@ -5225,6 +5228,7 @@ mod latency_tests {
     }
 
     #[test]
+    #[ignore = "rate servo is disabled in this build (INPUT_SERVO_ENABLED = false)"]
     fn reader_slips_a_spike_backlog_back_toward_the_target() {
         let mut ring = SampleRing::new();
         for _ in 0..5_000 {
