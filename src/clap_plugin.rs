@@ -34,6 +34,11 @@ pub struct ClapSlot {
     gui_open: AtomicBool,
     /// Parameter changes waiting to be delivered as events in the next block.
     pending: Mutex<Vec<(ClapId, f64)>>,
+    /// Values the console just set, per parameter id. CLAP applies a set only
+    /// inside the plug-in's next process, so without this the parameter list
+    /// would show (and the sliders would snap back to) the previous value for
+    /// a whole block every time a slider moved.
+    touched: Mutex<Vec<(u32, f64)>>,
 }
 
 struct Main {
@@ -78,7 +83,8 @@ impl ClapSlot {
             peak: AtomicU32::new(0),
             in_peak: AtomicU32::new(0),
             gui_open: AtomicBool::new(false),
-            pending: Mutex::new(Vec::with_capacity(8)),
+            pending: Mutex::new(Vec::with_capacity(32)),
+            touched: Mutex::new(Vec::new()),
         })
     }
 
@@ -223,6 +229,9 @@ impl ClapSlot {
             *slot = Some(info.clone());
         }
         self.set_error(None);
+        if let Ok(mut touched) = self.touched.lock() {
+            touched.clear();
+        }
         Ok(info)
     }
 
@@ -237,6 +246,9 @@ impl ClapSlot {
         }
         if let Ok(mut slot) = self.info.lock() {
             *slot = None;
+        }
+        if let Ok(mut touched) = self.touched.lock() {
+            touched.clear();
         }
         self.peak.store(0u32, Ordering::Relaxed);
         self.in_peak.store(0u32, Ordering::Relaxed);
@@ -256,13 +268,17 @@ impl ClapSlot {
         let count = params.count(&handle);
         let mut buffer = ParamInfoBuffer::new();
         let mut out = Vec::new();
+        let touched = self.touched.lock().map(|t| t.clone()).unwrap_or_default();
         for index in 0..count {
             let Some(info) = params.get_info(&handle, index, &mut buffer) else {
                 continue;
             };
             let id = info.id.get();
-            let value = params
-                .get_value(&handle, info.id)
+            let value = touched
+                .iter()
+                .find(|(moved, _)| *moved == id)
+                .map(|(_, value)| *value)
+                .or_else(|| params.get_value(&handle, info.id))
                 .unwrap_or(info.default_value);
             let mut text = [0u8; 128];
             let formatted = params
@@ -280,6 +296,7 @@ impl ClapSlot {
                 value,
                 min: info.min_value,
                 max: info.max_value,
+                default: info.default_value,
                 step_count: if info.max_value - info.min_value > 0.0 {
                     -1
                 } else {
@@ -295,11 +312,18 @@ impl ClapSlot {
     /// inside its next `process` call. It is queued here and delivered then.
     pub fn set_parameter(&self, id: u32, value: f64) -> Result<(), String> {
         let id = ClapId::from_raw(id).ok_or_else(|| "invalid parameter id".to_string())?;
+        // Remember it now so the parameter list reflects the move immediately.
+        if let Ok(mut touched) = self.touched.lock() {
+            match touched.iter_mut().find(|(moved, _)| *moved == id.get()) {
+                Some(entry) => entry.1 = value,
+                None => touched.push((id.get(), value)),
+            }
+        }
         let mut pending = self
             .pending
             .lock()
             .map_err(|_| "parameter queue unavailable".to_string())?;
-        if pending.len() >= 8 {
+        if pending.len() >= 32 {
             return Err("too many parameter changes queued".to_string());
         }
         pending.push((id, value));

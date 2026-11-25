@@ -49,6 +49,8 @@ pub struct VstParam {
     /// 0.0..=1.0, CLAP uses the plug-in's own plain range.
     pub min: f64,
     pub max: f64,
+    /// Factory default, so a double click can restore it.
+    pub default: f64,
     pub step_count: i32,
     pub formatted: String,
 }
@@ -848,6 +850,7 @@ fn read_parameters(plugin: &mut Plugin) -> Vec<VstParam> {
                 value: param.value,
                 min: 0.0,
                 max: 1.0,
+                default: param.default,
                 step_count: param.step_count,
                 formatted,
             }

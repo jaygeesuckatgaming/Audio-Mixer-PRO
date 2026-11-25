@@ -8311,19 +8311,35 @@ Right click > Source to use the Windows capture stream instead."
 
         // Copy the rows out so the window closure never borrows `self` while
         // the changes are applied afterwards.
-        let mut rows: Vec<(u32, String, String, f64, f64, f64)> = self
+        let mut rows: Vec<(u32, String, String, f64, f64, f64, f64)> = self
             .param_cache
             .iter()
-            .map(|p| (p.id, p.name.clone(), p.formatted.clone(), p.value, p.min, p.max))
+            .map(|p| {
+                (
+                    p.id,
+                    p.name.clone(),
+                    p.formatted.clone(),
+                    p.value,
+                    p.min,
+                    p.max,
+                    p.default,
+                )
+            })
             .collect();
         let mut changes: Vec<(u32, f64)> = Vec::new();
         let mut refresh = false;
         let mut open = true;
+        let accent = TEAL;
 
+        // The panel follows the console's own look: one vertical fader per
+        // parameter, name above, value below, dragged the same way as a strip
+        // fader (a fixed number of units per pixel, anchored at mouse-down).
+        let width = (rows.len() as f32 * 54.0 + 26.0).clamp(180.0, 900.0);
         egui::Window::new(format!("{name} - parameters"))
             .open(&mut open)
             .resizable(true)
-            .default_width(360.0)
+            .default_width(width)
+            .default_height(250.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("Refresh").clicked() {
@@ -8336,29 +8352,53 @@ Right click > Source to use the Windows capture stream instead."
                     ui.label("This plug-in exposes no parameters.");
                     return;
                 }
-                egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
-                    for (id, param_name, formatted, value, min, max) in rows.iter_mut() {
-                        let lo = min.min(*max);
-                        let hi = max.max(lo + 1e-9);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{param_name}")).size(9.5),
-                            );
-                            let mut v = *value;
-                            if ui.add(egui::Slider::new(&mut v, lo..=hi)).changed() {
-                                *value = v;
-                                changes.push((*id, v));
-                            }
-                            if !formatted.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(formatted.clone())
-                                        .size(8.5)
-                                        .color(FAINT),
-                                );
+                egui::ScrollArea::horizontal()
+                    .max_width(width - 20.0)
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            for (id, param_name, formatted, value, min, max, default) in
+                                rows.iter_mut()
+                            {
+                                let lo = min.min(*max);
+                                let hi = max.max(lo + 1e-9);
+                                ui.allocate_ui(Vec2::new(50.0, 214.0), |ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(fit_text(
+                                                ui.painter(),
+                                                param_name,
+                                                8.0,
+                                                46.0,
+                                            ))
+                                            .size(8.5)
+                                            .color(DIM),
+                                        );
+                                        let moved = param_fader(
+                                            ui,
+                                            Vec2::new(46.0, 160.0),
+                                            value,
+                                            lo,
+                                            hi,
+                                            *default,
+                                            accent,
+                                            Id::new(("param-fader", idx, *id)),
+                                        );
+                                        if moved {
+                                            changes.push((*id, *value));
+                                        }
+                                        let text = if formatted.is_empty() {
+                                            format!("{value:.2}")
+                                        } else {
+                                            formatted.clone()
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(text).size(8.5).color(TEXT),
+                                        );
+                                    });
+                                });
                             }
                         });
-                    }
-                });
+                    });
             });
 
         let touched = !changes.is_empty();
@@ -10980,6 +11020,108 @@ fn fader(
             ui.label(format!("{}", fmt_db(*value)));
         });
     }
+}
+
+/// One parameter of a plug-in: a vertical fader in the console's own style,
+/// used by the parameter window for plug-ins that have no editor of their own.
+/// Returns true when the value moved this frame.
+///
+/// The mapping is anchored at mouse-down (value at grab + pixels moved), the
+/// same way `fader` does it, so dragging never accumulates error against the
+/// ends of the range. Wheel steps 1 % of the range, double click restores the
+/// plug-in's default.
+fn param_fader(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    value: &mut f64,
+    lo: f64,
+    hi: f64,
+    default: f64,
+    accent: Color32,
+    id: Id,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let span = (hi - lo).max(1e-9);
+    let travel = Rect::from_min_max(
+        Pos2::new(rect.center().x - 5.0, rect.top() + 12.0),
+        Pos2::new(rect.center().x + 5.0, rect.bottom() - 12.0),
+    );
+    let mut moved = false;
+
+    let grab_id = id.with("grab");
+    if resp.drag_started() {
+        let y = ui.input(|i| {
+            i.pointer
+                .press_origin()
+                .or_else(|| i.pointer.interact_pos())
+                .map(|p| p.y)
+                .unwrap_or(0.0)
+        });
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(grab_id, (*value, y)));
+    }
+    if resp.dragged() {
+        if let Some((at_grab, grab_y)) = ui.ctx().data(|d| d.get_temp::<(f64, f32)>(grab_id)) {
+            if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                let height = travel.height().max(1.0) as f64;
+                *value = (at_grab - (pos.y - grab_y) as f64 * span / height).clamp(lo, hi);
+                moved = true;
+            }
+        }
+    }
+    if resp.double_clicked() {
+        *value = default.clamp(lo, hi);
+        moved = true;
+    }
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y) as f64;
+        if scroll != 0.0 {
+            *value = (*value + scroll.signum() * span / 100.0).clamp(lo, hi);
+            moved = true;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+
+    let p = ui.painter();
+    let track = Rect::from_center_size(travel.center(), Vec2::new(7.0, travel.height()));
+    p.rect_filled(track, 2.0, TRACK);
+    p.rect_stroke(track, 2.0, Stroke::new(1.0, LINE));
+    // Ticks every quarter of the range: enough to read a relative position
+    // without turning the column into a scale.
+    for step in 1..4 {
+        let y = travel.bottom() - travel.height() * step as f32 / 4.0;
+        p.line_segment(
+            [
+                Pos2::new(track.right() + 1.0, y),
+                Pos2::new(track.right() + 4.0, y),
+            ],
+            Stroke::new(1.0, FAINT.gamma_multiply(0.5)),
+        );
+    }
+    let t = ((*value - lo) / span).clamp(0.0, 1.0) as f32;
+    let y = travel.bottom() - t * travel.height();
+    let fill = Rect::from_min_max(
+        Pos2::new(track.left(), y),
+        Pos2::new(track.right(), track.bottom()),
+    );
+    p.rect_filled(fill, 2.0, accent.gamma_multiply(0.22));
+    let handle = Rect::from_center_size(
+        Pos2::new(rect.center().x, y),
+        Vec2::new(rect.width() - 10.0, 9.0),
+    );
+    p.rect_filled(handle, 2.0, Color32::from_rgb(40, 45, 55));
+    p.rect_stroke(handle, 2.0, Stroke::new(1.0, accent));
+    p.line_segment(
+        [
+            Pos2::new(handle.left() + 3.0, handle.center().y),
+            Pos2::new(handle.right() - 3.0, handle.center().y),
+        ],
+        Stroke::new(2.0, accent),
+    );
+    if resp.hovered() {
+        p.rect_stroke(track, 2.0, Stroke::new(1.0, accent.gamma_multiply(0.6)));
+    }
+    moved
 }
 
 /// One ducking parameter: compact bar slider, editable value, name, and a
