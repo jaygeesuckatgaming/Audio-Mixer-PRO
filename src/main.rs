@@ -946,12 +946,14 @@ struct MixerApp {
     reader_skipped_prev: [u64; audio::MAX_STRIPS],
     reader_starved_prev: [u64; audio::MAX_STRIPS],
     reader_pushed_prev: [u64; audio::MAX_STRIPS],
-    /// Consumer side of the same measurement: frames the reader took and frames
-    /// the ring discarded, so the log can report a real rate mismatch instead
-    /// of the servo's trim (which is a clamp, not an observation).
-    reader_taken_prev: [u64; audio::MAX_STRIPS],
-    reader_dropped_prev: [u64; audio::MAX_STRIPS],
-    reader_stats_at: f64,
+    /// Wall clock of the previous strip log, and the long-window delay trend:
+    /// the fill average at the last baseline, the resulting ms/min per strip,
+    /// and how many seconds that baseline covers.
+    reader_stats_at: std::time::Instant,
+    reader_drift_at: std::time::Instant,
+    reader_drift_fill: [f32; audio::MAX_STRIPS],
+    reader_drift_ms: [f32; audio::MAX_STRIPS],
+    reader_drift_span: f64,
     /// Windows default output watchdog: a muted endpoint or a slider at zero
     /// looks exactly like a dead mixer, so it is called out in a toast.
     output_check_tick: f64,
@@ -1536,9 +1538,11 @@ impl MixerApp {
             reader_skipped_prev: [0; audio::MAX_STRIPS],
             reader_starved_prev: [0; audio::MAX_STRIPS],
             reader_pushed_prev: [0; audio::MAX_STRIPS],
-            reader_taken_prev: [0; audio::MAX_STRIPS],
-            reader_dropped_prev: [0; audio::MAX_STRIPS],
-            reader_stats_at: 0.0,
+            reader_stats_at: std::time::Instant::now(),
+            reader_drift_at: std::time::Instant::now(),
+            reader_drift_fill: [0.0; audio::MAX_STRIPS],
+            reader_drift_ms: [0.0; audio::MAX_STRIPS],
+            reader_drift_span: 0.0,
             output_check_tick: 5.0,
             output_silent: false,
             last_ring_logged: 0,
@@ -1863,10 +1867,35 @@ impl MixerApp {
             self.latency_ms_shown, avg, peak
         ));
         let sr = self.sample_rate.max(1) as f64;
-        // The log runs on a 10 s tick; time it from the frame clock so a long
-        // frame cannot make the rates look wrong.
-        let seconds = (self.time - self.reader_stats_at).clamp(1.0, 60.0);
-        self.reader_stats_at = self.time;
+        // Wall clock, not the frame clock: eframe's dt can run ahead of real
+        // time when the window is throttled, which made the measured rates look
+        // 1.6x off and the drift figures pure noise.
+        let now = std::time::Instant::now();
+        let seconds = now
+            .duration_since(self.reader_stats_at)
+            .as_secs_f64()
+            .clamp(0.5, 120.0);
+        self.reader_stats_at = now;
+
+        // Delay trend. The raw fill swings by a whole device period whenever the
+        // capture endpoint delivers, so a short-window difference is mostly
+        // noise; compare the servo's 0.5 s average with where it was a minute
+        // ago instead. Positive = the ring is deeper = the audio is later.
+        let elapsed = now.duration_since(self.reader_drift_at).as_secs_f64();
+        if elapsed >= 60.0 {
+            for i in 0..self.active_strips.min(audio::MAX_STRIPS) {
+                let avg = self.audio.strip_reader_stats(i).fill_avg_frames;
+                self.reader_drift_ms[i] = if avg > 0.0 {
+                    ((avg - self.reader_drift_fill[i]) as f64 * 60_000.0 / (sr * elapsed)) as f32
+                } else {
+                    0.0
+                };
+                self.reader_drift_fill[i] = avg;
+            }
+            self.reader_drift_span = elapsed;
+            self.reader_drift_at = now;
+        }
+
         for i in 0..self.active_strips.min(audio::MAX_STRIPS) {
             let stats = self.audio.strip_reader_stats(i);
             let skipped_now = stats.skipped.saturating_sub(self.reader_skipped_prev[i]);
@@ -1876,31 +1905,34 @@ impl MixerApp {
             if stats.fill_frames == 0 && skipped_now == 0 && starved_now == 0 {
                 continue;
             }
-            // Real rates from the ring's own counters, not from the servo. The
-            // producer pushed N frames while the reader took M; N-M per second
-            // is the mismatch the resampler has to absorb, and the same number
-            // read as ms per minute is the delay change - the actual drift.
+            // Liveness only: how fast this strip's producer is delivering. The
+            // producer pushes in bursts, so this is not a drift figure.
             let pushed = stats.pushed.saturating_sub(self.reader_pushed_prev[i]) as f64;
-            let taken = stats.taken.saturating_sub(self.reader_taken_prev[i]) as f64;
-            let dropped = stats.dropped.saturating_sub(self.reader_dropped_prev[i]) as f64;
             self.reader_pushed_prev[i] = stats.pushed;
-            self.reader_taken_prev[i] = stats.taken;
-            self.reader_dropped_prev[i] = stats.dropped;
-            let rate_in = pushed / seconds;
-            let rate_out = (taken + dropped) / seconds;
-            let ppm = (rate_in - rate_out) / sr * 1e6;
-            let delay_ms_per_min = (rate_in - rate_out) * 60_000.0 / sr;
+            let average = if stats.fill_avg_frames > 0.0 {
+                format!("avg {:.1}", stats.fill_avg_frames as f64 / sr * 1000.0)
+            } else {
+                // A strip that is routed nowhere still reports its fill (held at
+                // the target by discarding), but its reader never ran, so there
+                // is no average to talk about.
+                "avg -".to_string()
+            };
+            let delay = if self.reader_drift_span > 0.0 {
+                format!(
+                    "delay {:+.2} ms/min ({:.0} s)",
+                    self.reader_drift_ms[i], self.reader_drift_span
+                )
+            } else {
+                "delay pending (needs 60 s)".to_string()
+            };
             diag_log(format!(
-                "audio: strip {} '{}': fill {:.1} ms (avg {:.1}), trim {:+.0} ppm{}, in {:.1}/s out {:.1}/s, delay {:+.1} ms/min, skip {:.0}/s, starve {:.0}/s",
+                "audio: strip {} '{}': fill {:.1} ms ({average}), in {:.0}/s, trim {:+.0} ppm{}, {delay}, skip {:.1}/s, starve {:.1}/s",
                 i + 1,
                 self.strips[i].name,
                 stats.fill_frames as f64 / sr * 1000.0,
-                stats.fill_avg_frames as f64 / sr * 1000.0,
+                pushed / seconds,
                 stats.trim as f64 * 1e6,
                 if stats.clamped { " [clamped]" } else { "" },
-                rate_in,
-                rate_out,
-                delay_ms_per_min,
                 skipped_now as f64 / seconds,
                 starved_now as f64 / seconds,
             ));
