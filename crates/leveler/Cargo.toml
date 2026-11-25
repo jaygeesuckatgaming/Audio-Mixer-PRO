@@ -1,0 +1,23 @@
+[package]
+name = "leveler"
+version = "0.1.0"
+edition = "2021"
+description = "Audio Mixer PRO Leveler - a small CLAP leveler (min/max) for the mixer's strip insert"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+clack-plugin = "0.2"
+clack-extensions = { version = "0.2", features = [
+    "clack-plugin",
+    "audio-ports",
+    "params",
+    "state",
+    "latency",
+] }
+
+# Kept out of the mixer's crate graph: this builds to a .clap library, it is not
+# a dependency of the console.
+[workspace]
