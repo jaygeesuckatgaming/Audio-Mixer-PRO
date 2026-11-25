@@ -209,8 +209,10 @@ impl PluginMainThreadParams for LevelerMain {
 
     fn get_info(&self, param_index: u32, info: &mut ParamInfoWriter) {
         let (id, name, range, default) = match param_index {
-            0 => (PARAM_MIN_ID, b"Min".as_slice(), RANGE_DB, MIN_DB),
-            1 => (PARAM_MAX_ID, b"Max".as_slice(), RANGE_DB, MAX_DB),
+            // Max is listed first: in the console's fader window the pair then
+            // reads as a band, Max on the left going down to Min on the right.
+            0 => (PARAM_MAX_ID, b"Max".as_slice(), RANGE_DB, MAX_DB),
+            1 => (PARAM_MIN_ID, b"Min".as_slice(), RANGE_DB, MIN_DB),
             2 => (PARAM_ATTACK_ID, b"Attack".as_slice(), RANGE_ATTACK, ATTACK_MS),
             3 => (PARAM_RELEASE_ID, b"Release".as_slice(), RANGE_RELEASE, RELEASE_MS),
             4 => (PARAM_CEILING_ID, b"Ceiling".as_slice(), RANGE_CEILING, CEILING_DB),
@@ -340,7 +342,7 @@ impl DefaultPluginFactory for Leveler {
     fn get_descriptor() -> PluginDescriptor {
         PluginDescriptor::new("com.jaygee.leveler", "Leveler")
             .with_vendor("JayGee")
-            .with_version("0.4.0")
+            .with_version("0.4.1")
     }
 
     fn new_shared(_host: HostSharedHandle<'_>) -> Result<Self::Shared<'_>, PluginError> {

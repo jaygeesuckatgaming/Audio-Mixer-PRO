@@ -11107,7 +11107,7 @@ fn param_fader(
     p.rect_filled(fill, 2.0, accent.gamma_multiply(0.22));
     let handle = Rect::from_center_size(
         Pos2::new(rect.center().x, y),
-        Vec2::new(rect.width() - 10.0, 9.0),
+        Vec2::new(20.0, 9.0),
     );
     p.rect_filled(handle, 2.0, Color32::from_rgb(40, 45, 55));
     p.rect_stroke(handle, 2.0, Stroke::new(1.0, accent));
