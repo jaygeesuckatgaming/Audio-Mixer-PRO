@@ -741,6 +741,15 @@ struct Shared {
     strip_trim: [AtomicU32; MAX_STRIPS],
     strip_skipped: [AtomicU64; MAX_STRIPS],
     strip_starved: [AtomicU64; MAX_STRIPS],
+    /// Half-second average of the ring fill (f32 bits), and whether the servo
+    /// is sitting on its clamp - the state that used to be reported as a clock.
+    strip_fill_avg: [AtomicU32; MAX_STRIPS],
+    strip_clamped: [AtomicBool; MAX_STRIPS],
+    /// Producer / consumer / discard frame counters per strip, so the log can
+    /// state the real rate mismatch (ppm) and the resulting delay change.
+    strip_pushed: [AtomicU64; MAX_STRIPS],
+    strip_taken: [AtomicU64; MAX_STRIPS],
+    strip_dropped: [AtomicU64; MAX_STRIPS],
     /// One VST3 insert per input strip (up to MAX_STRIPS independent slots).
     /// This is a rebuild extension (the original console has no VST loader);
     /// see vst.rs.
@@ -836,6 +845,11 @@ impl Shared {
             strip_trim: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             strip_skipped: std::array::from_fn(|_| AtomicU64::new(0)),
             strip_starved: std::array::from_fn(|_| AtomicU64::new(0)),
+            strip_fill_avg: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
+            strip_clamped: std::array::from_fn(|_| AtomicBool::new(false)),
+            strip_pushed: std::array::from_fn(|_| AtomicU64::new(0)),
+            strip_taken: std::array::from_fn(|_| AtomicU64::new(0)),
+            strip_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
             mixer_late: AtomicU64::new(0),
             bus_underruns: std::array::from_fn(|_| AtomicU64::new(0)),
             bus_callback_frames: std::array::from_fn(|_| AtomicUsize::new(0)),
@@ -1219,6 +1233,9 @@ impl Dsp {
                 if let Some(ring) = rings[i].as_mut() {
                     let target = (sample_rate * INPUT_TARGET_MS / 1000.0) as usize;
                     ring.trim_to(target);
+                    // Still report this strip's counters: the latency log must
+                    // not present a stale rate as a live one.
+                    strip_counters(shared, i, ring);
                 }
                 continue;
             }
@@ -1234,13 +1251,12 @@ impl Dsp {
                 self.vst_in_l[i][frame] = s[0];
                 self.vst_in_r[i][frame] = s[1];
             }
-            // Publish the reader state once per block for the latency log: a
-            // steady skip rate or a large trim is what makes the audio drift
-            // against a picture that is paced by another clock.
-            shared.strip_fill[i].store(ring.fill(), Ordering::Relaxed);
-            shared.strip_trim[i].store(self.readers[i].trim.to_bits(), Ordering::Relaxed);
-            shared.strip_skipped[i].store(self.readers[i].skipped, Ordering::Relaxed);
-            shared.strip_starved[i].store(self.readers[i].starved_total, Ordering::Relaxed);
+            // Publish the reader state once per block for the latency log: the
+            // real producer/consumer rates, the ring fill and the servo's own
+            // trim. A steady skip rate or a clamped trim is what makes the audio
+            // drift against a picture paced by another clock.
+            strip_counters(shared, i, ring);
+            self.readers[i].publish(shared, i);
             // Pre-FX insert: send the dry block, then use the returned one in its
             // place. The return belongs to an earlier block, so the strip is a
             // block or two late — inherent to an external insert.
@@ -1798,6 +1814,23 @@ fn group_buses_by_device(wanted: &[Option<String>; MAX_BUSES]) -> Vec<(String, V
         }
     }
     groups
+}
+
+/// One strip's capture-reader state, for the periodic latency log.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StripReaderStats {
+    /// Frames waiting in the strip's ring right now.
+    pub fill_frames: usize,
+    /// Half-second average of that fill, which the servo actually steers.
+    pub fill_avg_frames: f32,
+    /// Servo trim: 0.001 means the reader plays the source 0.1 % fast.
+    pub trim: f32,
+    pub pushed: u64,
+    pub taken: u64,
+    pub dropped: u64,
+    pub skipped: u64,
+    pub starved: u64,
+    pub clamped: bool,
 }
 
 impl AudioEngine {
@@ -2796,20 +2829,27 @@ impl AudioEngine {
         load_f32(&self.shared.source_peak)
     }
 
-    /// Capture-reader state for one strip: ring fill in frames, servo trim
-    /// (0.001 = the source is being played 0.1 % fast), and cumulative frames
-    /// skipped to shed a spike / held because the ring ran empty. Used by the
-    /// periodic latency log to tell a clock mismatch from a spike recovery.
-    pub fn strip_reader_stats(&self, strip: usize) -> (usize, f32, u64, u64) {
+    /// Capture-reader state for one strip, for the periodic latency log.
+    ///
+    /// `pushed`, `taken` and `dropped` are cumulative frame counters from the
+    /// ring: the log differences them over its own interval to state the real
+    /// rate mismatch in ppm and the delay change in ms/min. `trim` is what the
+    /// servo is doing about it, not a measurement.
+    pub fn strip_reader_stats(&self, strip: usize) -> StripReaderStats {
         if strip >= MAX_STRIPS {
-            return (0, 0.0, 0, 0);
+            return StripReaderStats::default();
         }
-        (
-            self.shared.strip_fill[strip].load(Ordering::Relaxed),
-            f32::from_bits(self.shared.strip_trim[strip].load(Ordering::Relaxed)),
-            self.shared.strip_skipped[strip].load(Ordering::Relaxed),
-            self.shared.strip_starved[strip].load(Ordering::Relaxed),
-        )
+        StripReaderStats {
+            fill_frames: self.shared.strip_fill[strip].load(Ordering::Relaxed),
+            fill_avg_frames: f32::from_bits(self.shared.strip_fill_avg[strip].load(Ordering::Relaxed)),
+            trim: f32::from_bits(self.shared.strip_trim[strip].load(Ordering::Relaxed)),
+            pushed: self.shared.strip_pushed[strip].load(Ordering::Relaxed),
+            taken: self.shared.strip_taken[strip].load(Ordering::Relaxed),
+            dropped: self.shared.strip_dropped[strip].load(Ordering::Relaxed),
+            skipped: self.shared.strip_skipped[strip].load(Ordering::Relaxed),
+            starved: self.shared.strip_starved[strip].load(Ordering::Relaxed),
+            clamped: self.shared.strip_clamped[strip].load(Ordering::Relaxed),
+        }
     }
 
     pub fn output_devices() -> Vec<String> {
@@ -2923,6 +2963,14 @@ struct SampleRing {
     read: usize,
     write: usize,
     count: usize,
+    /// Cumulative frames the producer pushed, frames the reader popped for
+    /// audio, and frames thrown away (startup trim or ring overflow). The
+    /// latency log derives the real rate mismatch from these instead of from
+    /// the servo's own trim - which is what it used to report, so a clamp at
+    /// -0.4 % was printed as 240 ms/min of drift on every strip.
+    pushed: u64,
+    taken: u64,
+    dropped: u64,
 }
 
 impl SampleRing {
@@ -2932,14 +2980,19 @@ impl SampleRing {
             read: 0,
             write: 0,
             count: 0,
+            pushed: 0,
+            taken: 0,
+            dropped: 0,
         }
     }
 
     fn push(&mut self, frame: [f32; 2]) {
         self.frames[self.write] = frame;
         self.write = (self.write + 1) % INPUT_RING_FRAMES;
+        self.pushed += 1;
         if self.count == INPUT_RING_FRAMES {
             self.read = (self.read + 1) % INPUT_RING_FRAMES;
+            self.dropped += 1;
         } else {
             self.count += 1;
         }
@@ -2952,11 +3005,24 @@ impl SampleRing {
         let frame = self.frames[self.read];
         self.read = (self.read + 1) % INPUT_RING_FRAMES;
         self.count -= 1;
+        self.taken += 1;
         Some(frame)
     }
 
     fn fill(&self) -> usize {
         self.count
+    }
+
+    fn pushed_frames(&self) -> u64 {
+        self.pushed
+    }
+
+    fn taken_frames(&self) -> u64 {
+        self.taken
+    }
+
+    fn dropped_frames(&self) -> u64 {
+        self.dropped
     }
 
     /// Drop the oldest frames down to `target`, in one lock.
@@ -2965,6 +3031,7 @@ impl SampleRing {
         if drop > 0 {
             self.read = (self.read + drop) % INPUT_RING_FRAMES;
             self.count -= drop;
+            self.dropped += drop as u64;
         }
     }
 }
@@ -3122,6 +3189,16 @@ impl InputShared {
     }
 }
 
+/// Publish a strip's ring counters for the latency log. Called for every strip
+/// that has a ring, routed or not: the log needs the producer's real rate and
+/// what the reader actually took, not the servo's opinion of it.
+fn strip_counters(shared: &Shared, strip: usize, ring: &SampleRing) {
+    shared.strip_fill[strip].store(ring.fill(), Ordering::Relaxed);
+    shared.strip_pushed[strip].store(ring.pushed_frames(), Ordering::Relaxed);
+    shared.strip_taken[strip].store(ring.taken_frames(), Ordering::Relaxed);
+    shared.strip_dropped[strip].store(ring.dropped_frames(), Ordering::Relaxed);
+}
+
 /// Sample-accurate reader state for one capture stream inside the output
 /// callback. Ratio converts the device rate to the main output rate; the
 /// linear interpolation smooths mismatched clock rates (e.g. 44.1 -> 48 kHz).
@@ -3151,6 +3228,19 @@ struct InputReader {
 }
 
 impl InputReader {
+    /// Publish this reader's servo state; the frame counters come from the
+    /// ring (`strip_counters`).
+    fn publish(&self, shared: &Shared, strip: usize) {
+        shared.strip_trim[strip].store(self.trim.to_bits(), Ordering::Relaxed);
+        shared.strip_fill_avg[strip].store(self.fill_avg.to_bits(), Ordering::Relaxed);
+        shared.strip_clamped[strip].store(
+            self.trim.abs() >= INPUT_TRIM_MAX - 1e-7,
+            Ordering::Relaxed,
+        );
+        shared.strip_skipped[strip].store(self.skipped, Ordering::Relaxed);
+        shared.strip_starved[strip].store(self.starved_total, Ordering::Relaxed);
+    }
+
     fn new() -> Self {
         Self {
             prev: [0.0, 0.0],
@@ -5136,6 +5226,32 @@ mod latency_tests {
             let _ = reader.next(&mut ring, 48_000, 48_000);
         }
         assert!(ring.fill() < before, "drift controller did not catch up");
+    }
+
+    /// The latency log measures the clock mismatch from these counters, so they
+    /// have to keep producer, consumer and discards apart.
+    #[test]
+    fn ring_counters_separate_taken_from_dropped() {
+        let mut ring = SampleRing::new();
+        for _ in 0..10 {
+            ring.push([0.0, 0.0]);
+        }
+        for _ in 0..3 {
+            let _ = ring.pop();
+        }
+        ring.trim_to(2);
+        assert_eq!(ring.fill(), 2);
+        assert_eq!(ring.pushed_frames(), 10);
+        assert_eq!(ring.taken_frames(), 3);
+        assert_eq!(ring.dropped_frames(), 5);
+
+        // A full ring drops its oldest frame rather than growing: only the two
+        // pushes beyond capacity are discards.
+        for _ in 0..INPUT_RING_FRAMES {
+            ring.push([0.0, 0.0]);
+        }
+        assert_eq!(ring.fill(), INPUT_RING_FRAMES);
+        assert_eq!(ring.dropped_frames(), 5 + 2);
     }
 }
 

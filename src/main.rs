@@ -946,6 +946,12 @@ struct MixerApp {
     reader_skipped_prev: [u64; audio::MAX_STRIPS],
     reader_starved_prev: [u64; audio::MAX_STRIPS],
     reader_pushed_prev: [u64; audio::MAX_STRIPS],
+    /// Consumer side of the same measurement: frames the reader took and frames
+    /// the ring discarded, so the log can report a real rate mismatch instead
+    /// of the servo's trim (which is a clamp, not an observation).
+    reader_taken_prev: [u64; audio::MAX_STRIPS],
+    reader_dropped_prev: [u64; audio::MAX_STRIPS],
+    reader_stats_at: f64,
     /// Windows default output watchdog: a muted endpoint or a slider at zero
     /// looks exactly like a dead mixer, so it is called out in a toast.
     output_check_tick: f64,
@@ -1530,6 +1536,9 @@ impl MixerApp {
             reader_skipped_prev: [0; audio::MAX_STRIPS],
             reader_starved_prev: [0; audio::MAX_STRIPS],
             reader_pushed_prev: [0; audio::MAX_STRIPS],
+            reader_taken_prev: [0; audio::MAX_STRIPS],
+            reader_dropped_prev: [0; audio::MAX_STRIPS],
+            reader_stats_at: 0.0,
             output_check_tick: 5.0,
             output_silent: false,
             last_ring_logged: 0,
@@ -1854,35 +1863,46 @@ impl MixerApp {
             self.latency_ms_shown, avg, peak
         ));
         let sr = self.sample_rate.max(1) as f64;
+        // The log runs on a 10 s tick; time it from the frame clock so a long
+        // frame cannot make the rates look wrong.
+        let seconds = (self.time - self.reader_stats_at).clamp(1.0, 60.0);
+        self.reader_stats_at = self.time;
         for i in 0..self.active_strips.min(audio::MAX_STRIPS) {
-            let (fill, trim, skipped, starved) = self.audio.strip_reader_stats(i);
-            let skipped_now = skipped.saturating_sub(self.reader_skipped_prev[i]);
-            let starved_now = starved.saturating_sub(self.reader_starved_prev[i]);
-            self.reader_skipped_prev[i] = skipped;
-            self.reader_starved_prev[i] = starved;
-            if fill == 0 && skipped_now == 0 && starved_now == 0 && trim.abs() < 1e-6 {
+            let stats = self.audio.strip_reader_stats(i);
+            let skipped_now = stats.skipped.saturating_sub(self.reader_skipped_prev[i]);
+            let starved_now = stats.starved.saturating_sub(self.reader_starved_prev[i]);
+            self.reader_skipped_prev[i] = stats.skipped;
+            self.reader_starved_prev[i] = stats.starved;
+            if stats.fill_frames == 0 && skipped_now == 0 && starved_now == 0 {
                 continue;
             }
-            let stream = self
-                .captures
-                .get(i)
-                .and_then(|capture| capture.as_ref())
-                .map(|capture| capture.shared().pushed_frames())
-                .unwrap_or(0);
-            let delivered = stream.saturating_sub(self.reader_pushed_prev[i]) / 10;
-            self.reader_pushed_prev[i] = stream;
+            // Real rates from the ring's own counters, not from the servo. The
+            // producer pushed N frames while the reader took M; N-M per second
+            // is the mismatch the resampler has to absorb, and the same number
+            // read as ms per minute is the delay change - the actual drift.
+            let pushed = stats.pushed.saturating_sub(self.reader_pushed_prev[i]) as f64;
+            let taken = stats.taken.saturating_sub(self.reader_taken_prev[i]) as f64;
+            let dropped = stats.dropped.saturating_sub(self.reader_dropped_prev[i]) as f64;
+            self.reader_pushed_prev[i] = stats.pushed;
+            self.reader_taken_prev[i] = stats.taken;
+            self.reader_dropped_prev[i] = stats.dropped;
+            let rate_in = pushed / seconds;
+            let rate_out = (taken + dropped) / seconds;
+            let ppm = (rate_in - rate_out) / sr * 1e6;
+            let delay_ms_per_min = (rate_in - rate_out) * 60_000.0 / sr;
             diag_log(format!(
-                "audio: strip {} '{}': fill {:.1} ms, trim {:+.3} %, drift {:+.0} ms/min, stream {delivered} frames/s, skip {}/s, starve {}/s",
+                "audio: strip {} '{}': fill {:.1} ms (avg {:.1}), trim {:+.0} ppm{}, in {:.1}/s out {:.1}/s, delay {:+.1} ms/min, skip {:.0}/s, starve {:.0}/s",
                 i + 1,
                 self.strips[i].name,
-                fill as f64 / sr * 1000.0,
-                trim as f64 * 100.0,
-                // Positive trim means the reader consumes fewer source frames
-                // per output frame, so the audio falls behind by that fraction
-                // of real time; report the sign the listener would notice.
-                -(trim as f64) * 60_000.0,
-                skipped_now / 10,
-                starved_now / 10,
+                stats.fill_frames as f64 / sr * 1000.0,
+                stats.fill_avg_frames as f64 / sr * 1000.0,
+                stats.trim as f64 * 1e6,
+                if stats.clamped { " [clamped]" } else { "" },
+                rate_in,
+                rate_out,
+                delay_ms_per_min,
+                skipped_now as f64 / seconds,
+                starved_now as f64 / seconds,
             ));
         }
     }
