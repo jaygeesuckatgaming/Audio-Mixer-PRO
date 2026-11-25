@@ -2274,9 +2274,11 @@ fn path_delay_ms(
         }
     }
 
-    fn open_vst_editor(&mut self, slot: usize) {
+    /// Returns true when the plug-in's own window opened, false when it has no
+    /// editor at all (the caller then shows the parameter panel instead).
+    fn open_vst_editor(&mut self, slot: usize) -> bool {
         if slot >= self.vsts.len() {
-            return;
+            return false;
         }
         let label = self.strip_label(slot);
         match self.vsts[slot].chain.open_editor(self.mixer_hwnd) {
@@ -2285,27 +2287,20 @@ fn path_delay_ms(
                     self.toast(format!("Opened {label} plug-in window: {}", info.name));
                 }
                 self.vsts[slot].error = None;
+                true
             }
             Err(err) => {
                 // A plug-in with no editor of its own is not a failure: it is
-                // loaded and processing, it simply has no window. Painting the
-                // insert red for that made a working GUI-less plug-in look
-                // broken (the Leveler hit this every time it was clicked).
+                // loaded and processing, it simply has no window. The caller
+                // shows the console's parameter panel instead, so the plug-in
+                // is still adjustable.
                 let no_editor = err.contains("no screen") || err.contains("no editor");
-                if no_editor {
-                    let name = self.vsts[slot]
-                        .info
-                        .as_ref()
-                        .map(|info| info.name.clone())
-                        .unwrap_or_else(|| "Plug-in".to_string());
-                    self.toast(format!(
-                        "{name}: no editor window - it is running, controls are in the insert panel"
-                    ));
-                } else {
+                if !no_editor {
                     diag_log(format!("vst[{slot}] load failed: {err}"));
                     self.vsts[slot].error = Some(err.clone());
                     self.toast(format!("VST on {label}: {err}"));
                 }
+                false
             }
         }
     }
@@ -6537,16 +6532,19 @@ Right click > Source to use the Windows capture stream instead."
                     // A plug-in with its own editor opens that window; one
                     // without (the Leveler, most utilities) opens the console's
                     // parameter list instead, so it is still adjustable.
-                    let has_editor = self.vsts[idx]
-                        .info
-                        .as_ref()
-                        .map(|info| info.has_gui)
-                        .unwrap_or(false);
-                    if has_editor {
-                        self.open_vst_editor(idx);
-                    } else {
+                    // Try the plug-in's own editor first: whether one exists is
+                    // only really known by trying (the CLAP backend reports
+                    // `has_gui` optimistically). If it opens, that was the
+                    // intent; if not, show our parameter list for this slot.
+                    if !self.open_vst_editor(idx) {
                         self.param_cache = self.vsts[idx].chain.parameters();
                         self.param_editor = Some(idx);
+                        if self.param_cache.is_empty() {
+                            self.toast(format!(
+                                "{} exposes neither an editor nor parameters",
+                                self.strip_label(idx)
+                            ));
+                        }
                     }
                 } else {
                     self.open_vst_chooser(idx);
