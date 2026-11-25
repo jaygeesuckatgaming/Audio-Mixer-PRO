@@ -2113,6 +2113,15 @@ impl AudioEngine {
             .name("mixer".to_string())
             .spawn(move || mixer_loop(shared, flag, block, rate))
             .map_err(|e| format!("Could not start the mixer thread: {e}"))?;
+        // Taps get their own thread: draining them once per mixer block meant a
+        // late block delivered two or three device periods at once, which made
+        // the strip ring sawtooth by ~40 ms, starve at the bottom and drive the
+        // fill servo to its clamp. A 2 ms cadence keeps the ring fed evenly.
+        let tap_flag = stop.clone();
+        let tap_shared = self.shared.clone();
+        let _ = std::thread::Builder::new()
+            .name("taps".to_string())
+            .spawn(move || tap_pump_loop(tap_shared, tap_flag));
         self.mixer_stop = Some(stop);
         self.mixer_join = Some(handle);
         self.mixer_block = block;
@@ -4005,11 +4014,47 @@ fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
     }
 }
 
+/// Drains every tap input on its own 2 ms cadence. Called from the `taps`
+/// thread, never from the mixer block: a late mixer block used to deliver
+/// several device periods in one go, which starved the strip ring at the bottom
+/// of the sawtooth.
+fn tap_pump_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
+    let mut tap_buf = vec![0u8; 16_384];
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    #[cfg(windows)]
+    let timer = MixerTimer::new();
+    let period = std::time::Duration::from_millis(2);
+    let mut next = std::time::Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        next += period;
+        pump_taps(&shared, &mut tap_buf);
+        let now = std::time::Instant::now();
+        if next > now {
+            let wait = next - now;
+            #[cfg(windows)]
+            match &timer {
+                Some(timer) => timer.wait(wait),
+                None => std::thread::sleep(wait),
+            }
+            #[cfg(not(windows))]
+            std::thread::sleep(wait);
+        } else if now.duration_since(next) > std::time::Duration::from_millis(50) {
+            // Woken after a long stall: do not try to catch up a queue of
+            // missed periods.
+            next = now;
+        }
+    }
+}
+
 fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u32) {
     let mut dsp = Dsp::new(rate as f32);
     let mut buffer = vec![0.0f32; block.max(1) * 2];
-    // Large enough for a whole tap drain at 32-bit stereo (16 KB = 2048 frames).
-    let mut tap_buf = vec![0u8; 16_384];
     let nominal_nanos =
         ((block.max(1) as f64 / rate.max(1) as f64) * 1e9).max(1.0);
 
@@ -4041,8 +4086,8 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        // Taps first: the strip's reader must see this block's audio already.
-        pump_taps(&shared, &mut tap_buf);
+        // Taps are drained on their own thread (see `tap_pump_loop`), so the
+        // reader already has this block's audio.
         dsp.render(&mut buffer, 2, &shared);
         // A1 master: follow the rate trim published by the A1 output callback.
         // It bumps `master_seen` on every callback; if that stops (A1 closed,

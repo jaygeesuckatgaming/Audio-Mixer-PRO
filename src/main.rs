@@ -1863,8 +1863,13 @@ impl MixerApp {
             .cloned()
             .fold(0.0_f64, f64::max);
         diag_log(format!(
-            "audio: latency now {:.0} ms, 10 s avg {:.0} ms, peak {:.0} ms",
-            self.latency_ms_shown, avg, peak
+            "audio: latency now {:.0} ms, 10 s avg {:.0} ms, peak {:.0} ms, a1 ring {:.0} ms, clk {}, master trim {:+.0} ppm",
+            self.latency_ms_shown,
+            avg,
+            peak,
+            self.audio.monitor_ring_frames() as f64 / self.sample_rate.max(1) as f64 * 1000.0,
+            if self.a1_master { "on" } else { "off" },
+            self.audio.master_trim() as f64 * 1e6,
         ));
         let sr = self.sample_rate.max(1) as f64;
         // Wall clock, not the frame clock: eframe's dt can run ahead of real
