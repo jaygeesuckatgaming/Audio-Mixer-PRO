@@ -2929,9 +2929,16 @@ const INPUT_BUFFER_FRAMES: u32 = 512;
 pub const INPUT_TARGET_MS: f32 = 40.0;
 /// Input ring servo: the most it may trim the read rate away from the device's
 /// (7 cents, reached only while the fill is recovering) and the integrator step
-/// per output frame, which lets it converge in about a second.
+/// per output frame.
+///
+/// The step has to be far slower than the fill average it steers (1 s), or the
+/// loop limit-cycles: at 2e-7 the trim covered its whole +-0.4 % range in 0.4 s,
+/// so with the narrow band it overshot, clamped, overshot back, and the reader
+/// alternated between 0.4 % fast and 0.4 % slow - audible as the sound moving
+/// ahead of and behind the picture every few seconds. 8e-9 takes ~10 s for a
+/// full-range correction, which is imperceptible and stable.
 const INPUT_TRIM_MAX: f32 = 0.004;
-const INPUT_TRIM_STEP: f32 = 2.0e-7;
+const INPUT_TRIM_STEP: f32 = 8.0e-9;
 /// Extra fill tolerated before the drift controller starts slipping frames out.
 /// It has to sit above the backlog a healthy capture settles at, or the slip runs
 /// permanently: 250 single-frame removals a second is a continuous stream of
@@ -2950,9 +2957,11 @@ const INPUT_SLIP_FRAMES_PER_SEC: usize = 250;
 /// spike is worth any content loss.
 const INPUT_SLIP_ABOVE_MS: f32 = 60.0;
 /// Time constant of the fill average that feeds the trim integrator. Long
-/// enough to remove the 10 ms device-period swing, short enough that a real
-/// backlog change still moves the trim within a few seconds.
-const INPUT_FILL_AVG_S: f32 = 0.5;
+/// enough to remove the device-period swing (and the 1 s tap bursts), short
+/// enough that a real backlog change still moves the trim within a few seconds.
+/// It must stay several times shorter than the integrator's own convergence
+/// time, or the pair oscillates.
+const INPUT_FILL_AVG_S: f32 = 1.0;
 /// Fill band inside which the trim integrator is left alone, as a fraction of
 /// the target. Wide bands let the delay wander (and the bottom edge starves);
 /// this one is narrow enough that the servo actually holds the target while
@@ -5184,8 +5193,11 @@ mod latency_tests {
             ring.push([0.1, 0.1]);
         }
         let before = ring.fill();
-        // Ten seconds of capture and playback running frame for frame.
-        for _ in 0..480_000 {
+        // Thirty seconds of capture and playback running frame for frame. The
+        // integrator is deliberately slow (a full-range correction takes ~10 s,
+        // which is what keeps it from limit-cycling), so a 40 ms spike takes
+        // roughly 20 s to walk back down.
+        for _ in 0..1_440_000 {
             ring.push([0.1, 0.1]);
             let _ = reader.next(&mut ring, 48_000, 48_000);
         }
@@ -5194,10 +5206,12 @@ mod latency_tests {
             after < before,
             "backlog did not recover: {before} -> {after} frames"
         );
-        let high = (48_000.0 * (INPUT_TARGET_MS + INPUT_TARGET_HYSTERESIS_MS) / 1000.0) as usize;
+        let target = (48_000.0 * INPUT_TARGET_MS / 1000.0) as usize;
+        // Back inside the servo's band (85-115 % of the target), not parked
+        // above it.
         assert!(
-            after <= high + 8,
-            "backlog parked above the tolerated band: {after} frames, band ends at {high}"
+            after <= (target as f32 * INPUT_FILL_BAND_HIGH) as usize + 16,
+            "backlog parked above the servo band: {after} frames, target {target}"
         );
     }
 
