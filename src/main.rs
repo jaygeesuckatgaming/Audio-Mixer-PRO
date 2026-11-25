@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+﻿#![windows_subsystem = "windows"]
 
 mod audio;
 mod asio_insert;
@@ -851,6 +851,9 @@ struct MixerApp {
     vst_scan_results: Vec<vst::VstInfo>,
     vst_scan_errors: Vec<String>,
     vst_status: String,
+    /// Strip whose plug-in parameter list is open, and the values shown.
+    param_editor: Option<usize>,
+    param_cache: Vec<vst::VstParam>,
     vst_filter: String,
     /// Diagnostic: close normally after this many seconds (used to test the
     /// save-on-exit path without a human).
@@ -1453,6 +1456,8 @@ impl MixerApp {
             vst_scan_results: Vec::new(),
             vst_scan_errors: Vec::new(),
             vst_status: String::new(),
+            param_editor: None,
+            param_cache: Vec::new(),
             vst_filter: String::new(),
             auto_exit: std::env::args()
                 .position(|a| a == "--exit-after")
@@ -5933,7 +5938,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit Â· 48 kHz"), from the
+        // The endpoint's configured format ("24-bit Ã‚Â· 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6016,7 +6021,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit Â· 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit Ã‚Â· 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui
@@ -6529,7 +6534,20 @@ Right click > Source to use the Windows capture stream instead."
 
             if insert_resp.clicked() && enabled {
                 if loaded {
-                    self.open_vst_editor(idx);
+                    // A plug-in with its own editor opens that window; one
+                    // without (the Leveler, most utilities) opens the console's
+                    // parameter list instead, so it is still adjustable.
+                    let has_editor = self.vsts[idx]
+                        .info
+                        .as_ref()
+                        .map(|info| info.has_gui)
+                        .unwrap_or(false);
+                    if has_editor {
+                        self.open_vst_editor(idx);
+                    } else {
+                        self.param_cache = self.vsts[idx].chain.parameters();
+                        self.param_editor = Some(idx);
+                    }
                 } else {
                     self.open_vst_chooser(idx);
                 }
@@ -8274,7 +8292,98 @@ Right click > Source to use the Windows capture stream instead."
     // Dialogs
     // -----------------------------------------------------------------------
 
+    /// The console's own parameter list, for plug-ins that have no editor of
+    /// their own. One slider per parameter, in the units the back end uses
+    /// (VST3 normalised 0..1, CLAP the plug-in's own range).
+    fn draw_param_window(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.param_editor else {
+            return;
+        };
+        if idx >= self.vsts.len() || !self.vsts[idx].loaded() {
+            self.param_editor = None;
+            return;
+        }
+        let name = self
+            .vsts[idx]
+            .info
+            .as_ref()
+            .map(|info| info.name.clone())
+            .unwrap_or_else(|| "Plug-in".to_string());
+        let strip = self.strip_label(idx);
+
+        // Copy the rows out so the window closure never borrows `self` while
+        // the changes are applied afterwards.
+        let mut rows: Vec<(u32, String, String, f64, f64, f64)> = self
+            .param_cache
+            .iter()
+            .map(|p| (p.id, p.name.clone(), p.formatted.clone(), p.value, p.min, p.max))
+            .collect();
+        let mut changes: Vec<(u32, f64)> = Vec::new();
+        let mut refresh = false;
+        let mut open = true;
+
+        egui::Window::new(format!("{name} - parameters"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        refresh = true;
+                    }
+                    ui.label(egui::RichText::new(&strip).size(9.0).color(DIM));
+                });
+                ui.separator();
+                if rows.is_empty() {
+                    ui.label("This plug-in exposes no parameters.");
+                    return;
+                }
+                egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
+                    for (id, param_name, formatted, value, min, max) in rows.iter_mut() {
+                        let lo = min.min(*max);
+                        let hi = max.max(lo + 1e-9);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{param_name}")).size(9.5),
+                            );
+                            let mut v = *value;
+                            if ui.add(egui::Slider::new(&mut v, lo..=hi)).changed() {
+                                *value = v;
+                                changes.push((*id, v));
+                            }
+                            if !formatted.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(formatted.clone())
+                                        .size(8.5)
+                                        .color(FAINT),
+                                );
+                            }
+                        });
+                    }
+                });
+            });
+
+        for (id, value) in changes {
+            let _ = self.vsts[idx].chain.set_parameter(id, value);
+        }
+        if refresh {
+            self.param_cache = self.vsts[idx].chain.parameters();
+        } else {
+            // Keep the cache in step with what was just moved, so reopening
+            // shows the current value without another plug-in call.
+            for (id, value) in rows.iter().map(|r| (r.0, r.3)) {
+                if let Some(p) = self.param_cache.iter_mut().find(|p| p.id == id) {
+                    p.value = value;
+                }
+            }
+        }
+        if !open {
+            self.param_editor = None;
+        }
+    }
+
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
+        self.draw_param_window(ctx);
         if self.show_vc {
             let mut open = self.show_vc;
             self.vc.draw(ctx, &mut open, self.driver_mode);
@@ -9364,6 +9473,9 @@ Right click > Source to use the Windows capture stream instead."
             }
             if do_browse {
                 if let Some(path) = vst::pick_plugin_file() {
+                    // Choosing a plug-in is explicit: it always starts active,
+                    // whatever this slot was doing before.
+                    self.vsts[slot].bypass = false;
                     self.load_vst(slot, &path, false);
                     if self.vsts[slot]
                         .info
@@ -9388,6 +9500,9 @@ Right click > Source to use the Windows capture stream instead."
                 self.vsts[slot].chain.set_bypass(bypass);
             }
             if let Some(path) = do_load {
+                    // Choosing a plug-in is explicit: it always starts active,
+                    // whatever this slot was doing before.
+                    self.vsts[slot].bypass = false;
                 self.load_vst(slot, &path, false);
                 if self.vsts[slot]
                     .info

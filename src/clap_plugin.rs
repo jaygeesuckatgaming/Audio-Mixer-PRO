@@ -278,6 +278,8 @@ impl ClapSlot {
                 name: String::from_utf8_lossy(info.name).to_string(),
                 unit: String::new(),
                 value,
+                min: info.min_value,
+                max: info.max_value,
                 step_count: if info.max_value - info.min_value > 0.0 {
                     -1
                 } else {
