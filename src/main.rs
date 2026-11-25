@@ -1,4 +1,4 @@
-﻿#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 
 mod audio;
 mod asio_insert;
@@ -951,7 +951,7 @@ struct MixerApp {
     /// and how many seconds that baseline covers.
     reader_stats_at: std::time::Instant,
     reader_drift_at: std::time::Instant,
-    reader_drift_fill: [f32; audio::MAX_STRIPS],
+    reader_drift_path: [f64; audio::MAX_STRIPS],
     reader_drift_ms: [f32; audio::MAX_STRIPS],
     reader_drift_span: f64,
     /// Windows default output watchdog: a muted endpoint or a slider at zero
@@ -1540,7 +1540,7 @@ impl MixerApp {
             reader_pushed_prev: [0; audio::MAX_STRIPS],
             reader_stats_at: std::time::Instant::now(),
             reader_drift_at: std::time::Instant::now(),
-            reader_drift_fill: [0.0; audio::MAX_STRIPS],
+            reader_drift_path: [0.0; audio::MAX_STRIPS],
             reader_drift_ms: [0.0; audio::MAX_STRIPS],
             reader_drift_span: 0.0,
             output_check_tick: 5.0,
@@ -1878,19 +1878,21 @@ impl MixerApp {
         self.reader_stats_at = now;
 
         // Delay trend. The raw fill swings by a whole device period whenever the
-        // capture endpoint delivers, so a short-window difference is mostly
-        // noise; compare the servo's 0.5 s average with where it was a minute
-        // ago instead. Positive = the ring is deeper = the audio is later.
+        // capture endpoint delivers, so compare the *path length* - ring fill
+        // plus frames held minus frames skipped - a minute apart. That covers a
+        // starvation ratchet, which a fill average on its own cannot see.
+        // Positive = the audio path is getting longer = the sound is later.
         let elapsed = now.duration_since(self.reader_drift_at).as_secs_f64();
         if elapsed >= 60.0 {
             for i in 0..self.active_strips.min(audio::MAX_STRIPS) {
-                let avg = self.audio.strip_reader_stats(i).fill_avg_frames;
-                self.reader_drift_ms[i] = if avg > 0.0 {
-                    ((avg - self.reader_drift_fill[i]) as f64 * 60_000.0 / (sr * elapsed)) as f32
+                let stats = self.audio.strip_reader_stats(i);
+                let path = stats.fill_frames as f64 + stats.starved as f64 - stats.skipped as f64;
+                self.reader_drift_ms[i] = if stats.fill_frames > 0 {
+                    ((path - self.reader_drift_path[i]) * 60_000.0 / (sr * elapsed)) as f32
                 } else {
                     0.0
                 };
-                self.reader_drift_fill[i] = avg;
+                self.reader_drift_path[i] = path;
             }
             self.reader_drift_span = elapsed;
             self.reader_drift_at = now;
@@ -1925,14 +1927,20 @@ impl MixerApp {
             } else {
                 "delay pending (needs 60 s)".to_string()
             };
+            // Frames held minus frames skipped: the part of the path length that
+            // is not ring fill. It only moves when the reader had to repeat
+            // samples (starve) or throw them away (skip), so a growing number is
+            // audio sliding against the picture.
+            let held = (stats.starved as i64 - stats.skipped as i64) as f64 / sr * 1000.0;
             diag_log(format!(
-                "audio: strip {} '{}': fill {:.1} ms ({average}), in {:.0}/s, trim {:+.0} ppm{}, {delay}, skip {:.1}/s, starve {:.1}/s",
+                "audio: strip {} '{}': fill {:.1} ms ({average}), in {:.0}/s, trim {:+.0} ppm{}, held {:+.0} ms, {delay}, skip {:.1}/s, starve {:.1}/s",
                 i + 1,
                 self.strips[i].name,
                 stats.fill_frames as f64 / sr * 1000.0,
                 pushed / seconds,
                 stats.trim as f64 * 1e6,
                 if stats.clamped { " [clamped]" } else { "" },
+                held,
                 skipped_now as f64 / seconds,
                 starved_now as f64 / seconds,
             ));

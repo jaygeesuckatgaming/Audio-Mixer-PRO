@@ -2920,7 +2920,13 @@ const INPUT_BUFFER_FRAMES: u32 = 512;
 /// Keep the live input near this much audio; a startup backlog is trimmed and
 /// slow clock drift is corrected toward it instead of growing toward the ring
 /// capacity.
-pub const INPUT_TARGET_MS: f32 = 20.0;
+///
+/// Was 20 ms, which the measured log showed to be too shallow: the USB tap
+/// delivers in ~1 device period bursts, the ring sat at 5-8 ms between bursts
+/// and starved (up to ~360 frames a second), and every starvation holds samples
+/// and shifts the audio against the picture. 40 ms is two device periods plus a
+/// margin - still a small constant offset, but no longer riding the edge.
+pub const INPUT_TARGET_MS: f32 = 40.0;
 /// Input ring servo: the most it may trim the read rate away from the device's
 /// (7 cents, reached only while the fill is recovering) and the integrator step
 /// per output frame, which lets it converge in about a second.
@@ -2948,11 +2954,11 @@ const INPUT_SLIP_ABOVE_MS: f32 = 60.0;
 /// backlog change still moves the trim within a few seconds.
 const INPUT_FILL_AVG_S: f32 = 0.5;
 /// Fill band inside which the trim integrator is left alone, as a fraction of
-/// the target. A capture path that only delivers whole device periods settles
-/// below the nominal target; without this band the integrator winds up to its
-/// clamp and plays the source slow for ever (240 ms of drift per minute).
-const INPUT_FILL_BAND_LOW: f32 = 0.30;
-const INPUT_FILL_BAND_HIGH: f32 = 1.10;
+/// the target. Wide bands let the delay wander (and the bottom edge starves);
+/// this one is narrow enough that the servo actually holds the target while
+/// still ignoring the burst swing that used to wind it up to its clamp.
+const INPUT_FILL_BAND_LOW: f32 = 0.85;
+const INPUT_FILL_BAND_HIGH: f32 = 1.15;
 
 /// Interleaved stereo frames waiting to be mixed into the output. The capture
 /// callback appends, the output callback consumes. A short ring keeps the
@@ -5203,10 +5209,14 @@ mod latency_tests {
         }
         let mut reader = InputReader::new();
         let _ = reader.next(&mut ring, 48_000, 48_000);
+        // A second of backlog is cut back to the servo's target on the first
+        // frame, whatever that target currently is.
+        let target = (48_000.0 * INPUT_TARGET_MS / 1000.0) as usize;
         assert!(
-            ring.fill() <= 1_201,
-            "ring fill was {} frames after the startup trim",
-            ring.fill()
+            ring.fill() <= target + 1,
+            "ring fill was {} frames after the startup trim (target {} frames)",
+            ring.fill(),
+            target
         );
     }
 
