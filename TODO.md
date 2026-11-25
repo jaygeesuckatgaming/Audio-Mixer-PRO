@@ -32,6 +32,22 @@ player and the cable clock run on two independent clocks. Long videos drift out
 of step. The fix is to pace the USB transfers from the mixer clock (slave the
 cable clock) rather than trimming at the reader.
 
+## Stream Deck
+
+The plugin itself is in `streamdeck/` (Strip Mute + Mute All, live state); see
+`streamdeck/README.md`. Left for later:
+
+- **Transport keys** (play/pause, next, previous) and **Bypass all inserts**,
+  **Mirror**, **Streamer mode** toggles - all one more `Command` variant each.
+- **Global hotkeys** in the console (`RegisterHotKey` on a message-only-window
+  thread) feeding the same command queue, so any keyboard or macro pad works,
+  not just the deck.
+- **Port setting in the plugin**: the console's port is configurable
+  (`<Control port='8765'>`), the plugin assumes 8765.
+- **Launch the mixer** from the plugin when it is not running (spawn the exe).
+- **Dials / touch strip** if a Stream Deck + ever shows up, and the Neo Infobar
+  for a now-playing display.
+
 ## Console
 
 - CLAP back end reports latency as 0 (`ClapSlot::latency`); VST3 reports the

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://schemas.elgato.com/streamdeck/plugins/manifest.json",
+  "UUID": "com.jaygee.audiomixerpro",
+  "Name": "Audio Mixer PRO",
+  "Version": "0.1.0.0",
+  "Author": "JayGee",
+  "Description": "Mute strips of Audio Mixer PRO and see their live state on the keys.",
+  "Category": "Audio Mixer PRO",
+  "CategoryIcon": "imgs/category",
+  "Icon": "imgs/plugin",
+  "CodePath": "bin/plugin.js",
+  "SDKVersion": 3,
+  "Software": {
+    "MinimumVersion": "7.1"
+  },
+  "Nodejs": {
+    "Version": "24"
+  },
+  "OS": [
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    }
+  ],
+  "Actions": [
+    {
+      "UUID": "com.jaygee.audiomixerpro.mute",
+      "Name": "Strip Mute",
+      "Icon": "imgs/mute-live",
+      "Tooltip": "Mutes one Audio Mixer PRO strip. Lights amber while the strip is muted.",
+      "Controllers": ["Keypad"],
+      "SupportedInMultiActions": true,
+      "PropertyInspectorPath": "ui/strip.html",
+      "States": [
+        {
+          "Image": "imgs/mute-live",
+          "TitleAlignment": "bottom"
+        },
+        {
+          "Image": "imgs/mute-muted",
+          "TitleAlignment": "bottom"
+        }
+      ]
+    },
+    {
+      "UUID": "com.jaygee.audiomixerpro.mute-all",
+      "Name": "Mute All",
+      "Icon": "imgs/mute-all-live",
+      "Tooltip": "Mutes every strip, or unmutes them if any strip is already muted.",
+      "Controllers": ["Keypad"],
+      "SupportedInMultiActions": true,
+      "States": [
+        {
+          "Image": "imgs/mute-all-live",
+          "TitleAlignment": "bottom"
+        },
+        {
+          "Image": "imgs/mute-all-muted",
+          "TitleAlignment": "bottom"
+        }
+      ]
+    }
+  ]
+}

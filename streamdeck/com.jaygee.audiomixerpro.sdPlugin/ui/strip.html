@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Strip Mute</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --panel: #1a1e25;
+        --line: #2f3641;
+        --text: #d8dee7;
+        --dim: #7c8696;
+        --amber: #e09e37;
+      }
+      body {
+        margin: 0;
+        padding: 10px 12px;
+        background: var(--panel);
+        color: var(--text);
+        font: 12px/1.5 "Segoe UI", system-ui, sans-serif;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--dim);
+      }
+      label {
+        display: block;
+        margin: 10px 0 4px;
+        color: var(--dim);
+      }
+      select {
+        width: 100%;
+        padding: 5px 6px;
+        background: #0b0d11;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 3px;
+        font: inherit;
+      }
+      .hint {
+        margin-top: 10px;
+        color: var(--dim);
+        font-size: 11px;
+      }
+      .badge {
+        display: inline-block;
+        margin-top: 8px;
+        padding: 1px 6px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-size: 10px;
+        color: var(--dim);
+      }
+      .badge.live {
+        border-color: var(--amber);
+        color: var(--amber);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Audio Mixer PRO</h1>
+
+    <label for="strip">Strip</label>
+    <select id="strip"></select>
+
+    <div class="hint">
+      The name comes from the mixer. Strip 1 is the leftmost channel.
+    </div>
+    <div id="status" class="badge">waiting for the mixer</div>
+
+    <script>
+      let socket = null;
+      let uuid = null;
+      let registerEvent = null;
+      let settings = { strip: 1 };
+
+      // Stream Deck calls this in the inspector window once the page is ready.
+      window.connectElgatoStreamDeckSocket = function (
+        inPort,
+        inUuid,
+        inRegisterEvent,
+        _inInfo,
+        inActionInfo
+      ) {
+        uuid = inUuid;
+        registerEvent = inRegisterEvent;
+
+        let actionInfo = {};
+        try {
+          actionInfo = JSON.parse(inActionInfo);
+        } catch {
+          actionInfo = {};
+        }
+        settings = (actionInfo.payload && actionInfo.payload.settings) || {};
+        render();
+
+        socket = new WebSocket("ws://127.0.0.1:" + inPort);
+        socket.onopen = () => {
+          send({ event: registerEvent, uuid });
+          send({ event: "getSettings", context: uuid });
+        };
+        socket.onmessage = (event) => {
+          let message;
+          try {
+            message = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+          if (message.event === "didReceiveSettings") {
+            settings = (message.payload && message.payload.settings) || {};
+            render();
+          }
+          if (message.event === "sendToPropertyInspector") {
+            noteStrips(message.payload && message.payload.strips);
+          }
+        };
+      };
+
+      function send(message) {
+        if (socket && socket.readyState === 1) {
+          socket.send(JSON.stringify(message));
+        }
+      }
+
+      const select = document.getElementById("strip");
+      const status = document.getElementById("status");
+      let strips = [];
+
+      function noteStrips(list) {
+        if (!Array.isArray(list) || list.length === 0) {
+          return;
+        }
+        strips = list;
+        status.textContent = "connected to the mixer";
+        status.classList.add("live");
+        render();
+      }
+
+      function render() {
+        const wanted = Number(settings.strip) || 1;
+        select.innerHTML = "";
+        const rows = strips.length
+          ? strips
+          : Array.from({ length: 16 }, (_, index) => ({
+              number: index + 1,
+              name: "Strip " + (index + 1),
+            }));
+        for (const strip of rows) {
+          const option = document.createElement("option");
+          option.value = String(strip.number);
+          option.textContent = strip.number + " - " + strip.name;
+          if (strip.number === wanted) {
+            option.selected = true;
+          }
+          select.appendChild(option);
+        }
+      }
+
+      select.addEventListener("change", () => {
+        settings = { ...settings, strip: Number(select.value) || 1 };
+        send({ event: "setSettings", context: uuid, payload: settings });
+      });
+    </script>
+  </body>
+</html>

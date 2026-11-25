@@ -5,6 +5,7 @@ mod asio_insert;
 mod clap_host;
 mod clap_plugin;
 mod clap_slot;
+mod control;
 mod diagnostics;
 mod editor_host;mod endpoint_format;
 mod host_window;
@@ -887,6 +888,18 @@ struct MixerApp {
     player_mirror_prev: Vec<(usize, String)>,
     status: String,
     status_until: f64,
+    /// Local control API for the Stream Deck plug-in. `None` until it is
+    /// started (or after it is switched off in MENU).
+    control: Option<control::Server>,
+    control_shared: Option<Arc<control::Shared>>,
+    control_enabled: bool,
+    control_port: u16,
+    /// One start attempt per enabling, so a busy port is reported once instead
+    /// of retried every frame.
+    control_attempted: bool,
+    /// When the published snapshot is next refreshed, in `self.time` seconds.
+    control_publish_at: f64,
+    control_seq: u64,
     time: f64,
     frame_no: u64,
     shot_path: Option<PathBuf>,
@@ -1480,6 +1493,13 @@ impl MixerApp {
             player_mirror_prev: Vec::new(),
             status: audio_status,
             status_until: 12.0,
+            control: None,
+            control_shared: None,
+            control_enabled: true,
+            control_port: control::DEFAULT_PORT,
+            control_attempted: false,
+            control_publish_at: 0.0,
+            control_seq: 0,
             time: 0.0,
             frame_no: 0,
             shot_path,
@@ -3658,6 +3678,10 @@ fn path_delay_ms(
             self.vban_enabled as u8, self.vban_port, self.vban_quality
         ));
         text.push_str(&format!(
+            "\t<Control enabled='{}' port='{}' />\n",
+            self.control_enabled as u8, self.control_port
+        ));
+        text.push_str(&format!(
             "\t<Ducking enabled='{}' source='{}' targets='{}' depthDb='{:.2}' thresholdDb='{:.2}' attackMs='{:.1}' releaseMs='{:.0}' />\n",
             self.duck.enabled as u8,
             self.duck.source.map(|s| s as i32).unwrap_or(-1),
@@ -4377,6 +4401,25 @@ fn path_delay_ms(
             self.streamer_mode = bool_attr(attrs, "enabled").unwrap_or(self.streamer_mode);
             if let Some(speed) = f32_attr(attrs, "speed") {
                 self.streamer_speed = speed.clamp(1.0, 30.0);
+            }
+        }
+
+        // Local control API (Stream Deck plug-in). Restoring a scene must not
+        // leave a stale listener on an old port.
+        if let Some((attrs, _)) = xml_elements(text, "Control").first() {
+            if let Some(enabled) = bool_attr(attrs, "enabled") {
+                if enabled != self.control_enabled {
+                    self.control_enabled = enabled;
+                    self.control_attempted = false;
+                }
+            }
+            if let Some(value) = xml_attr(attrs, "port") {
+                if let Ok(port) = value.parse::<u16>() {
+                    if port > 0 && port != self.control_port {
+                        self.control_port = port;
+                        self.control_attempted = false;
+                    }
+                }
             }
         }
 
@@ -8111,6 +8154,125 @@ Right click > Source to use the Windows capture stream instead."
             });
     }
 
+    // -----------------------------------------------------------------------
+    // Stream Deck / local control
+    // -----------------------------------------------------------------------
+
+    /// Start/stop the loopback API, apply whatever the plug-in queued, and
+    /// publish the state snapshot the plug-in polls. Called once per frame, so
+    /// a key press reaches the audio engine within one frame (33 ms at 30 fps).
+    fn service_control(&mut self, ctx: &egui::Context) {
+        if self.control_enabled && self.control.is_none() && !self.control_attempted {
+            self.control_attempted = true;
+            match control::Server::start(self.control_port) {
+                Ok(server) => {
+                    let shared = server.shared();
+                    shared.attach_ui(ctx.clone());
+                    diag_log(format!("control: listening on 127.0.0.1:{}", server.port()));
+                    self.control_shared = Some(shared);
+                    self.control = Some(server);
+                }
+                Err(err) => {
+                    diag_log(format!("control: {err}"));
+                    self.toast(format!("Stream Deck control: {err}"));
+                }
+            }
+        } else if self.control.is_some()
+            && (!self.control_enabled
+                || self.control.as_ref().is_some_and(|s| s.port() != self.control_port))
+        {
+            // Switched off in MENU, or a scene moved the port: close the old
+            // listener and try the new settings on the next frame.
+            self.control = None;
+            self.control_shared = None;
+            self.control_attempted = false;
+            diag_log("control: listener stopped");
+            if !self.control_enabled {
+                self.toast("Stream Deck control off");
+            }
+        }
+
+        let Some(shared) = self.control_shared.clone() else {
+            return;
+        };
+        let commands = shared.take_commands();
+        if !commands.is_empty() {
+            for command in commands {
+                self.apply_control_command(command);
+            }
+            // Publish at once: the plug-in's next poll then shows the result of
+            // the press instead of the state before it.
+            self.control_publish_at = 0.0;
+        }
+        if self.time >= self.control_publish_at {
+            self.publish_control_state(&shared);
+            self.control_publish_at = self.time + 0.15;
+        }
+    }
+
+    fn apply_control_command(&mut self, command: control::Command) {
+        match command {
+            control::Command::StripMute { strip, value } => {
+                if strip < self.active_strips.min(self.strips.len()) {
+                    let now = self.strips[strip].mute;
+                    self.strips[strip].mute = value.unwrap_or(!now);
+                }
+            }
+            control::Command::MuteAll { value } => {
+                let active = self.active_strips.min(self.strips.len());
+                let any_unmuted = self.strips[..active].iter().any(|strip| !strip.mute);
+                let mute = value.unwrap_or(any_unmuted);
+                for strip in self.strips.iter_mut().take(active) {
+                    strip.mute = mute;
+                }
+            }
+        }
+    }
+
+    fn publish_control_state(&mut self, shared: &control::Shared) {
+        self.control_seq = self.control_seq.wrapping_add(1);
+        let active = self.active_strips.min(self.strips.len());
+        let strips: Vec<serde_json::Value> = self.strips[..active]
+            .iter()
+            .enumerate()
+            .map(|(index, strip)| {
+                serde_json::json!({
+                    "index": index,
+                    "number": index + 1,
+                    "name": strip.name.clone(),
+                    "mute": strip.mute,
+                    "solo": strip.solo,
+                    "mono": strip.mono,
+                    "gain_db": strip.gain_db,
+                })
+            })
+            .collect();
+        let buses: Vec<serde_json::Value> = self
+            .buses
+            .iter()
+            .enumerate()
+            .map(|(index, bus)| {
+                serde_json::json!({
+                    "index": index,
+                    "number": index + 1,
+                    "name": bus.name.clone(),
+                    "mute": bus.mute,
+                    "gain_db": bus.gain_db,
+                })
+            })
+            .collect();
+        let state = serde_json::json!({
+            "seq": self.control_seq,
+            "active_strips": active,
+            "strips": strips,
+            "buses": buses,
+            "streamer": self.streamer_mode,
+            "mirror": self.player_mirror,
+        })
+        .to_string();
+        shared.publish(state);
+    }
+
     fn draw_menu(&mut self, ctx: &egui::Context) {
         if !self.menu_open {
             return;
@@ -8247,6 +8409,21 @@ Right click > Source to use the Windows capture stream instead."
                         }
                         if check_item(right, "Limit Remote Gain to 0 dBfs", self.limit_remote) {
                             self.limit_remote = !self.limit_remote;
+                        }
+                        let control_label =
+                            format!("Stream Deck Control (port {})", self.control_port);
+                        if check_item(right, &control_label, self.control_enabled) {
+                            self.control_enabled = !self.control_enabled;
+                            // The port or the enabling may have changed: allow
+                            // one fresh start attempt.
+                            self.control_attempted = false;
+                            self.control_publish_at = 0.0;
+                            if self.control_enabled {
+                                self.toast(format!(
+                                    "Stream Deck control on 127.0.0.1:{}",
+                                    self.control_port
+                                ));
+                            }
                         }
                         if check_item(right, "Show Contextual Help In Caption", self.help_caption) {
                             self.help_caption = !self.help_caption;
@@ -10223,6 +10400,7 @@ impl eframe::App for MixerApp {
         }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         self.time += dt as f64;
+        self.service_control(ctx);
 
         // Remember the window size and position for the next run. Maximized
         // sizes are ignored so Restore returns to the last manual size, but
