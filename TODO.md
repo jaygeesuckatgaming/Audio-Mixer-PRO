@@ -25,12 +25,38 @@ adjusted through the console's parameter window. A small CLAP GUI extension
 window (vertical faders, same look as the console) would make it usable in any
 CLAP host, not just this one.
 
-## Player drift on long videos
+## A/V sync: settled 2026-11-25
 
-`trim -0.400 %` and `drift +240 ms/min` on every strip is rev 1 behaviour: the
-player and the cable clock run on two independent clocks. Long videos drift out
-of step. The fix is to pace the USB transfers from the mixer clock (slave the
-cable clock) rather than trimming at the reader.
+The "sound ahead of the lips" report was **Twitch in Chromium**, not the console.
+Evidence gathered on this machine:
+
+- with the rate servos disabled, the strip ring drained 80 -> 10 ms in under a
+  minute (~1200 ppm) and starved, so a fill controller is required;
+- with the controller replaced by a **proportional** loop both loops hold: strip
+  fill flat at the target, `trim +-46 ppm`, `held` constant, `starve 0`,
+  underruns 0, and the measured tap rate is 48000 +/-25 ppm - i.e. the cable
+  clock and A1 agree to well under 50 ppm, which is 15 ms per 5 minutes;
+- VLC playing a local file **through the mixer**: in sync;
+- YouTube in Chrome **through the mixer**: in sync after 6+ minutes;
+- Twitch in Chrome **and** Edge: drifts, audible offset at ~4-5 minutes.
+
+So the drift belongs to Twitch's player (Chromium media path), and nothing in the
+audio engine needs to change for it. Practical workaround for watching Twitch:
+`streamlink twitch.tv/<channel> best` (hands the stream to VLC).
+
+Two controller bugs were fixed on the way and are worth remembering:
+
+1. an **integrator** controlling a fill that is itself an integral of the trim is
+   a double integrator: it limit-cycled at +-0.4 % (240 ms/min) and the delay
+   moved by tens of ms. Both loops are now proportional-only.
+2. the tap inputs were drained once per mixer block, so a late block delivered
+   several device periods at once and the strip ring sawtoothed by ~40 ms. Taps
+   now have their own 2 ms thread.
+
+Still open from this thread: the console's A1 cushion is 42 ms for physical
+devices (USB cables get 60); if a future machine starves, that is the knob.
+Cable-clock slaving (pacing the emulated USB transfers from A1) was **not**
+needed: the two clocks agree to within the measurement noise.
 
 ## Stream Deck
 

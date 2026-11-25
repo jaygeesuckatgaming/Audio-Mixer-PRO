@@ -2933,7 +2933,7 @@ const INPUT_BUFFER_FRAMES: u32 = 512;
 /// and starved (up to ~360 frames a second), and every starvation holds samples
 /// and shifts the audio against the picture. 40 ms is two device periods plus a
 /// margin - still a small constant offset, but no longer riding the edge.
-pub const INPUT_TARGET_MS: f32 = 80.0;
+pub const INPUT_TARGET_MS: f32 = 40.0;
 /// Input ring servo: the most it may trim the read rate away from the device's
 /// (7 cents, reached only while the fill is recovering) and the integrator step
 /// per output frame.
