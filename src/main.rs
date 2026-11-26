@@ -1,4 +1,4 @@
-﻿#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 
 mod audio;
 mod asio_insert;
@@ -40,6 +40,9 @@ const FAINT: Color32 = Color32::from_rgb(83, 92, 106);
 /// Release line and build number from `CHANNEL` and `REV`, stamped by build.rs.
 /// Shown in the top bar so a screenshot or a user report says exactly which build
 /// it is; `BUILD_FULL` adds the commit for the tooltip.
+#[cfg(feature = "lowlat")]
+const BUILD: &str = concat!(env!("APP_BUILD"), " LL");
+#[cfg(not(feature = "lowlat"))]
 const BUILD: &str = env!("APP_BUILD");
 const BUILD_FULL: &str = env!("APP_BUILD_FULL");
 const AMBER: Color32 = Color32::from_rgb(224, 158, 55);

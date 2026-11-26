@@ -7,6 +7,12 @@ edition = "2021"
 name = "audio_mixer_pro"
 path = "src/main.rs"
 
+[features]
+# Test build with much shallower engine buffers (see audio.rs): same console,
+# ~half the latency, less tolerance for a bursty capture path. Built as a
+# separate exe so it can be A/B'd against the normal one.
+lowlat = []
+
 [dependencies]
 raw-window-handle = "0.6"
 eframe = { version = "0.29.1", default-features = false, features = ["default_fonts", "glow"] }

@@ -46,12 +46,18 @@ const BUS_OPEN_RETRY_WEDGED: std::time::Duration = std::time::Duration::from_sec
 /// one more, otherwise it dips under a callback and starves (a 1024-frame ring
 /// dipped to 64 frames on those cycles, which is where the regular clicks came
 /// from).
+#[cfg(feature = "lowlat")]
+const BUS_DRAIN_FRAMES: usize = 1024;
+#[cfg(not(feature = "lowlat"))]
 const BUS_DRAIN_FRAMES: usize = 2048;
 /// Emulated USB cable endpoints ask for 480 frames per callback but deliver
 /// them in bursts: several callbacks land back to back, so the ring has to hold
 /// more than one callback's worth. Measured starving 1-9 times a second with
 /// 1024 and with 1792 frames. Six callbacks of cushion, 60 ms, is fine for an
 /// app feed; the status bar follows the monitoring bus, not this one.
+#[cfg(feature = "lowlat")]
+const USB_CABLE_CUSHION_FRAMES: usize = 2048;
+#[cfg(not(feature = "lowlat"))]
 const USB_CABLE_CUSHION_FRAMES: usize = 2880;
 
 /// How much of the rate an output callback's servo is allowed to trim away from
@@ -2933,6 +2939,13 @@ const INPUT_BUFFER_FRAMES: u32 = 512;
 /// and starved (up to ~360 frames a second), and every starvation holds samples
 /// and shifts the audio against the picture. 40 ms is two device periods plus a
 /// margin - still a small constant offset, but no longer riding the edge.
+///
+/// The `lowlat` feature halves that on purpose: it exists to test how shallow
+/// the cushion can go now that the taps have their own thread and the fill loop
+/// is proportional. Expect starvation to return if the source is bursty.
+#[cfg(feature = "lowlat")]
+pub const INPUT_TARGET_MS: f32 = 15.0;
+#[cfg(not(feature = "lowlat"))]
 pub const INPUT_TARGET_MS: f32 = 40.0;
 /// Input ring servo: the most it may trim the read rate away from the device's
 /// (7 cents, reached only while the fill is recovering) and the integrator step
