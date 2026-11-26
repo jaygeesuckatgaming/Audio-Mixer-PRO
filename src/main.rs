@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+﻿#![windows_subsystem = "windows"]
 
 mod audio;
 mod asio_insert;
@@ -6041,7 +6041,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit Ã‚Â· 48 kHz"), from the
+        // The endpoint's configured format ("24-bit Ãƒâ€šÃ‚Â· 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6124,7 +6124,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit Ã‚Â· 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui
@@ -8649,7 +8649,7 @@ Right click > Source to use the Windows capture stream instead."
         }
         if refresh || touched {
             // Re-read after a move so the readout next to each slider (the
-            // plug-in's own "−14.0 dB" text) follows the value, not the value
+            // plug-in's own "âˆ’14.0 dB" text) follows the value, not the value
             // it had when the window opened.
             self.param_cache = self.vsts[idx].chain.parameters();
         } else {
@@ -10850,32 +10850,15 @@ impl eframe::App for MixerApp {
         self.draw_resize_grip(ctx);
         self.handle_shot(ctx);
 
-        // Repaint pacing. Vsync is off (it hung the window in the NVIDIA
-        // driver), so the UI has to pace itself: at 16 ms it held a full core
-        // and starved the mixer thread, which showed up as late blocks and A1
-        // underruns. 30 fps while the console has focus moves the smoothed
-        // meters smoothly and leaves the audio thread room.
+        // Constant 30 fps. Vsync is off (it hung the window in the NVIDIA
+        // driver), so the UI paces itself: at 16 ms it held a full core and
+        // starved the mixer thread (late blocks, A1 underruns); 30 fps moves
+        // the smoothed meters smoothly and leaves the audio thread room.
         //
-        // While it does not have focus there is nothing to animate at 30 fps,
-        // and that redraw is real load on a machine that is decoding video in
-        // the foreground - Chromium's low-delay presentation shows every stall
-        // as the picture falling behind the sound. So: 4 fps unfocused, 1 fps
-        // minimised. Input (a click, a key, a hotkey) wakes it immediately, so
-        // it never feels unresponsive.
-        let (focused, minimized) = ctx.input(|i| {
-            (
-                i.focused,
-                i.viewport().minimized.unwrap_or(false),
-            )
-        });
-        let interval = if minimized {
-            1000
-        } else if focused {
-            33
-        } else {
-            250
-        };
-        ctx.request_repaint_after(std::time::Duration::from_millis(interval));
+        // A focus-dependent cadence (slow when unfocused) was tried and
+        // reverted: on this machine it coincided with the mixer stuttering,
+        // and the saving was not worth chasing that.
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 }
 

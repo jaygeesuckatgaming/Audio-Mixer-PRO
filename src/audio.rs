@@ -3929,7 +3929,7 @@ fn pcm24(bytes: &[u8]) -> f32 {
 /// the strip's input ring. Runs on the mixer thread, once per block, so there is
 /// no extra thread, no polling and no second clock: the strip sees the audio at
 /// the moment the driver does.
-fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
+fn pump_taps(shared: &Shared, tap_buf: &mut [u8], scratch: &mut Vec<[f32; 2]>) {
     for strip in 0..MAX_STRIPS {
         let device = match shared.tap_inputs[strip].lock() {
             Ok(slot) => slot.clone(),
@@ -3960,28 +3960,41 @@ fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
             continue;
         }
         let mut peak = 0.0f32;
+        // Convert outside the ring lock: the mixer block needs that same mutex
+        // to render this strip, and converting a 2048-frame tap drain while
+        // holding it showed up as a few late mixer blocks every second (and a
+        // stutter when a burst arrived).
+        scratch.clear();
+        scratch.reserve(whole / frame_bytes);
+        for frame in tap_buf[..whole].chunks_exact(frame_bytes) {
+            let (l, r) = match bytes {
+                2 => (
+                    i16::from_le_bytes([frame[0], frame[1]]) as f32 / 32_768.0,
+                    i16::from_le_bytes([frame[2], frame[3]]) as f32 / 32_768.0,
+                ),
+                3 => (pcm24(&frame[0..3]), pcm24(&frame[3..6])),
+                4 => (
+                    i32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as f32
+                        / 2_147_483_648.0,
+                    i32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]) as f32
+                        / 2_147_483_648.0,
+                ),
+                _ => (0.0, 0.0),
+            };
+            let (l, r) = (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0));
+            peak = peak.max(l.abs()).max(r.max(r.abs()));
+            scratch.push([l, r]);
+        }
         {
             let mut ring = lock_source(&input.ring);
+            for frame in scratch.iter() {
+                ring.push(*frame);
+            }
+        }
+        {
             let mut envelope = lock_source(&input.envelope);
-            for frame in tap_buf[..whole].chunks_exact(frame_bytes) {
-                let (l, r) = match bytes {
-                    2 => (
-                        i16::from_le_bytes([frame[0], frame[1]]) as f32 / 32_768.0,
-                        i16::from_le_bytes([frame[2], frame[3]]) as f32 / 32_768.0,
-                    ),
-                    3 => (pcm24(&frame[0..3]), pcm24(&frame[3..6])),
-                    4 => (
-                        i32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as f32
-                            / 2_147_483_648.0,
-                        i32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]) as f32
-                            / 2_147_483_648.0,
-                    ),
-                    _ => (0.0, 0.0),
-                };
-                let (l, r) = (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0));
-                peak = peak.max(l.abs()).max(r.abs());
-                ring.push([l, r]);
-                envelope.push([l, r]);
+            for frame in scratch.iter() {
+                envelope.push(*frame);
             }
         }
         input.peak.store(peak.to_bits(), Ordering::Relaxed);
@@ -4001,6 +4014,7 @@ fn pump_taps(shared: &Shared, tap_buf: &mut [u8]) {
 /// of the sawtooth.
 fn tap_pump_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     let mut tap_buf = vec![0u8; 16_384];
+    let mut scratch: Vec<[f32; 2]> = Vec::with_capacity(2_048);
     #[cfg(windows)]
     unsafe {
         use windows::Win32::System::Threading::{
@@ -4014,7 +4028,7 @@ fn tap_pump_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     let mut next = std::time::Instant::now();
     while !stop.load(Ordering::Relaxed) {
         next += period;
-        pump_taps(&shared, &mut tap_buf);
+        pump_taps(&shared, &mut tap_buf, &mut scratch);
         let now = std::time::Instant::now();
         if next > now {
             let wait = next - now;
