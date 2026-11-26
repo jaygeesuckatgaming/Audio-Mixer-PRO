@@ -47,7 +47,7 @@ const BUS_OPEN_RETRY_WEDGED: std::time::Duration = std::time::Duration::from_sec
 /// dipped to 64 frames on those cycles, which is where the regular clicks came
 /// from).
 #[cfg(feature = "lowlat")]
-const BUS_DRAIN_FRAMES: usize = 1024;
+const BUS_DRAIN_FRAMES: usize = 1536;
 #[cfg(not(feature = "lowlat"))]
 const BUS_DRAIN_FRAMES: usize = 2048;
 /// Emulated USB cable endpoints ask for 480 frames per callback but deliver
@@ -2944,7 +2944,7 @@ const INPUT_BUFFER_FRAMES: u32 = 512;
 /// the cushion can go now that the taps have their own thread and the fill loop
 /// is proportional. Expect starvation to return if the source is bursty.
 #[cfg(feature = "lowlat")]
-pub const INPUT_TARGET_MS: f32 = 15.0;
+pub const INPUT_TARGET_MS: f32 = 20.0;
 #[cfg(not(feature = "lowlat"))]
 pub const INPUT_TARGET_MS: f32 = 40.0;
 /// Input ring servo: the most it may trim the read rate away from the device's
