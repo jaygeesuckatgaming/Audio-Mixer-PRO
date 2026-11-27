@@ -754,6 +754,10 @@ struct Shared {
     strip_pushed: [AtomicU64; MAX_STRIPS],
     strip_taken: [AtomicU64; MAX_STRIPS],
     strip_dropped: [AtomicU64; MAX_STRIPS],
+    /// Per-strip input cushion in f32 bits. The console picks it from the
+    /// device type: the kernel cable is timer-locked to the system and needs
+    /// little slack, the emulated USB cables arrive in bursts and need more.
+    strip_target_ms: [AtomicU32; MAX_STRIPS],
     /// One VST3 insert per input strip (up to MAX_STRIPS independent slots).
     /// This is a rebuild extension (the original console has no VST loader);
     /// see vst.rs.
@@ -854,6 +858,7 @@ impl Shared {
             strip_pushed: std::array::from_fn(|_| AtomicU64::new(0)),
             strip_taken: std::array::from_fn(|_| AtomicU64::new(0)),
             strip_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
+            strip_target_ms: std::array::from_fn(|_| AtomicU32::new(INPUT_TARGET_MS.to_bits())),
             mixer_late: AtomicU64::new(0),
             bus_underruns: std::array::from_fn(|_| AtomicU64::new(0)),
             bus_callback_frames: std::array::from_fn(|_| AtomicUsize::new(0)),
@@ -1230,12 +1235,17 @@ impl Dsp {
         self.vst_ready = [false; MAX_STRIPS];
         for i in 0..strip_count {
             let duck_source_strip = duck_source == Some(i);
+            // The console chooses the cushion per strip from the device type;
+            // take it before either branch so an unrouted strip is trimmed to
+            // the same depth as a live one.
+            let target_ms = f32::from_bits(shared.strip_target_ms[i].load(Ordering::Relaxed));
+            self.readers[i].target_ms = target_ms;
             if !strip_on[i] && !duck_source_strip {
                 // Keep an unrouted/muted input near live time. Without this a
                 // strip can accumulate seconds of backlog and be delayed as
                 // soon as its bus button is turned on.
                 if let Some(ring) = rings[i].as_mut() {
-                    let target = (sample_rate * INPUT_TARGET_MS / 1000.0) as usize;
+                    let target = (sample_rate * target_ms.max(1.0) / 1000.0) as usize;
                     ring.trim_to(target);
                     // Still report this strip's counters: the latency log must
                     // not present a stale rate as a live one.
@@ -2842,6 +2852,17 @@ impl AudioEngine {
         load_f32(&self.shared.source_peak)
     }
 
+    /// Set a strip's input cushion, in milliseconds. Safe to call every frame;
+    /// the value is an atomic the render callback picks up on its next block.
+    pub fn set_strip_target_ms(&self, strip: usize, ms: f32) {
+        if strip < MAX_STRIPS {
+            self.shared.strip_target_ms[strip].store(
+                ms.clamp(2.0, 200.0).to_bits(),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     /// Capture-reader state for one strip, for the periodic latency log.
     ///
     /// `pushed`, `taken` and `dropped` are cumulative frame counters from the
@@ -3264,6 +3285,11 @@ struct InputReader {
     /// period (480 frames) and biases the trim by hundreds of ppm.
     fill_avg: f32,
     fill_smoothed: bool,
+    /// How much audio this strip's reader keeps queued, in milliseconds. Set
+    /// per strip from the device type: the kernel cable is timer-locked to the
+    /// system so it needs little slack, while the emulated USB cables arrive in
+    /// bursty USB frames and need the full cushion.
+    target_ms: f32,
 }
 
 impl InputReader {
@@ -3293,12 +3319,13 @@ impl InputReader {
             starved_total: 0,
             fill_avg: 0.0,
             fill_smoothed: false,
+            target_ms: INPUT_TARGET_MS,
         }
     }
 
     fn next(&mut self, ring: &mut SampleRing, input_rate: u32, output_rate: u32) -> [f32; 2] {
         let output_rate = output_rate.max(1);
-        let target = (output_rate as f32 * INPUT_TARGET_MS / 1000.0) as usize;
+        let target = (output_rate as f32 * self.target_ms.max(1.0) / 1000.0) as usize;
         // Spike-only slip threshold; see the block below. Kept well above the
         // servo's tolerated band so the steady state never skips frames.
         let slip_above =

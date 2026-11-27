@@ -2570,6 +2570,11 @@ fn path_delay_ms(
                 any_solo,
             );
             self.audio.set_strip_eq(i, s.eq);
+            // Per-device input cushion. The kernel cable's endpoints are driven
+            // by the same 1 ms timer as playback, so they need far less slack
+            // than the emulated USB cables, whose capture side arrives in
+            // bursty USB frames (and whose clock drifts from the output's).
+            self.audio.set_strip_target_ms(i, input_target_ms_for(&s.device));
         }
         for (i, bus) in self.buses.iter().enumerate() {
             self.audio.set_bus(
@@ -11622,6 +11627,7 @@ fn cable_render_device(devices: &[String], label: &str) -> String {
 fn cable_label(device: &str) -> Option<String> {
     let lower = device.to_ascii_lowercase();
     for (prefix, display) in [
+        ("audio mixer cable ", "Audio Mixer Cable "),
         ("virtual cable ", "Virtual Cable "),
         ("usb cable ", "USB Cable "),
     ] {
@@ -11640,11 +11646,26 @@ fn cable_label(device: &str) -> Option<String> {
 }
 
 /// True for the emulated USB/IP cable endpoints (the kernel driver's
-/// "Virtual Cable" endpoints are ordinary WDM devices that exist from boot).
+/// "Audio Mixer Cable" endpoints are ordinary WDM devices that exist from boot).
 fn is_usb_cable_endpoint(device: &str) -> bool {
-    cable_label(device)
-        .map(|label| label.starts_with("USB Cable"))
-        .unwrap_or(false)
+    let lower = device.to_ascii_lowercase();
+    lower.contains("usb cable") || (lower.contains("virtual cable") && !lower.contains("audio mixer cable"))
+}
+
+/// Input cushion for a strip, from the device it listens to, in milliseconds.
+///
+/// The kernel cable is clocked by the same 1 ms timer as playback, so its
+/// capture side is smooth and 12 ms is plenty. The emulated USB cables deliver
+/// in USB-frame bursts and run on a different clock, so they keep the full
+/// cushion; physical inputs (microphones, interfaces) keep it too, because
+/// their drivers are the ones that can stall unpredictably.
+fn input_target_ms_for(device: &str) -> f32 {
+    let lower = device.to_ascii_lowercase();
+    if lower.contains("audio mixer cable") {
+        12.0
+    } else {
+        audio::INPUT_TARGET_MS
+    }
 }
 
 /// Cable number behind an endpoint name ("Speakers (USB Cable 02)" -> 2), for
