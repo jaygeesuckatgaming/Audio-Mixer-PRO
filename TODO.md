@@ -76,6 +76,17 @@ The plugin itself is in `streamdeck/` (Strip Mute + Mute All, live state); see
 
 ## Console
 
+- **Player strip (Music Player): insert passes dry ~1×/s.** The log line
+  `audio: 1 plug-in block(s) passed dry in the last second: Music Player=1`
+  has no `(failed)` tag, so it is the 2 ms slot-lock budget being missed, not a
+  failed plug-in: one block in ~94 goes through unprocessed, i.e. a
+  processed/dry switch every second. With a stateful plug-in (Leveler) that can
+  look like "the VST does nothing". Worth checking whether the player attaches
+  before the strip is routed, and either taking the UI frame lock off the audio
+  path or widening the budget (a dry block is worse than a 2 ms stall).
+- `vst[4] 'Leveler.clap' not restored: it crashed the previous session` appears
+  in the scene log; a crash-restore path that silently drops the insert on the
+  player strip would also look like "the plug-in does not work".
 - CLAP back end reports latency as 0 (`ClapSlot::latency`); VST3 reports the
   real value. Needed before any CLAP plug-in with look-ahead can be trusted.
 - The insert panel's `Open` and the insert click both fall back to the parameter
