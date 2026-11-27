@@ -2614,14 +2614,14 @@ fn path_delay_ms(
         let b1 = if !auto_b1 {
             self.buses[3].device.clone()
         } else if self.driver_mode {
-            cable_render_device(&self.last_outputs, "Virtual Cable 01")
+            kernel_cable_render_device(&self.last_outputs, 1)
         } else {
             String::new()
         };
         let b2 = if !auto_b2 {
             self.buses[4].device.clone()
         } else if self.driver_mode {
-            cable_render_device(&self.last_outputs, "Virtual Cable 02")
+            kernel_cable_render_device(&self.last_outputs, 2)
         } else {
             String::new()
         };
@@ -5080,8 +5080,9 @@ fn path_delay_ms(
         }
     }
 
-    /// Lowest unused `Microphone (Virtual Cable NN)` with NN >= 03. Cables 01
-    /// and 02 carry B1/B2, so input strips start at cable 03.
+    /// Lowest unused cable capture endpoint that a virtual strip can listen to.
+    /// Cables already used by a strip are skipped, so a new strip takes the next
+    /// free one; each is bidirectional and any of them can feed a strip.
     fn next_free_virtual_cable(&self) -> Option<String> {
         let inputs = self.last_inputs.clone();
         let used: Vec<String> = self
@@ -5098,7 +5099,9 @@ fn path_delay_ms(
         for name in inputs {
             let lower = name.to_ascii_lowercase();
             let Some(rest) = lower
-                .strip_prefix("microphone array (virtual cable ")
+                .strip_prefix("microphone array (audio mixer cable ")
+                .or_else(|| lower.strip_prefix("microphone (audio mixer cable "))
+                .or_else(|| lower.strip_prefix("microphone array (virtual cable "))
                 .or_else(|| lower.strip_prefix("microphone (virtual cable "))
                 .or_else(|| lower.strip_prefix("microphone (usb cable "))
                 .or_else(|| lower.strip_prefix("microphone array (usb cable "))
@@ -6931,12 +6934,11 @@ Right click > Source to use the Windows capture stream instead."
             let name = if !self.buses[idx].device.trim().is_empty() {
                 self.buses[idx].device.clone()
             } else if let Some(cable) = self.bus_cable_number(idx) {
-                let label = format!(
-                    "{} Cable {:02}",
-                    if self.driver_mode { "Virtual" } else { "USB" },
-                    cable
-                );
-                cable_render_device(&self.last_outputs, &label)
+                if self.driver_mode {
+                    kernel_cable_render_device(&self.last_outputs, cable)
+                } else {
+                    cable_render_device(&self.last_outputs, &format!("USB Cable {cable:02}"))
+                }
             } else {
                 String::new()
             };
@@ -6992,10 +6994,16 @@ Right click > Source to use the Windows capture stream instead."
                 } else if idx == 3 || idx == 4 {
                     // Unset B1/B2 keep their automatic wiring; say which cable
                     // that is so the empty state is not read as "off".
-                    if self.driver_mode {
-                        format!("Virtual Cable {:02} (auto)", idx - 2)
+                    let number = idx - 2;
+                    let device = if self.driver_mode {
+                        kernel_cable_render_device(&self.last_outputs, number as u32)
                     } else {
-                        format!("USB Cable {:02} (auto)", idx - 2)
+                        cable_render_device(&self.last_outputs, &format!("USB Cable {number:02}"))
+                    };
+                    if device.is_empty() {
+                        format!("USB Cable {number:02} (auto)")
+                    } else {
+                        format!("{device} (auto)")
                     }
                 } else {
                     "No device".to_string()
@@ -11601,12 +11609,12 @@ fn driver_cables_present_from(devices: &[String]) -> bool {
         .iter()
         .filter(|d| d.to_ascii_lowercase().starts_with("speakers"))
         .filter_map(|d| cable_label(d))
-        // Only the kernel driver makes "Virtual Cable" endpoints. The USB/IP
-        // set is called "USB Cable" and must not be read as the driver: with
-        // four USB cables attached this used to report KERNEL DRIVER ACTIVE and
-        // an automatic B1/B2 then looked for a "Virtual Cable" that is not
-        // there.
-        .filter(|label| label.starts_with("Virtual Cable "))
+        // Only the kernel driver makes non-USB cable labels ("Audio Mixer
+        // Cable" now, "Virtual Cable" before the rename). The USB/IP set is
+        // called "USB Cable" and must not be read as the driver: with four USB
+        // cables attached this used to report KERNEL DRIVER ACTIVE and an
+        // automatic B1/B2 then looked for a kernel cable that is not there.
+        .filter(|label| !label.starts_with("USB Cable"))
         .collect();
     labels.sort();
     labels.dedup();
@@ -11619,6 +11627,22 @@ fn cable_render_device(devices: &[String], label: &str) -> String {
         .find(|d| {
             d.to_ascii_lowercase().starts_with("speakers")
                 && cable_label(d).as_deref() == Some(label)
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Render endpoint of the kernel driver's cable `number`, named either
+/// "Speakers (Audio Mixer Cable 01)" or, before the rename, "Speakers (Virtual
+/// Cable 01)". Matching by number keeps the automatic B1/B2 wiring working
+/// across both naming schemes.
+fn kernel_cable_render_device(devices: &[String], number: u32) -> String {
+    devices
+        .iter()
+        .find(|d| {
+            d.to_ascii_lowercase().starts_with("speakers")
+                && is_kernel_cable_endpoint(d)
+                && cable_number(d) == Some(number)
         })
         .cloned()
         .unwrap_or_default()
@@ -11645,11 +11669,22 @@ fn cable_label(device: &str) -> Option<String> {
     None
 }
 
-/// True for the emulated USB/IP cable endpoints (the kernel driver's
-/// "Audio Mixer Cable" endpoints are ordinary WDM devices that exist from boot).
+/// True for the emulated USB/IP cable endpoints only.
+///
+/// This must stay strict: the kernel driver's capture side is an ordinary WDM
+/// device and has to take the Windows capture path. Reading it through the USB
+/// cable server's buffer (the "direct tap") returns silence, because that
+/// buffer belongs to a different device that nothing is playing into.
 fn is_usb_cable_endpoint(device: &str) -> bool {
-    let lower = device.to_ascii_lowercase();
-    lower.contains("usb cable") || (lower.contains("virtual cable") && !lower.contains("audio mixer cable"))
+    cable_label(device)
+        .map(|label| label.starts_with("USB Cable"))
+        .unwrap_or(false)
+}
+
+/// True for the installed kernel driver's endpoints, under either the current
+/// "Audio Mixer Cable NN" names or the earlier "Virtual Cable NN" ones.
+fn is_kernel_cable_endpoint(device: &str) -> bool {
+    cable_label(device).is_some() && !is_usb_cable_endpoint(device)
 }
 
 /// Input cushion for a strip, from the device it listens to, in milliseconds.
@@ -11660,8 +11695,7 @@ fn is_usb_cable_endpoint(device: &str) -> bool {
 /// cushion; physical inputs (microphones, interfaces) keep it too, because
 /// their drivers are the ones that can stall unpredictably.
 fn input_target_ms_for(device: &str) -> f32 {
-    let lower = device.to_ascii_lowercase();
-    if lower.contains("audio mixer cable") {
+    if is_kernel_cable_endpoint(device) {
         12.0
     } else {
         audio::INPUT_TARGET_MS
@@ -12525,6 +12559,66 @@ mod tests {
             .map(|n| format!("Speakers (USB Cable {n:02})"))
             .collect();
         assert!(!driver_cables_present_from(&devices));
+    }
+
+    #[test]
+    fn kernel_cables_are_not_usb_cables() {
+        // Both naming schemes are the installed driver. Reading either through
+        // the USB cable server's buffer (the direct tap) returns silence, so
+        // neither may be classified as a USB endpoint.
+        assert!(!is_usb_cable_endpoint("Microphone Array (Audio Mixer Cable 01)"));
+        assert!(!is_usb_cable_endpoint("Microphone Array (Virtual Cable 01)"));
+        assert!(is_usb_cable_endpoint("Microphone (USB Cable 01)"));
+        assert!(is_kernel_cable_endpoint("Microphone Array (Audio Mixer Cable 01)"));
+        assert!(is_kernel_cable_endpoint("Speakers (Virtual Cable 02)"));
+        // VB-Audio's cable says "Virtual Cable" in its vendor name but has no
+        // cable number after it, so it must not be mistaken for ours.
+        assert!(!is_kernel_cable_endpoint("CABLE Output (VB-Audio Virtual Cable)"));
+    }
+
+    #[test]
+    fn kernel_cables_get_the_small_input_cushion() {
+        assert_eq!(
+            input_target_ms_for("Microphone Array (Audio Mixer Cable 01)"),
+            12.0
+        );
+        assert_eq!(
+            input_target_ms_for("Microphone Array (Virtual Cable 01)"),
+            12.0
+        );
+        assert_eq!(
+            input_target_ms_for("Microphone (USB Cable 01)"),
+            audio::INPUT_TARGET_MS
+        );
+        assert_eq!(
+            input_target_ms_for("Microphone (Yeti Stereo Microphone)"),
+            audio::INPUT_TARGET_MS
+        );
+    }
+
+    #[test]
+    fn audio_mixer_cables_count_as_the_kernel_driver() {
+        let devices: Vec<String> = (1..=4)
+            .map(|n| format!("Speakers (Audio Mixer Cable {n:02})"))
+            .collect();
+        assert!(driver_cables_present_from(&devices));
+        assert_eq!(
+            kernel_cable_render_device(&devices, 3),
+            "Speakers (Audio Mixer Cable 03)"
+        );
+    }
+
+    #[test]
+    fn next_free_cable_accepts_audio_mixer_names() {
+        let inputs = vec![
+            "Microphone Array (Audio Mixer Cable 03)".to_string(),
+            "Microphone Array (Audio Mixer Cable 04)".to_string(),
+        ];
+        let used = vec!["microphone array (audio mixer cable 03)".to_string()];
+        assert_eq!(
+            MixerApp::next_free_virtual_cable_from(&inputs, &used).as_deref(),
+            Some("Microphone Array (Audio Mixer Cable 04)")
+        );
     }
 
     #[test]

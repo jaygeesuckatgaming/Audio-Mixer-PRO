@@ -647,7 +647,10 @@ pub fn self_test() -> String {
                 continue;
             };
             let lower = name.to_ascii_lowercase();
-            if !lower.contains("virtual cable") && !lower.contains("usb cable") {
+            if !lower.contains("audio mixer cable")
+                && !lower.contains("virtual cable")
+                && !lower.contains("usb cable")
+            {
                 continue;
             }
             report.push_str(&format!("\n{name}\n"));
