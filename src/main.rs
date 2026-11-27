@@ -2698,6 +2698,7 @@ fn path_delay_ms(
     /// AMP_MAIN_BUFFER  mixer block, frames (64..2048)
     /// AMP_CUSHION_MS   kernel-cable input cushion, ms (1..200)
     /// AMP_A1_DRAIN     A1/A2/A3/B3 ring cushion, frames (256..4096)
+    /// AMP_VC           set 0/off to skip the USB/IP cable server
     fn apply_test_overrides(&mut self) {
         let mut changes: Vec<String> = Vec::new();
         if let Ok(value) = std::env::var("AMP_MAIN_BUFFER") {
@@ -2718,6 +2719,17 @@ fn path_delay_ms(
                 let frames = frames.clamp(256, 4096);
                 audio::set_bus_drain_override(Some(frames));
                 changes.push(format!("bus ring cushion {frames} frames"));
+            }
+        }
+        // Keep the USB/IP cable server out of a latency run: it costs CPU (the
+        // attach helper and six emulated devices) and it is irrelevant to the
+        // kernel-cable path. The saved scene is left alone, so a normal launch
+        // still starts the cables.
+        if let Ok(value) = std::env::var("AMP_VC") {
+            let trimmed = value.trim().to_ascii_lowercase();
+            if trimmed == "0" || trimmed == "off" || trimmed == "no" {
+                self.vc_cfg.enabled = false;
+                changes.push("USB/IP cables disabled".to_string());
             }
         }
         if !changes.is_empty() {
