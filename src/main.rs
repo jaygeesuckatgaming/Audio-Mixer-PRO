@@ -23,6 +23,7 @@ use eframe::egui::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -1607,6 +1608,10 @@ impl MixerApp {
             // no capture is opened while its USB endpoint is being replugged.
             app.load_settings_parse(false);
         }
+        // Latency test builds (rev 35+): environment switches override the
+        // block size, the kernel-cable cushion and the bus ring depth, so one
+        // binary can A/B every lever without editing the saved scene.
+        app.apply_test_overrides();
         app.audio.set_strip_count(app.active_strips);
         app.strip_bank = 0;
         if app.show_preset_on_startup {
@@ -2685,6 +2690,39 @@ fn path_delay_ms(
             Vec::new()
         };
         let _ = self.vban.set_senders(configs, self.audio.sample_rate);
+    }
+
+    /// Environment switches for the latency test builds. With none of the
+    /// variables set this does nothing, so a normal launch is unchanged.
+    ///
+    /// AMP_MAIN_BUFFER  mixer block, frames (64..2048)
+    /// AMP_CUSHION_MS   kernel-cable input cushion, ms (1..200)
+    /// AMP_A1_DRAIN     A1/A2/A3/B3 ring cushion, frames (256..4096)
+    fn apply_test_overrides(&mut self) {
+        let mut changes: Vec<String> = Vec::new();
+        if let Ok(value) = std::env::var("AMP_MAIN_BUFFER") {
+            if let Ok(frames) = value.trim().parse::<u32>() {
+                self.main_buffer = frames.clamp(64, MAIN_BUFFER_MAX);
+                changes.push(format!("block {} frames", self.main_buffer));
+            }
+        }
+        if let Ok(value) = std::env::var("AMP_CUSHION_MS") {
+            if let Ok(ms) = value.trim().parse::<f32>() {
+                let ms = ms.clamp(1.0, 200.0);
+                set_cushion_ms_override(Some(ms));
+                changes.push(format!("kernel-cable cushion {ms:.1} ms"));
+            }
+        }
+        if let Ok(value) = std::env::var("AMP_A1_DRAIN") {
+            if let Ok(frames) = value.trim().parse::<usize>() {
+                let frames = frames.clamp(256, 4096);
+                audio::set_bus_drain_override(Some(frames));
+                changes.push(format!("bus ring cushion {frames} frames"));
+            }
+        }
+        if !changes.is_empty() {
+            diag_log(format!("test build: {}", changes.join(", ")));
+        }
     }
 
     fn apply_audio_format(&mut self) -> Result<(), String> {
@@ -11687,6 +11725,15 @@ fn is_kernel_cable_endpoint(device: &str) -> bool {
     cable_label(device).is_some() && !is_usb_cable_endpoint(device)
 }
 
+/// Test override for the kernel cable's input cushion, in milliseconds,
+/// stored as f32 bits (0 = use the built-in 12 ms). Set from `AMP_CUSHION_MS`
+/// at startup; only the kernel-cable strips are affected.
+static CUSHION_MS_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+
+fn set_cushion_ms_override(ms: Option<f32>) {
+    CUSHION_MS_OVERRIDE.store(ms.map(|v| v.to_bits()).unwrap_or(0), Ordering::Relaxed);
+}
+
 /// Input cushion for a strip, from the device it listens to, in milliseconds.
 ///
 /// The kernel cable is clocked by the same 1 ms timer as playback, so its
@@ -11696,6 +11743,10 @@ fn is_kernel_cable_endpoint(device: &str) -> bool {
 /// their drivers are the ones that can stall unpredictably.
 fn input_target_ms_for(device: &str) -> f32 {
     if is_kernel_cable_endpoint(device) {
+        let over = CUSHION_MS_OVERRIDE.load(Ordering::Relaxed);
+        if over != 0 {
+            return f32::from_bits(over);
+        }
         12.0
     } else {
         audio::INPUT_TARGET_MS
@@ -12577,8 +12628,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_cables_get_the_small_input_cushion() {
-        assert_eq!(
+    fn kernel_cables_get_the_small_input_cushion() {        assert_eq!(
             input_target_ms_for("Microphone Array (Audio Mixer Cable 01)"),
             12.0
         );
@@ -12593,6 +12643,30 @@ mod tests {
         assert_eq!(
             input_target_ms_for("Microphone (Yeti Stereo Microphone)"),
             audio::INPUT_TARGET_MS
+        );
+    }
+
+    #[test]
+    fn cushion_override_only_affects_kernel_cables() {
+        // AMP_CUSHION_MS is a test switch: it must move the kernel cable's
+        // cushion and leave the USB/IP cables (bursty, different clock) alone.
+        set_cushion_ms_override(Some(9.0));
+        assert_eq!(
+            input_target_ms_for("Microphone Array (Virtual Cable 01)"),
+            9.0
+        );
+        assert_eq!(
+            input_target_ms_for("Microphone Array (Audio Mixer Cable 01)"),
+            9.0
+        );
+        assert_eq!(
+            input_target_ms_for("Microphone (USB Cable 01)"),
+            audio::INPUT_TARGET_MS
+        );
+        set_cushion_ms_override(None);
+        assert_eq!(
+            input_target_ms_for("Microphone Array (Virtual Cable 01)"),
+            12.0
         );
     }
 

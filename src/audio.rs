@@ -71,12 +71,24 @@ const SERVO_TRIM: f32 = 0.005;
 /// ppm, which moved the delay audibly).
 const SERVO_KP: f32 = 0.01;
 
+/// Test override for the non-USB bus ring cushion, in frames (0 = default).
+/// Set from `AMP_A1_DRAIN` at startup by the test builds; it affects A1/A2/A3/B3
+/// but never the USB/IP cable buses, whose bursty callbacks need their own.
+static BUS_DRAIN_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_bus_drain_override(frames: Option<usize>) {
+    BUS_DRAIN_OVERRIDE.store(frames.unwrap_or(0), Ordering::Relaxed);
+}
+
 /// Ring depth the callback keeps queued for this endpoint.
 fn bus_cushion_frames(device: &str) -> usize {
     if device.to_ascii_lowercase().contains("usb cable") {
         USB_CABLE_CUSHION_FRAMES
     } else {
-        BUS_DRAIN_FRAMES
+        match BUS_DRAIN_OVERRIDE.load(Ordering::Relaxed) {
+            0 => BUS_DRAIN_FRAMES,
+            frames => frames,
+        }
     }
 }
 
@@ -5364,6 +5376,24 @@ mod probe_tests {
     // Diagnostic only: decodes every supported audio file under
     // AUDIO_PROBE_DIR so the real-world formats this build meets can be
     // checked without opening the window.
+    #[test]
+    fn bus_drain_override_skips_usb_cables() {
+        // AMP_A1_DRAIN trims the A1/A2/A3/B3 ring in the test builds; the USB/IP
+        // buses must keep their own (larger) cushion because their callbacks
+        // arrive in bursts.
+        set_bus_drain_override(Some(960));
+        assert_eq!(bus_cushion_frames("Speakers (Realtek(R) Audio)"), 960);
+        assert_eq!(
+            bus_cushion_frames("Speakers (USB Cable 01)"),
+            USB_CABLE_CUSHION_FRAMES
+        );
+        set_bus_drain_override(None);
+        assert_eq!(
+            bus_cushion_frames("Speakers (Realtek(R) Audio)"),
+            BUS_DRAIN_FRAMES
+        );
+    }
+
     #[test]
     fn decodes_real_world_audio() {
         let Some(dir) = std::env::var_os("AUDIO_PROBE_DIR") else {
