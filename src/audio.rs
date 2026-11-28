@@ -95,7 +95,7 @@ fn bus_cushion_frames(device: &str) -> usize {
 /// Consumption multiplier applied by an output callback's rate servo: below the
 /// target fill it reads a little slower so the mixer refills the cushion, above
 /// it a little faster. `trim` is carried by the caller and integrated there; the
-/// result is clamped to `Ãƒâ€šÃ‚Â±SERVO_TRIM`, so it can never be heard as a pitch shift
+/// result is clamped to `ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±SERVO_TRIM`, so it can never be heard as a pitch shift
 /// beyond a few cents.
 fn servo_step(base_step: f32, trim: f32) -> f32 {
     base_step * (1.0 - trim.clamp(-SERVO_TRIM, SERVO_TRIM))
@@ -1303,7 +1303,7 @@ impl Dsp {
             self.readers[i].publish(shared, i);
             // Pre-FX insert: send the dry block, then use the returned one in its
             // place. The return belongs to an earlier block, so the strip is a
-            // block or two late ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â inherent to an external insert.
+            // block or two late ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â inherent to an external insert.
             let insert = shared.inserts.get(i);
             if insert_active {
                 if let Some((pair, false)) = insert {
@@ -3467,6 +3467,9 @@ pub struct InputCapture {
     /// True when the audio comes from a virtual cable's device buffer rather
     /// than a Windows capture stream.
     pub direct: bool,
+    /// True when this is a render endpoint's loopback (the audio engine's own
+    /// tap). It has no second clock, so the strip needs only a small cushion.
+    pub loopback: bool,
 }
 
 fn _assert_send<T: Send>() {}
@@ -3565,6 +3568,7 @@ impl InputCapture {
             available: false,
             status,
             direct: false,
+            loopback: false,
         }
     }
 
@@ -3589,6 +3593,68 @@ impl InputCapture {
             available: true,
             status: "Direct cable tap".to_string(),
             direct: true,
+            loopback: false,
+        }
+    }
+
+    /// A strip fed from a render endpoint's loopback: the audio engine's own tap
+    /// of what applications play into that endpoint. cpal turns on
+    /// AUDCLNT_STREAMFLAGS_LOOPBACK when an output device is opened as an input
+    /// stream, so the capture path below is unchanged.
+    ///
+    /// This window sees the cable's audio one engine period after the app writes
+    /// it, without the driver's ring read or a second clock - which is where the
+    /// kernel cable's extra ~25 ms lived.
+    pub fn open_loopback(render_name: &str) -> Self {
+        let host = cpal::default_host();
+        let devices: Vec<cpal::Device> = match host.output_devices() {
+            Ok(list) => list.collect(),
+            Err(err) => return Self::failed(format!("Could not list audio outputs: {err}")),
+        };
+        let Some(device) = devices.iter().find(|d| {
+            d.name()
+                .map(|n| n.eq_ignore_ascii_case(render_name))
+                .unwrap_or(false)
+        }) else {
+            return Self::failed(format!("Output device not found: {render_name}"));
+        };
+        let supported = match device.default_output_config() {
+            Ok(config) => config,
+            Err(err) => {
+                return Self::failed(format!("Could not read {render_name}: {err}"));
+            }
+        };
+        let sample_format = supported.sample_format();
+        let mut config: cpal::StreamConfig = supported.config();
+        config.buffer_size = cpal::BufferSize::Fixed(INPUT_BUFFER_FRAMES);
+        let shared = Arc::new(InputShared::new());
+        let stream = match build_capture_for_format(sample_format, device, &config, shared.clone()) {
+            Ok(stream) => stream,
+            Err(_) => {
+                config.buffer_size = cpal::BufferSize::Default;
+                match build_capture_for_format(sample_format, device, &config, shared.clone()) {
+                    Ok(stream) => stream,
+                    Err(err) => return Self::failed(err),
+                }
+            }
+        };
+        if let Err(err) = stream.play() {
+            return Self::failed(format!("Could not start loopback on {render_name}: {err}"));
+        }
+        crate::diag_log(format!(
+            "audio: loopback capture on '{render_name}' ({} Hz, {} ch)",
+            config.sample_rate.0, config.channels
+        ));
+        Self {
+            shared,
+            _stream: Some(stream),
+            device: render_name.to_string(),
+            sample_rate: config.sample_rate.0,
+            channels: config.channels,
+            available: true,
+            status: "Loopback (engine tap)".to_string(),
+            direct: true,
+            loopback: true,
         }
     }
 
@@ -3625,6 +3691,7 @@ impl InputCapture {
             available: true,
             status: String::new(),
             direct: false,
+            loopback: false,
         })
     }
 

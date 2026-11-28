@@ -467,6 +467,13 @@ impl StripInput {
         }
     }
 
+    fn loopback(&self) -> bool {
+        match self {
+            Self::Cpal(capture) => capture.loopback,
+            Self::Vban(_) => false,
+        }
+    }
+
     fn channels(&self) -> u16 {
         match self {
             Self::Cpal(capture) => capture.channels,
@@ -2579,7 +2586,14 @@ fn path_delay_ms(
             // by the same 1 ms timer as playback, so they need far less slack
             // than the emulated USB cables, whose capture side arrives in
             // bursty USB frames (and whose clock drifts from the output's).
-            self.audio.set_strip_target_ms(i, input_target_ms_for(&s.device));
+            // A loopback capture has no second clock (the engine taps the same
+            // render stream), so it needs only a couple of periods, not the
+            // capture cushion.
+            let target_ms = match self.captures.get(i).and_then(|capture| capture.as_ref()) {
+                Some(capture) if capture.loopback() => 6.0,
+                _ => input_target_ms_for(&s.device),
+            };
+            self.audio.set_strip_target_ms(i, target_ms);
         }
         for (i, bus) in self.buses.iter().enumerate() {
             self.audio.set_bus(
@@ -2862,11 +2876,27 @@ fn path_delay_ms(
         if self.open_cable_tap(slot, &name) {
             return;
         }
+        // A kernel cable's capture endpoint can be replaced by a loopback of its
+        // render endpoint: the audio engine taps what the app plays, so the strip
+        // skips the driver's ring read and the capture period. That is worth
+        // ~25 ms and removes a second clock from the path.
+        let render = loopback_render_name(&name);
         let (sender, receiver) = std::sync::mpsc::channel();
         if std::thread::Builder::new()
             .name("capture-open".to_string())
             .spawn(move || {
-                let _ = sender.send(audio::InputCapture::open(Some(&name)));
+                let capture = match render {
+                    Some(render) => {
+                        let mut capture = audio::InputCapture::open_loopback(&render);
+                        if capture.available {
+                            // The strip keeps showing the endpoint it listens to.
+                            capture.device = name.clone();
+                        }
+                        capture
+                    }
+                    None => audio::InputCapture::open(Some(&name)),
+                };
+                let _ = sender.send(capture);
             })
             .is_ok()
         {
@@ -11781,6 +11811,21 @@ fn input_target_ms_for(device: &str) -> f32 {
     } else {
         audio::INPUT_TARGET_MS
     }
+}
+
+/// Render endpoint whose loopback carries what a kernel cable's capture endpoint
+/// would deliver: "Microphone Array (Audio Mixer Cable 01)" becomes "Speakers
+/// (Audio Mixer Cable 01)". `None` for every other device, so only our own cable
+/// takes the loopback route.
+fn loopback_render_name(device: &str) -> Option<String> {
+    if !is_kernel_cable_endpoint(device) {
+        return None;
+    }
+    if !device.to_ascii_lowercase().starts_with("microphone") {
+        return None;
+    }
+    let at = device.find(" (")?;
+    Some(format!("Speakers{}", &device[at..]))
 }
 
 /// Cable number behind an endpoint name ("Speakers (USB Cable 02)" -> 2), for
