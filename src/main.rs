@@ -1407,7 +1407,7 @@ impl MixerApp {
             audio,
             sample_rate,
             buffer: VAIO_BUFFER_DEFAULT,
-            main_buffer: 512,
+    main_buffer: 480,
             dev_mme: DEV_MME_DEFAULT,
             dev_wdm: DEV_WDM_DEFAULT,
             dev_ks: DEV_KS_DEFAULT,
@@ -3782,7 +3782,7 @@ fn path_delay_ms(
         // Rebuild extension for state the original keeps in the registry
         // (audio format, menu switches) and for the tape file itself.
         let latency_profile = match self.main_buffer {
-            256 => "low",
+            256 | 480 => "low",
             512 => "balanced",
             1024 => "safe",
             _ => "custom",
@@ -6118,7 +6118,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz"), from the
+        // The endpoint's configured format ("24-bit ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6201,7 +6201,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui
@@ -8731,7 +8731,7 @@ Right click > Source to use the Windows capture stream instead."
         }
         if refresh || touched {
             // Re-read after a move so the readout next to each slider (the
-            // plug-in's own "Ã¢Ë†â€™14.0 dB" text) follows the value, not the value
+            // plug-in's own "ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢14.0 dB" text) follows the value, not the value
             // it had when the window opened.
             self.param_cache = self.vsts[idx].chain.parameters();
         } else {
@@ -8796,7 +8796,7 @@ Right click > Source to use the Windows capture stream instead."
                     ui.horizontal(|ui| {
                         ui.label("Latency profile:");
                         for (label, samples) in
-                            [("Low", 256u32), ("Balanced", 512), ("Safe", 1024)]
+                            [("Low", 480u32), ("Balanced", 512), ("Safe", 1024)]
                         {
                             if ui
                                 .selectable_label(self.main_buffer == samples, label)
