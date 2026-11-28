@@ -49,7 +49,7 @@ const BUS_OPEN_RETRY_WEDGED: std::time::Duration = std::time::Duration::from_sec
 #[cfg(feature = "lowlat")]
 const BUS_DRAIN_FRAMES: usize = 1792;
 #[cfg(not(feature = "lowlat"))]
-const BUS_DRAIN_FRAMES: usize = 2048;
+const BUS_DRAIN_FRAMES: usize = 1536;
 /// Emulated USB cable endpoints ask for 480 frames per callback but deliver
 /// them in bursts: several callbacks land back to back, so the ring has to hold
 /// more than one callback's worth. Measured starving 1-9 times a second with
@@ -95,7 +95,7 @@ fn bus_cushion_frames(device: &str) -> usize {
 /// Consumption multiplier applied by an output callback's rate servo: below the
 /// target fill it reads a little slower so the mixer refills the cushion, above
 /// it a little faster. `trim` is carried by the caller and integrated there; the
-/// result is clamped to `±SERVO_TRIM`, so it can never be heard as a pitch shift
+/// result is clamped to `Ã‚Â±SERVO_TRIM`, so it can never be heard as a pitch shift
 /// beyond a few cents.
 fn servo_step(base_step: f32, trim: f32) -> f32 {
     base_step * (1.0 - trim.clamp(-SERVO_TRIM, SERVO_TRIM))
@@ -291,9 +291,21 @@ fn soft_clip(x: f32) -> f32 {
 /// 2.4 dB at exactly 0 dBFS and heavily distorts every loud passage. Bypassing a
 /// plug-in that adds gain made the crackle disappear, because it was this
 /// limiter being driven, not the plug-in failing.
+///
+/// `AMP_NO_LIMIT=1` bypasses it (hard clip at 1.0 instead) so a test can tell a
+/// driven limiter apart from every other possible crackle source.
+static LIMIT_BYPASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_limit_bypass(on: bool) {
+    LIMIT_BYPASS.store(on, Ordering::Relaxed);
+}
+
 fn limit_bus(x: f32) -> f32 {
     if !x.is_finite() {
         return 0.0;
+    }
+    if LIMIT_BYPASS.load(Ordering::Relaxed) {
+        return x.clamp(-1.0, 1.0);
     }
     const KNEE: f32 = 0.9;
     const RANGE: f32 = 1.0 - KNEE;
@@ -806,6 +818,11 @@ struct Shared {
     /// ring was empty. Distinct from an underrun (one per callback): this is how
     /// much audio was actually missing, which is what is heard.
     bus_starve_frames: [AtomicU64; MAX_BUSES],
+    /// Frames dropped because a bus ring grew past its cushion (the mixer ran
+    /// ahead of the device). Each drop is an audible jump forward, and a steady
+    /// trickle of them makes audio creep ahead of a picture - the counter exists
+    /// so that is visible instead of being inferred from the lips.
+    bus_dropped: [AtomicU64; MAX_BUSES],
     /// Lowest ring fill seen since the last log tick. The servo targets a
     /// cushion; this shows whether the cushion is actually being held.
     bus_ring_min: [AtomicUsize; MAX_BUSES],
@@ -876,6 +893,7 @@ impl Shared {
             bus_callback_frames: std::array::from_fn(|_| AtomicUsize::new(0)),
             bus_step: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             bus_starve_frames: std::array::from_fn(|_| AtomicU64::new(0)),
+            bus_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
             bus_ring_min: std::array::from_fn(|_| AtomicUsize::new(usize::MAX)),
             inserts: crate::asio_insert::insert_map(),
             insert_host: AtomicBool::new(false),
@@ -1285,7 +1303,7 @@ impl Dsp {
             self.readers[i].publish(shared, i);
             // Pre-FX insert: send the dry block, then use the returned one in its
             // place. The return belongs to an earlier block, so the strip is a
-            // block or two late — inherent to an external insert.
+            // block or two late Ã¢â‚¬â€ inherent to an external insert.
             let insert = shared.inserts.get(i);
             if insert_active {
                 if let Some((pair, false)) = insert {
@@ -1966,6 +1984,12 @@ impl AudioEngine {
             .and_then(|inputs| inputs.get(strip).cloned().flatten())
             .and_then(|input| input.ring.lock().ok().map(|ring| ring.fill()))
             .unwrap_or(0)
+    }
+
+    /// Frames each bus ring dropped because it grew past the cushion since the
+    /// last call. Each one is audio skipped forward, i.e. A/V sync creep.
+    pub fn take_bus_drops(&self) -> [u64; MAX_BUSES] {
+        std::array::from_fn(|bus| self.shared.bus_dropped[bus].swap(0, Ordering::Relaxed))
     }
 
     /// Frames each bus had to fill by holding the last sample since the previous
@@ -4105,13 +4129,27 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
     let nominal_nanos =
         ((block.max(1) as f64 / rate.max(1) as f64) * 1e9).max(1.0);
 
+    // Register with MMCSS for the whole run. A TIME_CRITICAL thread still loses
+    // to a long DPC or a saturated encoder (measured during a live stream: 10-17
+    // late blocks a second and bus underruns at a 20 ms ring), while the "Pro
+    // Audio" class reserves CPU time for the thread. Priority is kept on top so
+    // the wake-up is serviced first once the timer fires.
     #[cfg(windows)]
-    unsafe {
+    let mmcss = unsafe {
         use windows::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+            AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, GetCurrentThread,
+            SetThreadPriority, AVRT_PRIORITY_CRITICAL, THREAD_PRIORITY_TIME_CRITICAL,
         };
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    }
+        let mut task_index = 0u32;
+        match AvSetMmThreadCharacteristicsW(windows::core::w!("Pro Audio"), &mut task_index) {
+            Ok(handle) => {
+                let _ = AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL);
+                Some(handle)
+            }
+            Err(_) => None,
+        }
+    };
     #[cfg(windows)]
     let timer = MixerTimer::new();
 
@@ -4174,6 +4212,12 @@ fn mixer_loop(shared: Arc<Shared>, stop: Arc<AtomicBool>, block: usize, rate: u3
             }
         }
     }
+    #[cfg(windows)]
+    if let Some(handle) = mmcss {
+        unsafe {
+            let _ = windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(handle);
+        }
+    }
 }
 
 impl Drop for AudioEngine {
@@ -4184,6 +4228,117 @@ impl Drop for AudioEngine {
 
 /// Open one output device and start a stream that carries every bus routed to
 /// it. Returns the stream and the device rate.
+/// True when this render endpoint's underlying device is Bluetooth.
+///
+/// The name cpal reports is "<endpoint> (<device>)", which is exactly how the
+/// MMDevices registry stores the two name properties, so the endpoint can be
+/// matched without COM. Bluetooth endpoints get a larger stream buffer: one
+/// engine period (10 ms) is not enough slack for the BT stack, and the resulting
+/// underruns happen inside the engine - invisible to every ring counter we have,
+/// but audible as crackle on speech.
+#[cfg(windows)]
+fn device_is_bluetooth(name: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE,
+        KEY_READ, RRF_RT_REG_SZ,
+    };
+
+    const BASE: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render";
+    const P_ENDPOINT: &str = r"{a45c254e-df1c-4efd-8020-67d146a850e0},2";
+    const P_DEVICE: &str = r"{b3f8fa53-0004-438e-9003-51a46e139bfc},6";
+    const P_INSTANCE: &str = r"{b3f8fa53-0004-438e-9003-51a46e139bfc},2";
+
+    unsafe fn read(key: HKEY, value: &str) -> Option<String> {
+        let name: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut buf = [0u16; 512];
+        let mut size = (buf.len() * 2) as u32;
+        let status = RegGetValueW(
+            key,
+            PCWSTR::null(),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        );
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        let len = (size as usize / 2).saturating_sub(1).min(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
+    }
+
+    unsafe {
+        let base_w: Vec<u16> = BASE.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut base = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(base_w.as_ptr()),
+            0,
+            KEY_READ,
+            &mut base,
+        ) != ERROR_SUCCESS
+        {
+            return false;
+        }
+        let mut index = 0u32;
+        loop {
+            let mut sub = [0u16; 128];
+            let mut sub_len = sub.len() as u32;
+            let status = RegEnumKeyExW(
+                base,
+                index,
+                windows::core::PWSTR(sub.as_mut_ptr()),
+                &mut sub_len,
+                None,
+                windows::core::PWSTR::null(),
+                None,
+                None,
+            );
+            if status != ERROR_SUCCESS {
+                break;
+            }
+            index += 1;
+            let sub_name = String::from_utf16_lossy(&sub[..sub_len as usize]);
+            let props_path: Vec<u16> = format!(r"{sub_name}\Properties")
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut props = HKEY::default();
+            if RegOpenKeyExW(
+                base,
+                PCWSTR(props_path.as_ptr()),
+                0,
+                KEY_READ,
+                &mut props,
+            ) != ERROR_SUCCESS
+            {
+                continue;
+            }
+            let endpoint = read(props, P_ENDPOINT);
+            let device = read(props, P_DEVICE);
+            let instance = read(props, P_INSTANCE);
+            let _ = RegCloseKey(props);
+            if let (Some(endpoint), Some(device), Some(instance)) = (endpoint, device, instance) {
+                let full = format!("{endpoint} ({device})");
+                if full.eq_ignore_ascii_case(name) {
+                    let _ = RegCloseKey(base);
+                    return instance.to_ascii_uppercase().contains("BTHENUM");
+                }
+            }
+        }
+        let _ = RegCloseKey(base);
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn device_is_bluetooth(_name: &str) -> bool {
+    false
+}
+
 fn open_bus_group(
     name: &str,
     shared: Arc<Shared>,
@@ -4203,7 +4358,35 @@ fn open_bus_group(
         .default_output_config()
         .map_err(|e| format!("Could not read the format of {name}: {e}"))?;
     let sample_format = default.sample_format();
-    let config = default.config();
+    let mut config = default.config();
+    // A larger shared-mode buffer where the device needs slack: Bluetooth cannot
+    // keep up with one 10 ms engine period, and its underruns happen inside the
+    // engine, where no ring counter can see them. AMP_OUT_BUFFER is kept as an
+    // A/B switch and overrides the automatic choice.
+    let bluetooth = device_is_bluetooth(name);
+    let test_mode = std::env::var("AMP_TEST")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false);
+    let requested = if test_mode {
+        std::env::var("AMP_OUT_BUFFER")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|frames| (128..=8192).contains(frames))
+    } else {
+        None
+    }
+    .or_else(|| bluetooth.then_some(1024));
+    if let Some(frames) = requested {
+        config.buffer_size = cpal::BufferSize::Fixed(frames);
+        crate::diag_log(format!(
+            "audio: {name} output buffer {frames} frames{}",
+            if bluetooth {
+                " (Bluetooth endpoint)"
+            } else {
+                " (AMP_OUT_BUFFER)"
+            }
+        ));
+    }
     let rate = config.sample_rate.0;
     let stream = build_bus_group_for_format(
         sample_format,
@@ -4377,6 +4560,9 @@ where
                     let excess = ring.len().saturating_sub(cushion);
                     if excess > 0 {
                         let _ = ring.drain(..excess);
+                        if let Some(slot) = shared.bus_dropped.get(owner) {
+                            slot.fetch_add(excess as u64, Ordering::Relaxed);
+                        }
                     }
                 }
             },

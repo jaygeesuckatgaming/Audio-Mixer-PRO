@@ -2699,7 +2699,13 @@ fn path_delay_ms(
     /// AMP_CUSHION_MS   kernel-cable input cushion, ms (1..200)
     /// AMP_A1_DRAIN     A1/A2/A3/B3 ring cushion, frames (256..4096)
     /// AMP_VC           set 0/off to skip the USB/IP cable server
+    /// AMP_NO_LIMIT     set 1 to bypass the bus safety limiter
     fn apply_test_overrides(&mut self) {
+        // Every switch below is inert unless AMP_TEST=1: a shipped build must not
+        // have its latency changed by a stray environment variable.
+        if std::env::var("AMP_TEST").map(|v| v.trim() != "1").unwrap_or(true) {
+            return;
+        }
         let mut changes: Vec<String> = Vec::new();
         if let Ok(value) = std::env::var("AMP_MAIN_BUFFER") {
             if let Ok(frames) = value.trim().parse::<u32>() {
@@ -2730,6 +2736,13 @@ fn path_delay_ms(
             if trimmed == "0" || trimmed == "off" || trimmed == "no" {
                 self.vc_cfg.enabled = false;
                 changes.push("USB/IP cables disabled".to_string());
+            }
+        }
+        if let Ok(value) = std::env::var("AMP_NO_LIMIT") {
+            let trimmed = value.trim().to_ascii_lowercase();
+            if trimmed == "1" || trimmed == "on" || trimmed == "yes" {
+                audio::set_limit_bypass(true);
+                changes.push("bus limiter bypassed (hard clip)".to_string());
             }
         }
         if !changes.is_empty() {
@@ -3109,16 +3122,18 @@ fn path_delay_ms(
             ));
         }
         let (starved, min_ring) = self.audio.take_starve_report();
+        let dropped = self.audio.take_bus_drops();
         let starved_total: u64 = starved.iter().sum();
+        let dropped_total: u64 = dropped.iter().sum();
         let underrun_total: u64 = bus_underruns.iter().sum();
-        if late_blocks > 0 || underrun_total > 0 || starved_total > 0 {
+        if late_blocks > 0 || underrun_total > 0 || starved_total > 0 || dropped_total > 0 {
             let detail = bus_underruns
                 .iter()
                 .enumerate()
-                .filter(|(bus, count)| **count > 0 || starved[*bus] > 0)
+                .filter(|(bus, count)| **count > 0 || starved[*bus] > 0 || dropped[*bus] > 0)
                 .map(|(bus, count)| {
                     format!(
-                        "{}={count} (cb {} frames, step {:.3}, ring {}, min {}, starved {} frames)",
+                        "{}={count} (cb {} frames, step {:.3}, ring {}, min {}, starved {} frames, dropped {} frames)",
                         self.buses[bus].name,
                         self.audio.callback_frames_for(bus),
                         self.audio.bus_step(bus),
@@ -3128,7 +3143,8 @@ fn path_delay_ms(
                         } else {
                             min_ring[bus].to_string()
                         },
-                        starved[bus]
+                        starved[bus],
+                        dropped[bus]
                     )
                 })
                 .collect::<Vec<_>>()
@@ -3147,11 +3163,11 @@ fn path_delay_ms(
             };
             if detail.is_empty() {
                 diag_log(format!(
-                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s) in the last second{clock}"
+                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s), {dropped_total} dropped frame(s) in the last second{clock}"
                 ));
             } else {
                 diag_log(format!(
-                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s) in the last second{clock}: {detail}"
+                    "audio: {late_blocks} late mixer block(s), {underrun_total} bus underrun(s), {starved_total} starved frame(s), {dropped_total} dropped frame(s) in the last second{clock}: {detail}"
                 ));
             }
         }
@@ -6102,7 +6118,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit Ãƒâ€šÃ‚Â· 48 kHz"), from the
+        // The endpoint's configured format ("24-bit ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6185,7 +6201,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui
@@ -8715,7 +8731,7 @@ Right click > Source to use the Windows capture stream instead."
         }
         if refresh || touched {
             // Re-read after a move so the readout next to each slider (the
-            // plug-in's own "âˆ’14.0 dB" text) follows the value, not the value
+            // plug-in's own "Ã¢Ë†â€™14.0 dB" text) follows the value, not the value
             // it had when the window opened.
             self.param_cache = self.vsts[idx].chain.parameters();
         } else {
@@ -11749,17 +11765,19 @@ fn set_cushion_ms_override(ms: Option<f32>) {
 /// Input cushion for a strip, from the device it listens to, in milliseconds.
 ///
 /// The kernel cable is clocked by the same 1 ms timer as playback, so its
-/// capture side is smooth and 12 ms is plenty. The emulated USB cables deliver
-/// in USB-frame bursts and run on a different clock, so they keep the full
-/// cushion; physical inputs (microphones, interfaces) keep it too, because
-/// their drivers are the ones that can stall unpredictably.
+/// capture side is smooth, but it is still read in 10 ms engine periods: with a
+/// 12 ms cushion the fill sawtooths down to ~2 ms and any callback jitter made
+/// the reader hold samples (measured: 86 ms of held audio in 72 s, audible as
+/// ticks on speech). 25 ms leaves a full period of margin at the bottom of the
+/// sawtooth. The emulated USB cables deliver in USB-frame bursts and run on a
+/// different clock, so they keep the larger cushion; physical inputs keep it too.
 fn input_target_ms_for(device: &str) -> f32 {
     if is_kernel_cable_endpoint(device) {
         let over = CUSHION_MS_OVERRIDE.load(Ordering::Relaxed);
         if over != 0 {
             return f32::from_bits(over);
         }
-        12.0
+        25.0
     } else {
         audio::INPUT_TARGET_MS
     }
@@ -12640,13 +12658,14 @@ mod tests {
     }
 
     #[test]
-    fn kernel_cables_get_the_small_input_cushion() {        assert_eq!(
+    fn kernel_cables_get_the_small_input_cushion() {
+        assert_eq!(
             input_target_ms_for("Microphone Array (Audio Mixer Cable 01)"),
-            12.0
+            25.0
         );
         assert_eq!(
             input_target_ms_for("Microphone Array (Virtual Cable 01)"),
-            12.0
+            25.0
         );
         assert_eq!(
             input_target_ms_for("Microphone (USB Cable 01)"),
@@ -12678,7 +12697,7 @@ mod tests {
         set_cushion_ms_override(None);
         assert_eq!(
             input_target_ms_for("Microphone Array (Virtual Cable 01)"),
-            12.0
+            25.0
         );
     }
 
