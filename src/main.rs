@@ -2595,7 +2595,10 @@ fn path_delay_ms(
                     if over != 0 {
                         f32::from_bits(over)
                     } else {
-                        6.0
+                        // At least one engine callback: with a 6 ms cushion the
+                        // fill hit zero every cycle and the reader held samples
+                        // (measured: 4.5 s of held audio in 68 s on the speakers).
+                        12.0
                     }
                 }
                 _ => input_target_ms_for(&s.device),
