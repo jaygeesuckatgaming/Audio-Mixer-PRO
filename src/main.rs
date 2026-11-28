@@ -2887,23 +2887,12 @@ fn path_delay_ms(
         // render endpoint: the audio engine taps what the app plays, so the strip
         // skips the driver's ring read and the capture period. That is worth
         // ~25 ms and removes a second clock from the path.
-        let render = loopback_render_name(&name);
+
         let (sender, receiver) = std::sync::mpsc::channel();
         if std::thread::Builder::new()
             .name("capture-open".to_string())
             .spawn(move || {
-                let capture = match render {
-                    Some(render) => {
-                        let mut capture = audio::InputCapture::open_loopback(&render);
-                        if capture.available {
-                            // The strip keeps showing the endpoint it listens to.
-                            capture.device = name.clone();
-                        }
-                        capture
-                    }
-                    None => audio::InputCapture::open(Some(&name)),
-                };
-                let _ = sender.send(capture);
+                let _ = sender.send(open_capture_for(&name));
             })
             .is_ok()
         {
@@ -5260,7 +5249,7 @@ fn path_delay_ms(
                 self.toast(format!("Virtual {} added - direct from {cable}", idx - 2));
                 return;
             }
-            let capture = InputCapture::open(Some(&cable));
+            let capture = open_capture_for(&cable);
             if capture.available {
                 self.strips[idx].device = capture.device.clone();
                 self.audio.attach_input(idx, capture.shared());
@@ -5290,7 +5279,7 @@ fn path_delay_ms(
                 if self.open_cable_tap(idx, &cable) {
                     continue;
                 }
-                let capture = InputCapture::open(Some(&cable));
+                let capture = open_capture_for(&cable);
                 if capture.available {
                     self.strips[idx].device = capture.device.clone();
                     self.audio.attach_input(idx, capture.shared());
@@ -5437,7 +5426,7 @@ fn path_delay_ms(
                 diag_log(format!("input {}: direct from '{}'", i + 1, name));
                 continue;
             }
-            let capture = InputCapture::open(Some(&name));
+            let capture = open_capture_for(&name);
             if capture.available {
                 diag_log(format!("input {}: opened '{}'", i + 1, capture.device));
                 self.strips[i].device = capture.device.clone();
@@ -6155,7 +6144,7 @@ fn path_delay_ms(
         let mut y = inner.top();
         let w = inner.width();
 
-        // The endpoint's configured format ("24-bit ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz"), from the
+        // The endpoint's configured format ("24-bit ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz"), from the
         // background property-store scan. It gets a line of its own under the
         // cable name, so the VST chip moves into the top corner and stops
         // eating the width of the device line.
@@ -6238,7 +6227,7 @@ fn path_delay_ms(
             DIM,
         );
         if let Some(format) = endpoint_format {
-            // Full "24-bit ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
+            // Full "24-bit ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â· 48 kHz" when the strip is wide enough, otherwise
             // the narrow form so the number is never cut in half.
             let full = format.label();
             let measured = ui
@@ -8768,7 +8757,7 @@ Right click > Source to use the Windows capture stream instead."
         }
         if refresh || touched {
             // Re-read after a move so the readout next to each slider (the
-            // plug-in's own "ÃƒÂ¢Ã‹â€ Ã¢â‚¬â„¢14.0 dB" text) follows the value, not the value
+            // plug-in's own "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã¢â‚¬Â¹ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢14.0 dB" text) follows the value, not the value
             // it had when the window opened.
             self.param_cache = self.vsts[idx].chain.parameters();
         } else {
@@ -11817,6 +11806,23 @@ fn input_target_ms_for(device: &str) -> f32 {
         25.0
     } else {
         audio::INPUT_TARGET_MS
+    }
+}
+
+/// Open a strip's capture, choosing the cheapest source for the device: a
+/// loopback of the render endpoint for our kernel cable, a plain capture for
+/// everything else.
+fn open_capture_for(name: &str) -> audio::InputCapture {
+    match loopback_render_name(name) {
+        Some(render) => {
+            let mut capture = audio::InputCapture::open_loopback(&render);
+            if capture.available {
+                // The strip keeps showing the endpoint it listens to.
+                capture.device = name.to_string();
+            }
+            capture
+        }
+        None => audio::InputCapture::open(Some(name)),
     }
 }
 
