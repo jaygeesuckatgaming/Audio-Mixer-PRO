@@ -2590,7 +2590,14 @@ fn path_delay_ms(
             // render stream), so it needs only a couple of periods, not the
             // capture cushion.
             let target_ms = match self.captures.get(i).and_then(|capture| capture.as_ref()) {
-                Some(capture) if capture.loopback() => 6.0,
+                Some(capture) if capture.loopback() => {
+                    let over = CUSHION_MS_OVERRIDE.load(Ordering::Relaxed);
+                    if over != 0 {
+                        f32::from_bits(over)
+                    } else {
+                        6.0
+                    }
+                }
                 _ => input_target_ms_for(&s.device),
             };
             self.audio.set_strip_target_ms(i, target_ms);
